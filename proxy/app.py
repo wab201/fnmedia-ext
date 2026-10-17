@@ -45,16 +45,41 @@ ONLINE_PREFIX = "/v/media/online"
 _search_cache: dict[str, tuple[float, list]] = {}
 _search_inflight: dict[str, asyncio.Future] = {}
 CACHE_TTL = 120
-HOT_LIB_GUID = "a110c1a0b1a04000900010000000f001"
+# 在线热门按内容拆成 4 个虚拟媒体库。guid 由固定串 md5 派生，保持稳定。
+HOT_CATEGORIES = [
+    ("movie",   "🌐在线电影", "Movie"),
+    ("tv",      "🌐在线剧集", "TV"),
+    ("anime",   "🌐在线动漫", "Mix"),
+    ("variety", "🌐在线综艺", "Mix"),
+]
+HOT_LIB_GUIDS: dict[str, str] = {
+    "movie":   "f4f27c311388d90f658670995a7fddb8",
+    "tv":      "2a6937a71b652ea061a68456a72e69a8",
+    "anime":   "5036a366ecfc047b4732b6bc2a39c3d8",
+    "variety": "61d5d026ae7390a9f333b5d3a43ef5ff",
+}
+HOT_GUID_CAT = {g: c for c, g in HOT_LIB_GUIDS.items()}
+# 兼容历史单库 guid：旧链接/旧缓存仍可打开，映射到剧集库。
+HOT_LEGACY_GUID = "a110c1a0b1a04000900010000000f001"
 HOT_DEFAULT_TITLE = "🌐在线热门"
 
 
-def hot_title() -> str:
-    return config.get().get("hot_library_title") or HOT_DEFAULT_TITLE
+def hot_cat_title(cat: str) -> str:
+    for c, title, _ in HOT_CATEGORIES:
+        if c == cat:
+            return title
+    return HOT_DEFAULT_TITLE
+
+
+def hot_cat_category(cat: str) -> str:
+    for c, _, mdbcat in HOT_CATEGORIES:
+        if c == cat:
+            return mdbcat
+    return "Mix"
 
 
 def is_hot_guid(guid: str) -> bool:
-    return guid == HOT_LIB_GUID
+    return guid in HOT_GUID_CAT or guid == HOT_LEGACY_GUID
 
 
 def b64e(u: str) -> str:
@@ -262,26 +287,30 @@ def _should_online(q: str) -> bool:
 
 # ------------------------------------------------------------- 在线热门媒体库
 
-def _hot_card(brief: dict) -> dict:
+def _hot_card(brief: dict, cat: str) -> dict:
     row = inj.search_item(brief)
     # 媒体库内不再重复显示【在线】前缀，让海报墙更接近原生媒体库体验
     title = (brief.get("title") or "").strip()
     remarks = (brief.get("remarks") or "").strip()
     row["title"] = title + (f" ·{remarks}" if remarks else "")
-    row["ancestor_guid"] = HOT_LIB_GUID
-    row["ancestor_name"] = hot_title()
-    row["ancestor_category"] = "Mix"
+    row["ancestor_guid"] = HOT_LIB_GUIDS[cat]
+    row["ancestor_name"] = hot_cat_title(cat)
+    row["ancestor_category"] = hot_cat_category(cat)
     row["video_guid"] = video_guid(brief["guid"])
     return row
 
 
-def _hot_rows_all(body: dict) -> list[dict]:
-    items = hot_cache.items()
+def _hot_cat_items(cat: str) -> list[dict]:
+    return [b for b in hot_cache.items() if inj.hot_category(b) == cat]
+
+
+def _hot_rows_all(body: dict, cat: str) -> list[dict]:
+    items = _hot_cat_items(cat)
     # parent_guid 可能用于目录/分组；热门库只有一层，非根 parent 直接为空。
     parent = (body.get("parent_guid") or "").strip()
     if parent:
         return []
-    rows = [_hot_card(b) for b in items]
+    rows = [_hot_card(b, cat) for b in items]
     tags = body.get("tags")
     if isinstance(tags, dict):
         wanted = set(tags.get("type") or [])
@@ -367,25 +396,35 @@ async def mediadb_list(request: Request):
     if payload is None:
         return upstream
     dbs = payload.get("data")
-    if not isinstance(dbs, list) or any(d.get("guid") == HOT_LIB_GUID for d in dbs):
+    hot_guids = set(HOT_LIB_GUIDS.values()) | {HOT_LEGACY_GUID}
+    if not isinstance(dbs, list) or any(d.get("guid") in hot_guids for d in dbs):
         return upstream
     try:
-        # 缓存为空时先保证卡片存在；后台 worker 会继续刷新内容。
-        posters = []
-        for b in hot_cache.items()[:4]:
-            p = inj._poster(b.get("poster") or "")
-            if p:
-                posters.append(p)
-        dbs.insert(0, {
-            "guid": HOT_LIB_GUID,
-            "title": hot_title(),
-            "poster": posters[0] if posters else "",
-            "posters": posters,
-            "category": "Mix",
-            "view_type": 0,
-            "poster_type": 0,
-            "refresh_disabled": True,
-        })
+        # 每个分类注入一个虚拟媒体库，按电影/剧集/动漫/综艺排序置于最前。
+        cat_posters: dict[str, list[str]] = {}
+        for cat, _t, _c in HOT_CATEGORIES:
+            ps = []
+            for b in _hot_cat_items(cat):
+                p = inj._poster(b.get("poster") or "")
+                if p:
+                    ps.append(p)
+                if len(ps) >= 8:
+                    break
+            cat_posters[cat] = ps
+        inserts = []
+        for cat, _t, _c in HOT_CATEGORIES:
+            ps = cat_posters[cat]
+            inserts.append({
+                "guid": HOT_LIB_GUIDS[cat],
+                "title": hot_cat_title(cat),
+                "poster": ps[0] if ps else "",
+                "posters": ps,
+                "category": hot_cat_category(cat),
+                "view_type": 0,
+                "poster_type": 0,
+                "refresh_disabled": True,
+            })
+        dbs[0:0] = inserts
         return JSONResponse(payload)
     except Exception as exc:
         _log.warning("inject hot mediadb failed: %s", exc)
@@ -400,10 +439,14 @@ async def mediadb_sum(request: Request):
     payload = await _json_from_upstream(upstream)
     if not payload or not isinstance(payload.get("data"), dict):
         return upstream
-    n = len(hot_cache.items())
-    if n:
-        payload["data"][HOT_LIB_GUID] = n
-        payload["data"]["total"] = int(payload["data"].get("total", 0)) + n
+    total_added = 0
+    for cat, _t, _c in HOT_CATEGORIES:
+        n = len(_hot_cat_items(cat))
+        if n:
+            payload["data"][HOT_LIB_GUIDS[cat]] = n
+            total_added += n
+    if total_added:
+        payload["data"]["total"] = int(payload["data"].get("total", 0)) + total_added
     return JSONResponse(payload)
 
 
@@ -414,19 +457,26 @@ async def item_list(request: Request):
         body = json.loads(raw or b"{}")
     except Exception:
         body = {}
-    if body.get("ancestor_guid") != HOT_LIB_GUID:
+    aguid = body.get("ancestor_guid")
+    cat = HOT_GUID_CAT.get(aguid)
+    # 兼容历史单库 guid：作为剧集库打开
+    if aguid == HOT_LEGACY_GUID:
+        cat = "tv"
+    if cat is None:
         return await forward_upstream(request)
+    mdb_name = hot_cat_title(cat)
+    mdb_cat = hot_cat_category(cat)
     if not config.get().get("hot_library_enabled", True):
         return JSONResponse({"code": 0, "msg": "", "data": {
-            "mdb_name": hot_title(), "mdb_category": "Mix", "top_dir": "",
+            "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
             "dir": "", "total": 0, "list": [], "jump_list": None,
         }})
     # 即使缓存还在第一次刷新，也立即返回（不实时串联各资源站拖慢 UI）
-    all_rows = _hot_rows_all(body)
+    all_rows = _hot_rows_all(body, cat)
     page_size, start, end = _page_args(body, len(all_rows))
     return JSONResponse({"code": 0, "msg": "", "data": {
-        "mdb_name": hot_title(),
-        "mdb_category": "Mix",
+        "mdb_name": mdb_name,
+        "mdb_category": mdb_cat,
         "top_dir": "",
         "dir": "",
         "total": len(all_rows),
@@ -474,9 +524,10 @@ async def item_detail(guid: str, request: Request):
     # 在线热门虚拟媒体库根节点（进入媒体库时前端会请求 item/<库guid>）。
     # 必须在透传前拦截，否则官方后端返回 -6，页面提示「此媒体库不存在」。
     if is_hot_guid(guid):
-        n = len(hot_cache.items())
+        cat = HOT_GUID_CAT.get(guid) or ("tv" if guid == HOT_LEGACY_GUID else "movie")
+        n = len(_hot_cat_items(cat))
         data = inj._base_item(
-            guid=HOT_LIB_GUID, type="MediaDB", title=hot_title(),
+            guid=guid, type="MediaDB", title=hot_cat_title(cat),
             can_play=1, number_of_episodes=n, local_number_of_episodes=n,
             ancestor_guid="", ancestor_name="", ancestor_category="",
             poster="", logic_type=0)

@@ -29,8 +29,11 @@ _MOVIE_TYPE_WORDS = ("电影", "影片", "剧情片", "动作片", "喜剧片", 
 
 def is_tv(b: dict) -> bool:
     typ = (b.get("type_name") or "").strip()
-    if any(w in typ for w in _MOVIE_TYPE_WORDS) and "动画电影" in typ:
+    # 明确的电影类型（含动画电影、纪录片等）一律作为单部电影点开即播。
+    # 苹果 CMS 一部电影在每条线路里也是 1 个“正片”条目，不能因此误判成 TV。
+    if any(w in typ for w in _MOVIE_TYPE_WORDS):
         return False
+    # 动漫/综艺：多集才算连载剧集；单集番外/剧场版按电影处理。
     if "综艺" in typ and _ep_count(b) <= 1:
         return False
     if any(w in typ for w in _TV_TYPE_WORDS):
@@ -40,6 +43,27 @@ def is_tv(b: dict) -> bool:
 
 def fnos_type(b: dict) -> str:
     return "TV" if is_tv(b) else "Movie"
+
+
+# 在线热门细分类：movie / tv / anime / variety（按优先级判定）
+_ANIME_WORDS = ("动漫", "番剧", "动画剧", "动画", "日本动漫", "日韩动漫",
+                "国产动漫", "欧美动漫", "动漫片")
+_VARIETY_WORDS = ("综艺", "真人秀")
+_MOVIE_CAT_WORDS = ("电影", "影片", "剧情片", "动作片", "喜剧片", "爱情片",
+                    "科幻片", "恐怖片", "纪录片", "动画电影")
+
+
+def hot_category(b: dict) -> str:
+    """把在线条目归入 movie/tv/anime/variety 之一。"""
+    typ = (b.get("type_name") or "").strip()
+    if any(w in typ for w in _ANIME_WORDS):
+        return "anime"
+    if any(w in typ for w in _VARIETY_WORDS):
+        return "variety"
+    if any(w in typ for w in _MOVIE_CAT_WORDS):
+        return "movie"
+    # type_name 不足以判定时，用是否多集兜底：多集=剧集，单集=电影
+    return "tv" if _ep_count(b) > 1 else "movie"
 
 
 def brief_of(t: providers.OnlineTitle) -> dict:
