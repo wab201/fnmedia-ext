@@ -28,6 +28,13 @@ DEFAULTS = {
     "junk_keywords": JUNK_KEYWORDS,
     # 在线资源前排展示（在线片库更齐全，默认前排）
     "online_first": True,
+    # 虚拟“在线热门”媒体库
+    "hot_library_enabled": True,
+    "hot_library_title": "🌐在线热门",
+    "hot_limit": 60,
+    "hot_per_source": 30,
+    "hot_pages_per_source": 2,
+    "hot_refresh_interval": 6 * 3600,
     "admin_token": "",
 }
 

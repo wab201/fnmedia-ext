@@ -230,13 +230,17 @@ class Store:
         try:
             _STATE.parent.mkdir(parents=True, exist_ok=True)
             tmp = _STATE.with_suffix(".tmp")
-            # 控制体积：只保留最近 _MAX_TITLES 条
+            # 控制磁盘体积：超限时只裁剪本次写入的快照，不能从内存中删除。
+            # 否则热门库 remember_merged 后可能误删用户此前搜索缓存的标题。
             titles = self._titles
+            orig = self._orig
             if len(titles) > _MAX_TITLES:
                 keys = list(titles.keys())[-_MAX_TITLES:]
+                keep = set(keys)
                 titles = {k: self._titles[k] for k in keys}
+                orig = {k: v for k, v in self._orig.items() if k in keep}
             tmp.write_text(json.dumps(
-                {"titles": titles, "orig": self._orig}, ensure_ascii=False))
+                {"titles": titles, "orig": orig}, ensure_ascii=False))
             tmp.replace(_STATE)
             self._dirty = False
         except Exception:

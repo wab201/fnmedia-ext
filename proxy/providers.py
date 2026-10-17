@@ -52,6 +52,7 @@ class OnlineTitle:
     type_name: str
     year: str
     area: str
+    updated: str
     remarks: str
     score: str
     poster: str
@@ -109,6 +110,7 @@ def _map_vod(v: dict, source: dict) -> OnlineTitle | None:
         type_name=v.get("type_name", ""),
         year=str(v.get("vod_year", "") or ""),
         area=v.get("vod_area", "") or "",
+        updated=str(v.get("vod_time", "") or v.get("vod_time_add", "") or ""),
         remarks=v.get("vod_remarks", "") or "",
         score=str(v.get("vod_score", "") or ""),
         poster=v.get("vod_pic", "") or "",

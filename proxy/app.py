@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import os
 import re
 import time
@@ -31,6 +32,8 @@ import providers
 import inject as inj
 import config as cfgmod
 from config import config
+import hot as hotmod
+from hot import hot_cache
 import history as histmod
 from history import history
 from store import (store, make_guid, media_guid, video_guid, is_online_guid,
@@ -42,6 +45,16 @@ ONLINE_PREFIX = "/v/media/online"
 _search_cache: dict[str, tuple[float, list]] = {}
 _search_inflight: dict[str, asyncio.Future] = {}
 CACHE_TTL = 120
+HOT_LIB_GUID = "a110c1a0b1a04000900010000000f001"
+HOT_DEFAULT_TITLE = "🌐在线热门"
+
+
+def hot_title() -> str:
+    return config.get().get("hot_library_title") or HOT_DEFAULT_TITLE
+
+
+def is_hot_guid(guid: str) -> bool:
+    return guid == HOT_LIB_GUID
 
 
 def b64e(u: str) -> str:
@@ -59,9 +72,43 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(120), trust_env=False)
     app.state.ext = httpx.AsyncClient(
         timeout=httpx.Timeout(30), trust_env=False, follow_redirects=True)
-    yield
-    await app.state.up.aclose()
-    await app.state.ext.aclose()
+    app.state.stop_hot = asyncio.Event()
+    app.state.hot_task = asyncio.create_task(_hot_worker(app))
+    try:
+        yield
+    finally:
+        app.state.stop_hot.set()
+        app.state.hot_task.cancel()
+        try:
+            await app.state.hot_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        await app.state.up.aclose()
+        await app.state.ext.aclose()
+
+
+async def _hot_worker(app: FastAPI):
+    """热门库后台刷新：启动先读旧缓存，稍等启动流程，再按需刷新；之后按配置轮询。"""
+    await asyncio.sleep(5)
+    while not app.state.stop_hot.is_set():
+        cfg = config.get()
+        interval = max(1800, int(cfg.get("hot_refresh_interval", 6 * 3600)))
+        status = hot_cache.status()
+        stale_for = interval
+        if status.get("updated_at"):
+            stale_for = max(0, int(time.time() - status["updated_at"]))
+        if cfg.get("hot_library_enabled", True) and (
+                not status.get("updated_at") or stale_for >= interval):
+            try:
+                await asyncio.wait_for(hot_cache.refresh(store), timeout=90)
+            except asyncio.TimeoutError:
+                _log.warning("hot refresh timed out; keeping previous cache")
+            except Exception as exc:
+                _log.warning("hot refresh failed, keeping previous cache: %s", exc)
+        try:
+            await asyncio.wait_for(app.state.stop_hot.wait(), timeout=300)
+        except asyncio.TimeoutError:
+            pass
 
 
 app = FastAPI(lifespan=lifespan)
@@ -213,6 +260,181 @@ def _should_online(q: str) -> bool:
     return len(q) >= 7
 
 
+# ------------------------------------------------------------- 在线热门媒体库
+
+def _hot_card(brief: dict) -> dict:
+    row = inj.search_item(brief)
+    # 媒体库内不再重复显示【在线】前缀，让海报墙更接近原生媒体库体验
+    title = (brief.get("title") or "").strip()
+    remarks = (brief.get("remarks") or "").strip()
+    row["title"] = title + (f" ·{remarks}" if remarks else "")
+    row["ancestor_guid"] = HOT_LIB_GUID
+    row["ancestor_name"] = hot_title()
+    row["ancestor_category"] = "Mix"
+    row["video_guid"] = video_guid(brief["guid"])
+    return row
+
+
+def _hot_rows_all(body: dict) -> list[dict]:
+    items = hot_cache.items()
+    # parent_guid 可能用于目录/分组；热门库只有一层，非根 parent 直接为空。
+    parent = (body.get("parent_guid") or "").strip()
+    if parent:
+        return []
+    rows = [_hot_card(b) for b in items]
+    tags = body.get("tags")
+    if isinstance(tags, dict):
+        wanted = set(tags.get("type") or [])
+        media_wanted = wanted & {"Movie", "TV", "Movie,TV"}
+        if "Movie,TV" in media_wanted:
+            media_wanted.discard("Movie,TV")
+            media_wanted.update({"Movie", "TV"})
+        if media_wanted:
+            rows = [r for r in rows if r.get("type") in media_wanted]
+        watched = str(tags.get("watched") or "")
+        if watched in {"0", "1"}:
+            want_watched = watched == "1"
+            filtered = []
+            for r in rows:
+                rec = history.get(r["guid"])
+                is_watched = bool(rec and rec.get("duration") and
+                                  int(rec.get("ts") or 0) >= int(rec.get("duration") or 0) * 0.95)
+                if is_watched == want_watched:
+                    filtered.append(r)
+            rows = filtered
+    elif isinstance(tags, list):
+        wanted = set(tags) & {"Movie", "TV"}
+        if wanted:
+            rows = [r for r in rows if r.get("type") in wanted]
+
+    if int(body.get("is_favorite") or 0):
+        # 热门虚拟库暂不单独维护收藏；避免错误地展示全部内容。
+        return []
+    kw = str(body.get("keyword") or body.get("q") or body.get("title") or "").strip().lower()
+    if kw:
+        rows = [r for r in rows if kw in (r.get("title") or "").lower()]
+
+    col = body.get("sort_column", "create_time")
+    order = str(body.get("sort_type", "DESC")).upper()
+    reverse = order.lower() != "asc"
+
+    def rank(r: dict):
+        g = r["guid"]
+        b = hot_cache.get_guid(g) or {}
+        h = b.get("hot") or {}
+        return (h.get("rank") if reverse else -int(h.get("rank") or 0))
+
+    if col == "sort_title":
+        rows.sort(key=lambda r: (r.get("title") or ""), reverse=reverse)
+    elif col in ("release_date", "air_date", "year"):
+        rows.sort(key=lambda r: (r.get("release_date") or ""), reverse=reverse)
+    elif col in ("vote_average", "score"):
+        def score(r):
+            try:
+                return float(r.get("vote_average") or 0)
+            except ValueError:
+                return 0
+        rows.sort(key=lambda r: (score(r), rank(r)), reverse=True)
+    # create_time / 默认：保持 collect_hot 已计算好的热门顺序，不在这里二次排序。
+    return rows
+
+
+def _page_args(body: dict, total: int) -> tuple[int, int, int]:
+    page_size = max(1, min(int(body.get("page_size") or 22), 100))
+    page = int(body.get("page") or body.get("p") or body.get("page_index")
+               or body.get("pn") or 1)
+    page = max(1, page)
+    offset = int(body.get("offset") if body.get("offset") is not None else
+                 (page - 1) * page_size)
+    offset = max(0, min(offset, total))
+    return page_size, offset, min(offset + page_size, total)
+
+
+async def _json_from_upstream(upstream: Response) -> dict | None:
+    try:
+        data = json.loads(upstream.body)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+@app.get("/v/api/v1/mediadb/list")
+async def mediadb_list(request: Request):
+    upstream = await forward_upstream(request)
+    if not config.get().get("hot_library_enabled", True):
+        return upstream
+    payload = await _json_from_upstream(upstream)
+    if payload is None:
+        return upstream
+    dbs = payload.get("data")
+    if not isinstance(dbs, list) or any(d.get("guid") == HOT_LIB_GUID for d in dbs):
+        return upstream
+    try:
+        # 缓存为空时先保证卡片存在；后台 worker 会继续刷新内容。
+        posters = []
+        for b in hot_cache.items()[:4]:
+            p = inj._poster(b.get("poster") or "")
+            if p:
+                posters.append(p)
+        dbs.insert(0, {
+            "guid": HOT_LIB_GUID,
+            "title": hot_title(),
+            "poster": posters[0] if posters else "",
+            "posters": posters,
+            "category": "Mix",
+            "view_type": 0,
+            "poster_type": 0,
+            "refresh_disabled": True,
+        })
+        return JSONResponse(payload)
+    except Exception as exc:
+        _log.warning("inject hot mediadb failed: %s", exc)
+        return upstream
+
+
+@app.get("/v/api/v1/mediadb/sum")
+async def mediadb_sum(request: Request):
+    upstream = await forward_upstream(request)
+    if not config.get().get("hot_library_enabled", True):
+        return upstream
+    payload = await _json_from_upstream(upstream)
+    if not payload or not isinstance(payload.get("data"), dict):
+        return upstream
+    n = len(hot_cache.items())
+    if n:
+        payload["data"][HOT_LIB_GUID] = n
+        payload["data"]["total"] = int(payload["data"].get("total", 0)) + n
+    return JSONResponse(payload)
+
+
+@app.post("/v/api/v1/item/list")
+async def item_list(request: Request):
+    raw = await request.body()
+    try:
+        body = json.loads(raw or b"{}")
+    except Exception:
+        body = {}
+    if body.get("ancestor_guid") != HOT_LIB_GUID:
+        return await forward_upstream(request)
+    if not config.get().get("hot_library_enabled", True):
+        return JSONResponse({"code": 0, "msg": "", "data": {
+            "mdb_name": hot_title(), "mdb_category": "Mix", "top_dir": "",
+            "dir": "", "total": 0, "list": [], "jump_list": None,
+        }})
+    # 即使缓存还在第一次刷新，也立即返回（不实时串联各资源站拖慢 UI）
+    all_rows = _hot_rows_all(body)
+    page_size, start, end = _page_args(body, len(all_rows))
+    return JSONResponse({"code": 0, "msg": "", "data": {
+        "mdb_name": hot_title(),
+        "mdb_category": "Mix",
+        "top_dir": "",
+        "dir": "",
+        "total": len(all_rows),
+        "list": all_rows[start:end],
+        "jump_list": None,
+    }})
+
+
 @app.get("/v/api/v1/search/list")
 async def search_list(request: Request):
     local = await forward_upstream(request)
@@ -249,6 +471,18 @@ async def search_list(request: Request):
 
 @app.get("/v/api/v1/item/{guid}")
 async def item_detail(guid: str, request: Request):
+    # 在线热门虚拟媒体库根节点（进入媒体库时前端会请求 item/<库guid>）。
+    # 必须在透传前拦截，否则官方后端返回 -6，页面提示「此媒体库不存在」。
+    if is_hot_guid(guid):
+        n = len(hot_cache.items())
+        data = inj._base_item(
+            guid=HOT_LIB_GUID, type="MediaDB", title=hot_title(),
+            can_play=1, number_of_episodes=n, local_number_of_episodes=n,
+            ancestor_guid="", ancestor_name="", ancestor_category="",
+            poster="", logic_type=0)
+        data["play_item_guid"] = ""
+        data["play_error"] = ""
+        return JSONResponse({"code": 0, "msg": "", "data": data})
     # 伪造的 Season / Episode 节点
     if store.get_episode(guid):
         ep = store.get_episode(guid)
@@ -873,22 +1107,56 @@ def _decode_tok(tok: str) -> str:
     return b64d(tok)
 
 
-@app.get("/v/api/v1/sys/img/online/{tok_path:path}")
-async def online_poster(tok_path: str, request: Request):
+def _poster_fallback() -> Response:
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" width="300" height="450" viewBox="0 0 300 450">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#1f6feb"/><stop offset="1" stop-color="#7c3aed"/>
+  </linearGradient></defs>
+  <rect width="300" height="450" fill="url(#g)"/>
+  <circle cx="150" cy="180" r="58" fill="rgba(255,255,255,.18)"/>
+  <polygon points="132,145 132,215 192,180" fill="#fff" opacity=".92"/>
+  <text x="150" y="285" text-anchor="middle" fill="#fff" font-family="sans-serif"
+    font-size="26" font-weight="700">在线影视</text>
+  <text x="150" y="322" text-anchor="middle" fill="rgba(255,255,255,.72)"
+    font-family="sans-serif" font-size="15">fnmedia-ext</text>
+</svg>"""
+    return Response(svg, media_type="image/svg+xml; charset=utf-8",
+                    headers={"Cache-Control": "max-age=3600"})
+
+
+async def _serve_online_poster(tok_path: str, request: Request) -> Response:
+    # 兼容 /online/<token>.jpg 与官方图片前缀 /v/api/v1/sys/img/online/<token>.jpg
+    tok_path = tok_path.lstrip("/")
+    marker = "online/"
+    if marker in tok_path:
+        tok_path = tok_path.split(marker, 1)[1]
     try:
         u = _decode_tok(tok_path)
     except Exception:
-        return Response("", status_code=400)
+        return _poster_fallback()
     if not u.startswith("http"):
-        return Response("", status_code=400)
+        return _poster_fallback()
     try:
         r = await ext_client(request).get(u, headers={"User-Agent": "Mozilla/5.0"})
+        ctype = (r.headers.get("content-type") or "").lower()
+        if r.status_code != 200 or not r.content or not ctype.startswith("image/"):
+            return _poster_fallback()
     except Exception:
-        return Response("", status_code=502)
-    return Response(content=r.content, status_code=r.status_code,
-                    media_type=r.headers.get("content-type", "image/jpeg"),
+        return _poster_fallback()
+    return Response(content=r.content, status_code=200,
+                    media_type=ctype or "image/jpeg",
                     headers={"Cache-Control": "max-age=86400",
                              "Access-Control-Allow-Origin": "*"})
+
+
+@app.get("/online/{tok_path:path}")
+async def online_poster_short(tok_path: str, request: Request):
+    return await _serve_online_poster(tok_path, request)
+
+
+@app.get("/v/api/v1/sys/img/online/{tok_path:path}")
+async def online_poster(tok_path: str, request: Request):
+    return await _serve_online_poster(tok_path, request)
 
 
 @app.get("/_ext/healthz")
@@ -906,7 +1174,14 @@ def _up_status() -> str:
 async def ext_status(request: Request):
     return {"ok": True,
             "config": {k: v for k, v in config.get().items() if k != "admin_token"},
-            "cached_titles": len(store._titles)}
+            "cached_titles": len(store._titles),
+            "hot": hot_cache.status()}
+
+
+@app.post("/v/api/ext/hot/refresh")
+async def ext_hot_refresh(request: Request):
+    data = await hot_cache.refresh(store, force=True)
+    return {"code": 0, "msg": "", "data": hot_cache.status()}
 
 
 @app.get("/v/api/ext/online")
@@ -929,8 +1204,23 @@ async def ext_online(q: str = "", limit: int = 200):
 @app.post("/v/api/ext/config")
 async def ext_set_config(request: Request):
     body = await request.json()
-    allowed = {"max_per_keyword", "filter_junk", "junk_keywords", "online_first"}
+    allowed = {
+        "max_per_keyword", "filter_junk", "junk_keywords", "online_first",
+        "hot_library_enabled", "hot_library_title", "hot_limit",
+        "hot_per_source", "hot_pages_per_source", "hot_refresh_interval",
+    }
     patch = {k: v for k, v in body.items() if k in allowed}
+    if "hot_library_title" in patch:
+        patch["hot_library_title"] = str(patch["hot_library_title"]).strip()[:20] or HOT_DEFAULT_TITLE
+    if "hot_limit" in patch:
+        patch["hot_limit"] = max(20, min(120, int(patch["hot_limit"])))
+    if "hot_per_source" in patch:
+        patch["hot_per_source"] = max(10, min(40, int(patch["hot_per_source"])))
+    if "hot_pages_per_source" in patch:
+        patch["hot_pages_per_source"] = max(1, min(3, int(patch["hot_pages_per_source"])))
+    if "hot_refresh_interval" in patch:
+        patch["hot_refresh_interval"] = max(3 * 3600, min(24 * 3600,
+                                                          int(patch["hot_refresh_interval"])))
     if "sources" in body and isinstance(body["sources"], list):
         cur = {s["id"]: s for s in config.all_sources()}
         for ch in body["sources"]:

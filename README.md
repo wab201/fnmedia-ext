@@ -34,8 +34,20 @@
                                                    ├─ 普通请求 → 透传官方后端(upstream socket)
                                                    ├─ /search/list → 注入在线结果（默认排最前）+ 本地结果
                                                    ├─ /item /season/* /episode/* /play/* /stream/* → 伪造链路
+                                                   ├─ mediadb/list · mediadb/sum · item/list → 注入「在线热门」虚拟媒体库
                                                    └─ /v/media/online/* → HLS/分片/密钥/mp4 反向代理
 ```
+
+### 在线热门媒体库（方案 A）
+
+- 后台定时（默认每 6 小时）并发拉取各资源站「最近更新」详情，跨源按片名+年份聚合并排序，
+  原子写入本地缓存 `state/hot.json`；飞牛影视首页只读缓存，**打开页面绝不被网络请求阻塞**。
+- 在媒体库列表最前面插入一个名为「🌐在线热门」的虚拟库，卡片复用在线播放链路（详情/选集/线路/续播）。
+- 容错：任一线路失败不影响其它线路；**全部线路失败或结果异常为空时保留旧缓存**，并在管理页显示 `last_error`；
+  海报加载失败时返回内联 SVG 占位图（HTTP 200），不会出现裂图。
+- 完整兼容官方前端的 `page/page_size` 无限滚动分页、`tags.type`（电影/电视剧）筛选、
+  `is_favorite`、`parent_guid` 以及 `sort_column`（`create_time` / `sort_title` / `release_date` / `vote_average`）。
+- 可在管理页开关、改名、调整展示条数 / 每源条数 / 每源页数 / 刷新间隔，并可「立即刷新」。
 
 - `supervise.py` 先校验官方 socket 的监听者 exe，再在私有暂存 socket 启动本服务；
   健康检查通过后用 `renameat2(NOREPLACE)` 原子换名接管；退出/崩溃时原子换回官方 socket（fail-closed）。
@@ -54,6 +66,7 @@ proxy/
   providers.py      苹果CMS V10 适配 + 连通性探测 + /share 播放页解析（直连国内，trust_env=False）
   inject.py         在线条目 → 飞牛 item/stream/play/history 结构（标题带【在线】）
   store.py          标题/线路持久化、跨源聚合、按集解析、线路/集反查索引
+  hot.py            「在线热门」后台刷新：跨源聚合去重、排序、原子缓存、失败保留旧缓存
   history.py        在线播放进度（继续观看）：record 落库、play/list 合并、ts 续播
   config.py         可热加载配置：自定义源增删、启用开关、噪音过滤、在线前排
   admin_ui.py       单文件管理页（源管理/测速/设置）
@@ -96,6 +109,8 @@ sudo bash deploy/install.sh
   - 每词注入条数、在线前排开关
   - **噪音关键词自定义**：标签式增删、批量粘贴（逗号/顿号/换行分隔）、一键恢复默认；
     标题或备注命中任一关键词即不注入
+  - **在线热门媒体库**：开关、改名、展示条数/每源条数/每源页数/刷新间隔，查看最近刷新时间、
+    成功线路数与错误信息，可「立即刷新」
 
 ## 资源站接口格式
 
@@ -120,6 +135,7 @@ https://站点/api.php/provide/vod/at/json        # 搜索 ?ac=detail&wd=关键�
 | POST | `/v/api/ext/source/restore` | 恢复全部内置源 |
 | POST | `/v/api/ext/source/test` | `{id}` 或 `{api}` 单源连通性探测 |
 | POST | `/v/api/ext/source/test-all` | 并发探测全部源 |
+| POST | `/v/api/ext/hot/refresh` | 立即刷新「在线热门」缓存（后台聚合，失败保留旧缓存）|
 | GET | `/v/online-admin` | 管理页 |
 
 ## 选集（原生 TV UI）

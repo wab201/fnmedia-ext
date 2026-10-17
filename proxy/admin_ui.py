@@ -121,6 +121,31 @@ ADMIN_HTML = r"""<!doctype html>
   </div>
 
   <div class="card">
+    <h2>在线热门媒体库 <span class="badge" id="hotState">检测中</span>
+      <button class="ghost sm" style="margin-left:auto" onclick="refreshHot()">立即刷新</button>
+    </h2>
+    <div class="row" style="margin-bottom:12px">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="hotEnabled" style="width:16px;height:16px;accent-color:var(--ac)"/>
+        在飞牛影视媒体库中显示<strong style="margin-left:4px">在线热门</strong>（后台刷新，打开页面只读缓存）
+      </label>
+    </div>
+    <div class="addrow" style="grid-template-columns:1fr 120px 130px 120px 130px">
+      <input type="text" id="hotTitle" placeholder="媒体库名称" maxlength="20"/>
+      <input type="number" id="hotLimit" min="20" max="120" title="展示条数" placeholder="展示条数"/>
+      <input type="number" id="hotPerSource" min="10" max="40" title="每源条数" placeholder="每源条数"/>
+      <input type="number" id="hotPages" min="1" max="3" title="每源最近更新页数" placeholder="刷新页数"/>
+      <input type="number" id="hotInterval" min="3" max="24" title="自动刷新间隔（小时）" placeholder="刷新小时"/>
+    </div>
+    <div class="muted" style="margin:6px 0 10px">
+      名称 / 展示条数 / 每源条数 / 刷新间隔小时。最近更新按跨源命中数、更新时间和直链数量排序，失败时保留旧缓存。
+    </div>
+    <div id="hotStatus" class="meta">等待加载状态…</div>
+    <button onclick="saveHotCfg()" style="margin-top:10px">保存热门设置</button>
+    <span id="hotMsg" class="muted"></span>
+  </div>
+
+  <div class="card">
     <h2>已缓存在线条目 <span class="badge" id="cacheN"></span></h2>
     <div class="row">
       <input type="text" id="kw" placeholder="按标题过滤（先在飞牛搜索过的会出现在这里）" style="flex:1"/>
@@ -150,12 +175,45 @@ async function init(){
   $("maxn").value=CFG.max_per_keyword;
   $("junk").checked=CFG.filter_junk;
   $("onlineFirst").checked=CFG.online_first!==false;
+  renderHot(s.hot||{});
   KWS=Array.isArray(CFG.junk_keywords)?CFG.junk_keywords.slice():[];
   renderKw();
   renderSources();
   loadOnline();
 }
 
+function renderHot(h){
+  $("hotEnabled").checked=CFG.hot_library_enabled!==false;
+  $("hotTitle").value=CFG.hot_library_title||"🌐在线热门";
+  $("hotLimit").value=CFG.hot_limit||60;
+  $("hotPerSource").value=CFG.hot_per_source||30;
+  $("hotPages").value=CFG.hot_pages_per_source||2;
+  $("hotInterval").value=Math.round((CFG.hot_refresh_interval||21600)/3600);
+  const n=h.count||0, ok=h.provider_ok||0, total=h.total_sources||0;
+  $("hotState").textContent=n+" 条";
+  $("hotStatus").textContent=(h.refreshing?"正在后台刷新…":"最近刷新："+(h.updated_at_text||"尚未刷新"))
+    +` · 成功线路 ${ok}/${total}` + (h.last_error?(" · "+h.last_error):"");
+}
+async function saveHotCfg(){
+  const body={
+    hot_library_enabled:$("hotEnabled").checked,
+    hot_library_title:$("hotTitle").value.trim()||"🌐在线热门",
+    hot_limit:Math.max(20,Math.min(120,parseInt($("hotLimit").value)||60)),
+    hot_per_source:Math.max(10,Math.min(40,parseInt($("hotPerSource").value)||30)),
+    hot_pages_per_source:Math.max(1,Math.min(3,parseInt($("hotPages").value)||2)),
+    hot_refresh_interval:Math.max(3,Math.min(24,parseInt($("hotInterval").value)||6))*3600
+  };
+  const r=await jpost("/v/api/ext/config",body);
+  if(r.code===0){Object.assign(CFG,body);toast("热门设置已保存")}
+  else toast(r.msg||"保存失败",false);
+}
+async function refreshHot(){
+  toast("开始刷新热门缓存…");
+  const r=await jpost("/v/api/ext/hot/refresh",{});
+  const cfg=(await jget("/v/api/ext/status"));
+  CFG=cfg.config; renderHot(cfg.hot||r.data||{});
+  if(r.code===0) toast("热门缓存已刷新"); else toast(r.msg||"刷新失败",false);
+}
 function renderKw(){
   $("kwN").textContent="（共 "+KWS.length+" 个）";
   $("kwChips").innerHTML=KWS.map((k,i)=>

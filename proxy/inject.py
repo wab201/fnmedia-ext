@@ -19,8 +19,22 @@ def _poster(url: str) -> str:
 
 
 # 单集作为 Movie 点开即播；多集作为 TV，配合 season/list、episode/list
-# 伪造出原生选集 UI。
+# 伪造出原生选集 UI。苹果 CMS 的 type_name 用于修正“单集连载剧”等边界情况。
+_TV_TYPE_WORDS = ("电视剧", "连续剧", "日剧", "韩剧", "美剧", "英剧", "泰剧",
+                  "国剧", "日本剧", "韩国剧", "欧美剧", "海外剧", "港台剧", "港台",
+                  "动漫", "番剧", "动画剧", "综艺")
+_MOVIE_TYPE_WORDS = ("电影", "影片", "剧情片", "动作片", "喜剧片", "爱情片", "科幻片",
+                     "恐怖片", "纪录片")
+
+
 def is_tv(b: dict) -> bool:
+    typ = (b.get("type_name") or "").strip()
+    if any(w in typ for w in _MOVIE_TYPE_WORDS) and "动画电影" in typ:
+        return False
+    if "综艺" in typ and _ep_count(b) <= 1:
+        return False
+    if any(w in typ for w in _TV_TYPE_WORDS):
+        return _ep_count(b) > 0
     return _ep_count(b) > 1
 
 
