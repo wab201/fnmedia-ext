@@ -80,7 +80,7 @@ ADMIN_HTML = r"""<!doctype html>
         <input type="checkbox" id="addStandalone" style="width:15px;height:15px;accent-color:var(--ac)"/>独立库</label>
       <button onclick="addSource()">添加</button>
     </div>
-    <div class="muted" style="margin-top:8px">勾选「独立媒体库」会把该资源站单独生成为一张媒体库卡片（混合电影/剧集/动漫/综艺，无限滚动、点开即播）。国内直连已规避代理；删除内置源只是隐藏，可点“恢复内置源”找回。</div>
+    <div class="muted" style="margin-top:8px">「库」= 作为独立媒体库（混合电影/剧集/动漫/综艺，无限滚动、点开即播）；「放宽」= 私有源不按标题/备注过滤解说、预告、花絮等非正片词（适合自建、命名不规范的库），但成人等分类仍会被排除。国内直连已规避代理；删除内置源只是隐藏，可点“恢复内置源”找回。</div>
   </div>
 
   <div class="card">
@@ -276,8 +276,17 @@ function renderSources(){
   $("srcRows").innerHTML=srcs.map(src=>`
     <tr data-id="${src.id}">
       <td><input type="checkbox" class="en" ${src.enabled?"checked":""}/></td>
-      <td style="text-align:center"><input type="checkbox" class="sa" title="作为独立媒体库" ${src.standalone?"checked":""}
-         ${src.enabled?"":"disabled"} style="width:16px;height:16px;accent-color:var(--ac)"/></td>
+      <td style="text-align:center;white-space:nowrap">
+        <label title="把该资源站单独生成为一张媒体库卡片" style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:pointer">
+          <input type="checkbox" class="sa" ${src.standalone?"checked":""}
+           ${src.enabled?"":"disabled"} style="width:15px;height:15px;accent-color:var(--ac)"/>库
+        </label>
+        <label title="私有源放宽：独立库内不按标题/备注过滤解说/预告/花絮等（命名不规范的自抓片更友好）；成人分类仍会被排除"
+           style="display:inline-flex;align-items:center;gap:2px;font-size:11px;cursor:pointer;margin-left:4px">
+          <input type="checkbox" class="lf" ${src.loose_filter?"checked":""}
+           ${(src.enabled&&src.standalone)?"":"disabled"} style="width:15px;height:15px;accent-color:#d97706"/>放宽
+        </label>
+      </td>
       <td><div class="nm">${esc(src.name)}${src.builtin?'':'<span class="tag cu">自定义</span>'}${src.standalone?'<span class="tag cu">媒体库</span>':''}</div>
           <div class="meta">${esc(src.api)}</div></td>
       <td class="st wait" data-st>未测</td>
@@ -289,14 +298,22 @@ function renderSources(){
     tr.querySelector(".en").addEventListener("change",()=>toggleEnable(id,tr.querySelector(".en").checked));
     const sa=tr.querySelector(".sa");
     sa.addEventListener("change",()=>toggleStandalone(id,sa.checked));
+    const lf=tr.querySelector(".lf");
+    if(lf) lf.addEventListener("change",()=>toggleLoose(id,lf.checked));
     tr.querySelector("[data-test]").addEventListener("click",()=>testOne(id,tr));
     tr.querySelector("[data-del]").addEventListener("click",()=>delSource(id,srcName(id)));
   });
 }
 async function toggleStandalone(id,on){
   const r=await jpost("/v/api/ext/source/standalone",{id,standalone:on});
-  if(r.code===0){const s=CFG.sources.find(x=>x.id===id);if(s)s.standalone=on;
+  if(r.code===0){const s=CFG.sources.find(x=>x.id===id);if(s){s.standalone=on;if(!on)s.loose_filter=false;}
     renderSources();toast(on?"已生成独立媒体库（后台建库中，稍后刷新页面可见）":"已取消独立媒体库");}
+  else{toast(r.msg||"操作失败",false);renderSources();}
+}
+async function toggleLoose(id,on){
+  const r=await jpost("/v/api/ext/source/loose-filter",{id,loose_filter:on});
+  if(r.code===0){const s=CFG.sources.find(x=>x.id===id);if(s)s.loose_filter=on;
+    renderSources();toast(on?"已放宽正片过滤（后台刷新中）":"已恢复严格过滤");}
   else{toast(r.msg||"操作失败",false);renderSources();}
 }
 function srcName(id){const s=CFG.sources.find(x=>x.id===id);return s?s.name:id}

@@ -355,9 +355,10 @@ async def _aggregate_briefs(keyword: str, maxn: int | None = None) -> list[dict]
         maxn = int(config.get().get("max_per_keyword", 12))
     # 跨源同名合并：同 规范化片名+年份 聚成一个条目，每个来源各成一条
     # 播放线路（供播放器「切换线路」）；过滤解说/预告/无直链。
+    loose_ids = {s["id"] for s in sources if s.get("loose_filter")}
     groups: dict[tuple, dict] = {}
     for t in titles:
-        if config.is_junk(t.title, t.remarks):
+        if t.provider not in loose_ids and config.is_junk(t.title, t.remarks):
             continue
         playable = [e for line in t.sources.values() for e in line
                     if e.direct or e.resolve]
@@ -2057,6 +2058,8 @@ async def ext_set_config(request: Request):
                         bool(cur[sid].get("standalone")) != ch["standalone"]:
                     cur[sid]["standalone"] = ch["standalone"]
                     sources_changed = True
+                if isinstance(ch.get("loose_filter"), bool):
+                    cur[sid]["loose_filter"] = ch["loose_filter"]
         patch["sources"] = list(cur.values())
     config.save(patch)
     _search_cache.clear()
@@ -2106,6 +2109,29 @@ async def ext_source_standalone(request: Request):
     ok, info = config.set_standalone(sid, on)
     if not ok:
         return JSONResponse({"code": 404, "msg": info}, status_code=404)
+    _schedule_routes_refresh()
+    return {"code": 0, "msg": "ok"}
+
+
+@app.post("/v/api/ext/source/loose-filter")
+async def ext_source_loose(request: Request):
+    body = await request.json()
+    sid = body.get("id", "")
+    on = bool(body.get("loose_filter"))
+    ok, info = config.set_loose_filter(sid, on)
+    if not ok:
+        return JSONResponse({"code": 404, "msg": info}, status_code=404)
+    # 放宽规则变化要清掉该源作用域的页缓存，旧的过滤结果才不会残留
+    try:
+        with catalog._lock:
+            stale = [k for k in catalog._page_cache if k[0] == sid]
+        for k in stale:
+            catalog._page_cache.pop(k, None)
+            for buf in (catalog._dense, catalog._seen_guids,
+                        catalog._scanned_page, catalog._dense_count):
+                buf.pop(catalog._scope_key(sid, k[1]), None)
+    except Exception:
+        pass
     _schedule_routes_refresh()
     return {"code": 0, "msg": "ok"}
 

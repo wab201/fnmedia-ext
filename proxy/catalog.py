@@ -394,7 +394,11 @@ class Catalog:
                                 if e.direct or e.resolve]
                     if not playable:
                         continue
-                    if _cfg.is_junk(t.title, t.remarks):
+                    # 私有源放宽：单源作用域且该源开启 loose_filter 时，
+                    # 跳过标题/备注噪音过滤；分类层面的红线仍在（classify 已剔除）。
+                    loose = (scope != AGG_SCOPE
+                             and bool(source.get("loose_filter")))
+                    if not loose and _cfg.is_junk(t.title, t.remarks):
                         continue
                     brief = {
                         "guid": make_guid(t),

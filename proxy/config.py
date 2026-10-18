@@ -75,6 +75,7 @@ class Config:
                 m.update({k: cur[k] for k in ("enabled", "name", "api") if k in cur})
                 m["builtin"] = True
                 m["standalone"] = bool(cur.get("standalone", False))
+                m["loose_filter"] = bool(cur.get("loose_filter", False))
                 merged.append(m)
             for sid, s in saved_by_id.items():
                 if sid in _BUILTIN_IDS or sid in removed:
@@ -82,6 +83,7 @@ class Config:
                 m = {k: s.get(k) for k in ("id", "name", "api", "enabled")}
                 m["enabled"] = bool(s.get("enabled", True))
                 m["standalone"] = bool(s.get("standalone", False))
+                m["loose_filter"] = bool(s.get("loose_filter", False))
                 m["builtin"] = bool(s.get("builtin", False))
                 merged.append(m)
             cfg["sources"] = merged
@@ -185,6 +187,17 @@ class Config:
             if not target:
                 return False, "源不存在"
             target["standalone"] = bool(on)
+            self._persist(cfg)
+            return True, "ok"
+
+    def set_loose_filter(self, sid: str, on: bool) -> tuple[bool, str]:
+        """放宽正片（标题/备注噪音）过滤；分类层面的红线不受影响。"""
+        with _LOCK:
+            cfg = self.get()
+            target = next((s for s in cfg["sources"] if s["id"] == sid), None)
+            if not target:
+                return False, "源不存在"
+            target["loose_filter"] = bool(on)
             self._persist(cfg)
             return True, "ok"
 
