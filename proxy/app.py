@@ -1221,6 +1221,14 @@ async def stream_list(guid: str, request: Request):
         sl["video_streams"][0]["bps"] = quals[0]["bitrate"]
         sl["qualities"] = quals
         sl["cloud_storage_info"] = None
+    # 打开详情/线路菜单即后台预热默认线路播放列表（单飞，真正取 main 时并入）
+    if target:
+        try:
+            _mg = (sl.get("video_streams") or [{}])[0].get("media_guid")
+            if _mg:
+                _warm_playlist(_mg, target, request)
+        except Exception:
+            pass
     return JSONResponse({"code": 0, "msg": "", "data": sl})
 
 
@@ -1414,12 +1422,26 @@ async def play_info(request: Request):
     import json
     body = json.loads(await request.body() or b"{}")
     guid = body.get("item_guid", "")
+
+    def _prewarm_from_info(info: dict):
+        """点击播放即后台预热默认线路的播放列表，缩短首帧等待。"""
+        try:
+            mg = info.get("media_guid")
+            if not mg:
+                return
+            picked = _pick_episode(mg, request)
+            if picked:
+                _warm_playlist(mg, picked, request)
+        except Exception:
+            pass
+
     ep = store.get_episode(guid)
     rec = history.get(guid)
     if ep:
         info = inj.episode_play_info(ep)
         if rec:
             info["ts"] = rec.get("ts", 0)
+        _prewarm_from_info(info)
         return JSONResponse({"code": 0, "msg": "", "data": info})
     brief = store.get_title_by_guid(guid)
     if not brief and chart_cache.is_chart_guid(guid):
@@ -1440,10 +1462,12 @@ async def play_info(request: Request):
                 if ep:
                     info = inj.episode_play_info(ep)
                     info["ts"] = resume_ts
+                    _prewarm_from_info(info)
                     return JSONResponse({"code": 0, "msg": "", "data": info})
     info = inj.play_info(brief)
     if rec:
         info["ts"] = rec.get("ts", 0)  # 续播位置（秒），播放器据此恢复
+    _prewarm_from_info(info)
     return JSONResponse({"code": 0, "msg": "", "data": info})
 
 
@@ -1809,12 +1833,129 @@ async def _resolve_if_needed(picked: dict, request: Request) -> dict:
     return picked
 
 
+# ===== 起播速度优化：播放列表短时缓存/预热 =====
+# 说明：分辨率（清晰度）探测模块已整体搁置（ffprobe/额外分片占用资源、慢源下不稳定），
+# preset 线路菜单只显示线路名、不再追加分辨率；quality.py 仅保留 PNG 伪装分片解包用途。
+# 后续有更优的识别方案再行接入。
+
+
+# 改写后的媒体播放列表短时内存缓存，避免同一集起播/重试反复抓上游。
+# 上游地址带时效签名，TTL 取短；只缓存成功结果。
+_PLAYLIST_CACHE: dict[str, tuple[float, str]] = {}
+_PLAYLIST_TTL = 120.0
+# 单飞：同一「集+线路」只允许一次在途抓取，预热与真正取 main 共用同一个 Future
+_PLAYLIST_FUT: dict[str, asyncio.Future] = {}
+
+
+def _playlist_cache_key(picked: dict) -> str:
+    return f'{picked.get("online_guid","")}|{picked.get("line","")}|{int(picked.get("index",0) or 0)}'
+
+
+async def _build_playlist_body(mg: str, picked: dict, request: Request):
+    """抓取该线路的上游媒体列表，并把分片改写为经本代理的绝对地址。
+    返回 (body_text, base_url)；失败返回 (None, None)。"""
+    headers = picked["headers"]
+    was_redirect = bool(picked.get("redirect"))
+    await _resolve_if_needed(picked, request)
+    src_url = picked["url"]
+    text, cur = await _fetch_playlist(request, src_url, headers)
+    # 跳转型源站极慢且间歇抖动：解析后的真实地址抓取失败时，对原始跳转地址
+    # 强制重新解析一次再抓，避免整列表 502。
+    if text is None and was_redirect:
+        from store import store as _store
+        og = picked.get("online_guid")
+        raw = _store.get_title_by_guid(og) if og else None
+        jump = None
+        if raw:
+            for _ln, eps in (raw.get("lines") or {}).items():
+                for e in eps:
+                    if e.get("redirect"):
+                        jump = e.get("url")
+                        break
+                if jump:
+                    break
+        if jump:
+            fresh = await providers.resolve_redirect(
+                ext_client(request), jump, (headers or {}).get("Referer", ""))
+            if fresh:
+                text, cur = await _fetch_playlist(request, fresh, headers)
+                if text is not None:
+                    picked["url"] = fresh
+    if text is None:
+        return None, None
+
+    sel_qs = ""
+    if picked.get("line"):
+        sel_qs = f'line={urllib.parse.quote(picked["line"])}&index={picked["index"]}'
+    out_lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("#EXT-X-KEY") or line.startswith("#EXT-X-MAP"):
+            def repl(m):
+                uri = m.group(1)
+                absu = urllib.parse.urljoin(cur, uri)
+                return f'URI="{_seg_url(mg, absu, sel_qs)}"'
+            raw = re.sub(r'URI="([^"]+)"', repl, raw)
+            out_lines.append(raw)
+        elif line.startswith("#") or not line:
+            out_lines.append(raw)
+        else:
+            out_lines.append(_seg_url(mg, urllib.parse.urljoin(cur, line), sel_qs))
+    return "\n".join(out_lines) + "\n", cur
+
+
+async def _get_playlist_cached(mg: str, picked: dict, request: Request):
+    """取改写后的播放列表（内存缓存 + 单飞）。返回文本或 None。
+    若该集/线路已有在途抓取（点击时预热启动），直接等同一个结果，不重复请求上游。"""
+    key = _playlist_cache_key(picked)
+    now = time.time()
+    hit = _PLAYLIST_CACHE.get(key)
+    if hit and now - hit[0] < _PLAYLIST_TTL:
+        return hit[1]
+    fut = _PLAYLIST_FUT.get(key)
+    if fut is None:
+        fut = asyncio.get_event_loop().create_future()
+        _PLAYLIST_FUT[key] = fut
+
+        async def produce():
+            try:
+                body, _base = await _build_playlist_body(mg, picked, request)
+                if body is not None:
+                    _PLAYLIST_CACHE[key] = (time.time(), body)
+                    if len(_PLAYLIST_CACHE) > 600:
+                        for k in list(_PLAYLIST_CACHE)[:300]:
+                            _PLAYLIST_CACHE.pop(k, None)
+                if not fut.done():
+                    fut.set_result(body)
+            except Exception as exc:
+                if not fut.done():
+                    fut.set_result(None)
+                _log.info("playlist build failed: %s", exc)
+            finally:
+                _PLAYLIST_FUT.pop(key, None)
+
+        asyncio.create_task(produce())
+    return await fut
+
+
+def _warm_playlist(mg: str, picked: dict, request: Request) -> None:
+    """点击播放时后台预热默认线路播放列表（单飞，真正取 main 时并入同一任务）。"""
+    key = _playlist_cache_key(picked)
+    hit = _PLAYLIST_CACHE.get(key)
+    if hit and time.time() - hit[0] < _PLAYLIST_TTL:
+        return
+    if key in _PLAYLIST_FUT:
+        return  # 已在途
+    asyncio.create_task(_get_playlist_cached(mg, picked, request))
+
+
 @app.get(f"{ONLINE_PREFIX}/{{mg}}/preset.m3u8")
 async def hls_preset(mg: str, request: Request):
     picked = _pick_episode(mg, request)
     if not picked:
         return Response("not found", status_code=404)
-    await _resolve_if_needed(picked, request)
+    # 注意：此处不 await _resolve_if_needed —— preset 只输出线路变体菜单，
+    # 播放页/跳转/专有解码延迟到该线路被选中取 main 时再做，避免拖慢首屏。
     # play/play 选定线路后会带 line/index；此时只输出该线路，避免与清晰度菜单重复
     explicit_line = request.query_params.get("line")
     if explicit_line:
@@ -1823,51 +1964,17 @@ async def hls_preset(mg: str, request: Request):
                     "resolve": False}]
     else:
         targets = store.target_lines(picked)
-    # 枚举该集/正片在各播放线路下的地址；可解析页先解析
+    # 起播速度优先：preset 只枚举候选线路，不在关键路径解析播放页/302/专有解码，
+    # 那些动作延迟到该线路真正被选中取 main 时才做。
     hls_targets = []
     for t in targets:
-        if t.get("redirect"):
-            real = await providers.resolve_redirect(
-                ext_client(request), t["url"],
-                (t.get("headers") or {}).get("Referer", ""))
-            if real:
-                t["url"] = real
-                t["redirect"] = False
-                t["m3u8"] = bool(re.search(r"\.m3u8(\?|$)", real, re.I))
-        if t.get("resolve"):
-            real = await providers.resolve_share(
-                ext_client(request), t["url"],
-                (t.get("headers") or {}).get("Referer", ""))
-            if real:
-                t["url"] = real
-                t["m3u8"] = bool(re.search(r"\.m3u8(\?|$)", real, re.I))
-        if t.get("m3u8") or re.search(r"\.(m3u8|mp4)(\?|$)", t.get("url", ""), re.I):
+        if t.get("m3u8") or re.search(r"\.(m3u8|mp4)(\?|$)", t.get("url", ""), re.I) \
+                or t.get("resolve") or t.get("redirect") or t.get("xsrc"):
             hls_targets.append(t)
     if not hls_targets:
         return Response("no hls line", status_code=404)
 
-    # 多线路：用 ffprobe 探测每条真实地址的分辨率，给线路名追加 4K/1080P…
-    # 仅多线路（有切换菜单）时探测；并发、整体限时，失败不影响出单
-    if len(hls_targets) > 1:
-        import quality
-        title_guid = picked.get("online_guid", "")
-
-        async def _tag(t: dict) -> None:
-            try:
-                is_m3u8 = bool(t.get("m3u8")) or \
-                    bool(re.search(r"\.m3u8(\?|$)", t["url"], re.I))
-                t["_q"] = await quality.resolve(
-                    ext_client(request), t["url"], title_guid=title_guid,
-                    line=t["line"], headers=t.get("headers"),
-                    kind="m3u8" if is_m3u8 else "mp4")
-            except Exception:
-                t["_q"] = ""
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*[_tag(t) for t in hls_targets]), timeout=12)
-        except Exception:
-            pass  # 探测超时/异常：无标注也必须能播（结果已按线路缓存，下次更快）
-
+    # 分辨率探测模块已搁置：线路菜单只显示线路名，不追加分辨率标签。
     idx = int(picked.get("index", 0) or 0)
 
     def variant_uri(t: dict) -> str:
@@ -1876,19 +1983,16 @@ async def hls_preset(mg: str, request: Request):
         return "main.m3u8?" + urllib.parse.urlencode(q)
 
     if len(hls_targets) == 1:
-        # 单线路：保持原有清晰度写法
+        # 单线路：无 RESOLUTION 的单一变体（分辨率探测已搁置，不再写死占位分辨率）
         master = ("#EXTM3U\n#EXT-X-VERSION:3\n"
-                  "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080\n"
+                  "#EXT-X-STREAM-INF:BANDWIDTH=2000000\n"
                   f"{variant_uri(hls_targets[0])}\n")
     else:
         # 多线路：无 RESOLUTION 的变体，飞牛 HLS 播放器呈现为可切换「线路」
         out = ["#EXTM3U", "#EXT-X-VERSION:3"]
         for i, t in enumerate(hls_targets):
             name = _friendly_line(t["line"])
-            q = t.get("_q") or ""
-            if q:
-                name = f"{name} · {q}"
-            # NAME 供支持的播放器显示「线路名 · 分辨率」；BANDWIDTH 差异化避免被合并
+            # NAME 供支持的播放器显示线路名；BANDWIDTH 差异化避免变体被合并
             out.append(f'#EXT-X-STREAM-INF:BANDWIDTH={1000000 + i * 100000},'
                        f'PROGRAM-ID=1,NAME="{name}"')
             out.append(variant_uri(t))
@@ -1966,57 +2070,9 @@ async def hls_main(mg: str, request: Request):
     picked = _pick_episode(mg, request)
     if not picked:
         return Response("not found", status_code=404)
-    headers = picked["headers"]
-    was_redirect = bool(picked.get("redirect"))
-    await _resolve_if_needed(picked, request)
-    src_url = picked["url"]
-    # 抓取媒体列表（含嵌套 master 跟随 + 抖动重试）
-    text, cur = await _fetch_playlist(request, src_url, headers)
-    # 跳转型源站极慢且间歇抖动：若用解析后的真实地址抓取失败，则强制重新
-    # 解析一次（直接对原始 videodiag 跳转地址请求）再抓，避免整列表 502。
-    if text is None and was_redirect:
-        from store import store as _store
-        og = picked.get("online_guid")
-        raw = _store.get_title_by_guid(og) if og else None
-        jump = None
-        if raw:
-            for _ln, eps in (raw.get("lines") or {}).items():
-                for e in eps:
-                    if e.get("redirect"):
-                        jump = e.get("url")
-                        break
-                if jump:
-                    break
-        if jump:
-            fresh = await providers.resolve_redirect(
-                ext_client(request), jump,
-                (headers or {}).get("Referer", ""))
-            if fresh:
-                text, cur = await _fetch_playlist(request, fresh, headers)
-                if text is not None:
-                    picked["url"] = fresh
-    if text is None:
+    body = await _get_playlist_cached(mg, picked, request)
+    if body is None:
         return Response("fetch fail upstream", status_code=502)
-    base_url = cur  # 分片相对地址以最终媒体列表为基准
-
-    sel_qs = ""
-    if picked.get("line"):
-        sel_qs = f"line={urllib.parse.quote(picked['line'])}&index={picked['index']}"
-    out_lines = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.startswith("#EXT-X-KEY") or line.startswith("#EXT-X-MAP"):
-            def repl(m):
-                uri = m.group(1)
-                absu = urllib.parse.urljoin(base_url, uri)
-                return f'URI="{_seg_url(mg, absu, sel_qs)}"'
-            raw = re.sub(r'URI="([^"]+)"', repl, raw)
-            out_lines.append(raw)
-        elif line.startswith("#") or not line:
-            out_lines.append(raw)
-        else:
-            out_lines.append(_seg_url(mg, urllib.parse.urljoin(base_url, line), sel_qs))
-    body = "\n".join(out_lines) + "\n"
     return Response(body, media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-cache",
                              "Access-Control-Allow-Origin": "*"})
