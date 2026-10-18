@@ -81,6 +81,12 @@ CHART_GUID_CAT = {g: c for c, g in CHART_LIB_GUIDS.items()}
 # chart guid -> 已解析（挂载到 store）的可播放 brief
 _chart_resolved: dict[str, dict] = {}
 _chart_resolving: dict[str, asyncio.Future] = {}
+# 秒进播放页时，榜单片可能尚未绑定；暂记 media_guid -> chart guid，
+# 让播放页内的 stream/play/HLS 请求能找到同一个后台绑定任务，而不是漏给官方后端。
+_PENDING_MEDIA_CHART: dict[str, str] = {}
+# 已确认暂无可播源的榜单片：短时间内不要反复全网搜索（TTL 10 分钟）。
+_CHART_FAILED_TS: dict[str, float] = {}
+_CHART_FAILED_TTL = 10 * 60
 
 # 海量分类片库（方案 C：按资源站分类深翻，每类数千部，无限滚动）。
 CATALOG_LIB_GUIDS: dict[str, str] = {
@@ -172,6 +178,63 @@ def chart_card(item: dict) -> dict:
     }
 
 
+def start_resolve_chart(guid: str) -> asyncio.Future | None:
+    """启动榜单 guid 的后台解析（单飞），立即返回在途 Future；不阻塞当前请求。"""
+    existing = store.get_title_by_guid(guid)
+    if existing:
+        return None
+    if time.time() - _CHART_FAILED_TS.get(guid, 0) < _CHART_FAILED_TTL:
+        return None
+    fut = _chart_resolving.get(guid)
+    if fut is not None:
+        return fut
+    fut = asyncio.get_event_loop().create_future()
+    _chart_resolving[guid] = fut
+
+    async def work():
+        try:
+            item = chart_cache.get_guid(guid)
+            if not item:
+                fut.set_result(None)
+                return
+            briefs = await asyncio.wait_for(
+                _aggregate_briefs(item["title"], 12), timeout=25)
+            # 相关性：归一化片名必须包含完整榜单片名（分词全部命中），否则视为无源
+            want = _norm_title(item["title"])
+            want_tokens = [_norm_title(t) for t in re.split(r"[\s]+", item["title"]) if _norm_title(t)]
+            best = None
+            for b in briefs:
+                n = _norm_title(b.get("title", ""))
+                if n and (want in n or (len(want_tokens) > 1
+                                        and all(tok in n for tok in want_tokens))):
+                    best = b
+                    break
+            if best is None and briefs:
+                # 宽松兜底：取线路最多者（片名归一后高度重叠）
+                best = briefs[0]
+            if best is not None:
+                # 关键：把可播放 brief 的身份换成 chart guid，使播放链挂到榜单卡片
+                bound = dict(best)
+                bound["guid"] = guid
+                bound["chart"] = {"title": item["title"], "cat": item["cat"],
+                                  "cover": item.get("cover", ""),
+                                  "rating": item.get("rating", 0)}
+                _chart_resolved[guid] = bound
+                store.remember_merged([bound])
+                _PENDING_MEDIA_CHART.pop(media_guid(guid), None)
+                _CHART_FAILED_TS.pop(guid, None)
+            else:
+                _CHART_FAILED_TS[guid] = time.time()
+            fut.set_result(best)
+        except Exception:
+            fut.set_result(None)
+        finally:
+            _chart_resolving.pop(guid, None)
+
+    asyncio.create_task(work())
+    return fut
+
+
 async def resolve_chart(guid: str) -> dict | None:
     """用榜单片名去 CMS 聚合搜索，把最匹配的可播放 brief 挂到该 chart guid。
 
@@ -180,49 +243,82 @@ async def resolve_chart(guid: str) -> dict | None:
     existing = store.get_title_by_guid(guid)
     if existing:
         return existing
-    fut = _chart_resolving.get(guid)
+    fut = start_resolve_chart(guid)
     if fut is None:
-        fut = asyncio.get_event_loop().create_future()
-        _chart_resolving[guid] = fut
-
-        async def work():
-            try:
-                item = chart_cache.get_guid(guid)
-                if not item:
-                    fut.set_result(None)
-                    return
-                briefs = await asyncio.wait_for(
-                    _aggregate_briefs(item["title"], 12), timeout=25)
-                # 相关性：归一化片名必须包含完整榜单片名（分词全部命中），否则视为无源
-                want = _norm_title(item["title"])
-                want_tokens = [_norm_title(t) for t in re.split(r"[\s]+", item["title"]) if _norm_title(t)]
-                best = None
-                for b in briefs:
-                    n = _norm_title(b.get("title", ""))
-                    if n and (want in n or (len(want_tokens) > 1
-                                            and all(tok in n for tok in want_tokens))):
-                        best = b
-                        break
-                if best is None and briefs:
-                    # 宽松兜底：取线路最多者（片名归一后高度重叠）
-                    best = briefs[0]
-                if best is not None:
-                    # 关键：把可播放 brief 的身份换成 chart guid，使播放链挂到榜单卡片
-                    bound = dict(best)
-                    bound["guid"] = guid
-                    bound["chart"] = {"title": item["title"], "cat": item["cat"],
-                                      "cover": item.get("cover", ""),
-                                      "rating": item.get("rating", 0)}
-                    _chart_resolved[guid] = bound
-                    store.remember_merged([bound])
-                fut.set_result(best)
-            except Exception:
-                fut.set_result(None)
-            finally:
-                _chart_resolving.pop(guid, None)
-
-        asyncio.create_task(work())
+        return store.get_title_by_guid(guid)
     return await fut
+
+
+def chart_guid_by_media(mg: str) -> str:
+    """识别 media_guid 是否属于榜单/热门片（包括秒进时尚未绑定完成的）。"""
+    og = _PENDING_MEDIA_CHART.get(mg) or store.online_guid_by_media(mg)
+    return og if og and chart_cache.is_chart_guid(og) else ""
+
+
+async def resolve_chart_by_media(mg: str) -> dict | None:
+    """播放页内用 media_guid 找回榜单片并等待其后台绑定完成。"""
+    target = store.resolve_media_guid(mg)
+    if target:
+        return target
+    og = chart_guid_by_media(mg)
+    if og:
+        await resolve_chart(og)
+        _PENDING_MEDIA_CHART.pop(mg, None)
+        return store.resolve_media_guid(mg)
+    return None
+
+
+def _instant_play_response(mg: str, body_video_guid: str = ""):
+    """榜单源尚未绑定时的瞬时播放返回：先把播放器带进加载页，真正匹配延后到 preset。"""
+    play_link = f"{ONLINE_PREFIX}/{mg}/preset.m3u8?index=0"
+    return JSONResponse({"code": 0, "msg": "", "data": {
+        "audio_guid": "", "audio_index": -1, "hls_time": 6,
+        "is_subtitle_external": 0, "media_guid": mg,
+        "play_link": play_link, "subtitle_guid": "", "subtitle_index": -1,
+        "subtitle_link": "", "video_guid": body_video_guid or vg_for(mg),
+        "video_index": 0, "wrapper": "HLS",
+        "non_fatal_errno": None, "video_encoder": "",
+        "not_supported_resolution": "", "supported_highest_resolution": ""}})
+
+
+def _instant_stream_payload(mg: str):
+    """与 _instant_play_response 配套：只返回最小可播元数据，绝不等待搜源。"""
+    f = {
+        "guid": mg, "path": "在线/加载中.m3u8", "file_name": "加载中.m3u8",
+        "size": 0, "timestamp": 0, "type": 1, "sort_num": 0, "can_play": 1,
+        "play_error": "", "create_time": 0, "update_time": 0,
+        "parent_fv_guid": "", "file_birth_time": 0, "progress_thumb_hash_dir": "",
+    }
+    v = {
+        "media_guid": mg, "title": "", "guid": vg_for(mg),
+        "resolution_type": "1080p", "color_range_type": "SDR",
+        "codec_name": "h264", "codec_type": "video", "color_range": "tv",
+        "profile": "High", "index": 0, "width": 1920, "height": 1080,
+        "coded_width": 0, "coded_height": 0, "display_aspect_ratio": "16:9",
+        "pix_fmt": "yuv420p", "level": "40", "color_space": "",
+        "color_transfer": "", "color_primaries": "", "duration": 0,
+        "dv_profile": 0, "refs": 1, "r_frame_rate": "25 fps",
+        "avg_frame_rate": "25 fps", "bits_per_raw_sample": "8", "bps": 0,
+        "progressive": 1, "bit_depth": 8, "wrapper": "HLS",
+        "create_time": 0, "update_time": 0, "rotation": 0, "ext1": 0,
+        "is_bluray": False,
+    }
+    return {
+        "files": [f], "video_streams": [v], "audio_streams": [],
+        "subtitle_streams": [], "qualities": [], "cloud_storage_info": None,
+    }
+
+
+def _instant_stream_response(mg: str):
+    return JSONResponse({"code": 0, "msg": "",
+                         "data": _instant_stream_payload(mg)})
+
+
+def _no_source_response():
+    # 明确属于我们的在线榜单片、但源解析失败/暂无线路：返回本地可识别错误，
+    # 不能转发官方（它不认识虚拟 media guid，会报“权限不足/Auth Failed”）。
+    return JSONResponse({"code": 4001, "msg": "暂无可用在线片源，请稍后重试或切换其他影片",
+                         "data": None}, status_code=200)
 
 
 def hot_cat_title(cat: str) -> str:
@@ -1098,8 +1194,20 @@ async def item_detail(guid: str, request: Request):
         return JSONResponse({"code": 0, "msg": "", "data": data})
     # 榜单条目：按需用片名搜源解析；成功后复用标准详情，失败返回“暂无片源”。
     if chart_cache.is_chart_guid(guid):
-        bound = await resolve_chart(guid)
         meta = chart_cache.get_guid(guid) or {}
+        bound = store.get_title_by_guid(guid)
+        if bound is None and not (time.time() - _CHART_FAILED_TS.get(guid, 0)
+                                  < _CHART_FAILED_TTL):
+            # 详情接口也不能把用户卡在海报墙：后台搜源 + 极短窗口，超时先返回
+            # 可播骨架（play/info/stream/preset 会在播放页内继续等待同一任务）。
+            fut = start_resolve_chart(guid)
+            _PENDING_MEDIA_CHART[media_guid(guid)] = guid
+            if fut is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(fut), timeout=0.12)
+                except asyncio.TimeoutError:
+                    pass
+            bound = store.get_title_by_guid(guid)
         if bound is not None:
             data = inj.detail_item(bound)
             _apply_marks(data)
@@ -1113,19 +1221,25 @@ async def item_detail(guid: str, request: Request):
             if meta.get("desc") and not data.get("overview"):
                 data["overview"] = meta["desc"]
             return JSONResponse({"code": 0, "msg": "", "data": data})
-        # 未命中片源：仍返回详情骨架，但禁用播放并给出提示
         cat = meta.get("cat", "tv")
+        failed = time.time() - _CHART_FAILED_TS.get(guid, 0) < _CHART_FAILED_TTL
         data = inj._base_item(
             guid=guid,
             type="Movie" if cat == "movie" else "TV",
-            title=meta.get("title", ""), can_play=0,
+            title=meta.get("title", ""), can_play=0 if failed else 1,
             ancestor_guid=CHART_LIB_GUIDS.get(cat, ""),
             ancestor_name=chartmod.chart_cat_title(cat),
             ancestor_category=chartmod.chart_cat_mdb(cat),
             poster=meta.get("cover", ""), logic_type=0)
-        data["play_error"] = "暂无在线片源"
-        data["overview"] = (meta.get("desc") or
-                            "暂未在内置资源站找到可播片源，可过段时间再试，或用顶部搜索同名资源。")
+        # 匹配中：标记可播，让前端能立刻进入播放页；真正失败在播放页内给出提示。
+        data["play_item_guid"] = guid if not failed else ""
+        if failed:
+            data["play_error"] = "暂无在线片源"
+            data["overview"] = (meta.get("desc") or
+                                "暂未在内置资源站找到可播片源，可过段时间再试，或用顶部搜索同名资源。")
+        else:
+            data["play_error"] = ""
+            data["overview"] = meta.get("desc") or data.get("overview", "")
         data["vote_average"] = str(meta.get("rating") or "0")
         data["release_date"] = meta.get("year") or ""
         data["air_date"] = meta.get("year") or ""
@@ -1203,8 +1317,14 @@ async def stream_list(guid: str, request: Request):
     else:
         brief = store.get_title_by_guid(guid)
         if not brief and chart_cache.is_chart_guid(guid):
-            await resolve_chart(guid)
-            brief = store.get_title_by_guid(guid)
+            if time.time() - _CHART_FAILED_TS.get(guid, 0) < _CHART_FAILED_TTL:
+                return await forward_upstream(request)
+            # 打开详情/线路菜单也不能同步等搜源：启动后台匹配并立即返回占位线路，
+            # 真正播放时 play/info/preset 会等待同一单飞任务。
+            start_resolve_chart(guid)
+            _PENDING_MEDIA_CHART[media_guid(guid)] = guid
+            return JSONResponse({"code": 0, "msg": "",
+                                 "data": _instant_stream_payload(media_guid(guid))})
         if not brief:
             return await forward_upstream(request)
         sl = inj.stream_list(brief)
@@ -1445,10 +1565,42 @@ async def play_info(request: Request):
         return JSONResponse({"code": 0, "msg": "", "data": info})
     brief = store.get_title_by_guid(guid)
     if not brief and chart_cache.is_chart_guid(guid):
-        # 直接点榜单卡片的播放键（未先进详情页）时，chart guid 尚未绑定，
-        # 这里按需解析，否则会被转发给官方后端而得到“资源不存在”。
-        await resolve_chart(guid)
+        # 网页端必须先拿到 play/info 才会跳转播放页。这里不能长时间等待全网搜源，
+        # 否则用户会停在海报墙；先触发解析并给极短窗口，超时立即返回可播骨架，
+        # 后续进入播放页后的 stream/play 接口再等待同一个单飞任务完成。
+        fut = start_resolve_chart(guid)
+        if fut is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(fut), timeout=0.12)
+            except asyncio.TimeoutError:
+                pass
         brief = store.get_title_by_guid(guid)
+        if brief is None:
+            meta = chart_cache.get_guid(guid) or {}
+            cat = meta.get("cat", "tv")
+            typ = "Movie" if cat == "movie" else "TV"
+            _PENDING_MEDIA_CHART[media_guid(guid)] = guid
+            if len(_PENDING_MEDIA_CHART) > 1000:
+                for _k in list(_PENDING_MEDIA_CHART)[:500]:
+                    _PENDING_MEDIA_CHART.pop(_k, None)
+            info = {
+                "grand_guid": "", "guid": guid, "parent_guid": "",
+                "play_config": None, "ts": 0, "type": typ,
+                "video_guid": video_guid(guid),
+                "audio_guid": "", "subtitle_guid": "",
+                "media_guid": media_guid(guid),
+                "item": {
+                    "guid": guid, "type": typ, "title": meta.get("title", ""),
+                    "can_play": 1, "play_error": "",
+                    "season_number": 0 if typ == "Movie" else 1,
+                    "episode_number": 0, "parent_guid": "",
+                    "posters": inj._poster(meta.get("cover", "")) if meta.get("cover") else [],
+                    "backdrops": inj._poster(meta.get("cover", "")) if meta.get("cover") else [],
+                    "number_of_episodes": 1, "number_of_seasons": 1 if typ == "TV" else 0,
+                },
+                "direct_link_audio_index": -1,
+            }
+            return JSONResponse({"code": 0, "msg": "", "data": info})
     if not brief:
         return await forward_upstream(request)
     # 多集（TV）：标题播放键 → 智能续播（没看过=第1集；看过未看完=该集+进度；
@@ -1543,6 +1695,11 @@ async def stream_post(request: Request):
     body = json.loads(await request.body() or b"{}")
     mg = body.get("media_guid", "")
     target = store.resolve_media_guid(mg)
+    if not target and chart_guid_by_media(mg):
+        # 网页播放器会在进入播放页前连续请求 stream；这里必须瞬时返回，不能等待搜源，
+        # 否则三个请求串起来仍会把用户留在海报墙。真实匹配推迟到播放器请求 preset。
+        start_resolve_chart(chart_guid_by_media(mg))
+        return _instant_stream_response(mg)
     if not target:
         return await forward_upstream(request)
     if target.get("kind") == "episode":
@@ -1572,20 +1729,38 @@ async def media_range(mg: str, request: Request):
     非在线 mg 原样透传官方。
     """
     target = store.resolve_media_guid(mg)
+    chart_g = "" if target else chart_guid_by_media(mg)
+    if not target and chart_g:
+        if time.time() - _CHART_FAILED_TS.get(chart_g, 0) < _CHART_FAILED_TTL:
+            return Response("暂无可用在线片源", status_code=503)
+        # App 原生播放器也不等待搜索：立刻进入播放器，preset 内部再等待后台匹配
+        start_resolve_chart(chart_g)
+        return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/preset.m3u8?index=0",
+                                status_code=302)
     if not target:
         return await forward_upstream(request)
-    try:
-        await _resolve_if_needed(target, request)
-    except Exception as exc:
-        return Response(f"resolve fail {type(exc).__name__}", status_code=502)
-    src_url = target.get("url", "")
+    # 同样【不在此同步解析】（会卡 App 起播、像点了没反应）：先瞬时 302 到对应代理，
+    # 由 preset/main、direct 内部在播放加载阶段解析，并有双向 302 兜底。
+    _wrapper, is_hls = _guess_wrapper(target)
     q = urllib.parse.urlencode({"line": target["line"], "index": target["index"]})
-    if re.search(r"\.m3u8(\?|$)", src_url, re.I):
-        # HLS：交给 m3u8 代理（重写分片/密钥为同源地址）
+    if is_hls:
         return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/preset.m3u8?{q}",
                                 status_code=302)
-    # mp4 / 直链：direct 代理本身支持 Range 与 seek
     return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/direct?{q}", status_code=302)
+
+
+def _guess_wrapper(target: dict) -> tuple[str, bool]:
+    """不发起任何网络请求，预判该线路该用 HLS 还是 MP4 包装。
+    返回 (wrapper, is_hls)。预判可能失误：main/direct 入口在真正解析后会做
+    双向 302 兜底，所以这里宁可默认 HLS（绝大多数资源是 m3u8）。"""
+    url = (target.get("url") or "")
+    path = url.split("?", 1)[0].lower()
+    # 裸 mp4 直链（非跳转/解析页）才直接判 MP4
+    if not target.get("redirect") and not target.get("resolve") \
+            and re.search(r"\.mp4$", path):
+        return "MP4", False
+    # 跳转页 / 分享解析页 / 普通直链默认 HLS；解析后若实为 mp4，main 会 302 到 direct
+    return "HLS", True
 
 
 @app.post("/v/api/v1/play/play")
@@ -1594,6 +1769,11 @@ async def play_play(request: Request):
     body = json.loads(await request.body() or b"{}")
     mg = body.get("media_guid", "")
     base_target = store.resolve_media_guid(mg)
+    if not base_target and chart_guid_by_media(mg):
+        # 未绑定榜单片：play/play 也立即返回占位 HLS，播放器先进入加载页；
+        # preset/main 请求时再等待后台匹配，避免 play/info+stream+play 串行等待。
+        start_resolve_chart(chart_guid_by_media(mg))
+        return _instant_play_response(mg, body.get("video_guid", ""))
     if not base_target:
         return await forward_upstream(request)
     # 播放器「清晰度/线路」菜单切换时会带我们编码的 bitrate，据此选线路
@@ -1615,17 +1795,20 @@ async def play_play(request: Request):
                 target = base_target
     else:
         target = base_target
-    await _resolve_if_needed(target, request)
-    # mg 已与"标题第一集"或"具体某集"绑定；按源类型返回 HLS 或直链代理
-    src_url = target.get("url", "")
-    if re.search(r"\.m3u8(\?|$)", src_url, re.I):
-        q = urllib.parse.urlencode({"line": target["line"], "index": target["index"]})
+    # 起播体验：此处【不再同步解析】播放页/302/专有解码（慢源要 1~3 秒，会把用户
+    # 卡在海报墙像“点了没反应”）。先瞬时返回播放地址让播放器立刻进入加载页转圈，
+    # 真正的解析延迟到播放器内部取 main.m3u8 / direct 时再做（那里本就有加载指示）。
+    wrapper, is_hls = _guess_wrapper(target)
+    q = urllib.parse.urlencode({"line": target["line"], "index": target["index"]})
+    if is_hls:
         play_link = f"{ONLINE_PREFIX}/{mg}/preset.m3u8?{q}"
-        wrapper = "HLS"
+        # 后台立刻预热该线路（含解析 + 播放列表），播放器取 main 时大概率已就绪
+        try:
+            _warm_playlist(mg, target, request)
+        except Exception:
+            pass
     else:
-        q = urllib.parse.urlencode({"line": target["line"], "index": target["index"]})
         play_link = f"{ONLINE_PREFIX}/{mg}/direct?{q}"
-        wrapper = "MP4"
     return JSONResponse({"code": 0, "msg": "", "data": {
         "audio_guid": "", "audio_index": -1, "hls_time": 6,
         "is_subtitle_external": 0, "media_guid": mg,
@@ -1639,14 +1822,31 @@ async def play_play(request: Request):
 @app.get(f"{ONLINE_PREFIX}/{{mg}}/direct")
 async def direct_proxy(mg: str, request: Request):
     """mp4 等非 HLS 直链代理：同源、带 Range 支持（播放器 seek）。"""
+    failed_g = await _await_pending_chart(mg)
     target = store.resolve_media_guid(mg)
     if not target:
+        if failed_g:
+            return Response("暂无可用在线片源", status_code=503)
         return Response("not found", status_code=404)
+    # direct 的 query 会显式带线路（HLS 预判为 MP4 时回跳而来）；必须解析该线路，
+    # 不能沿用默认线路，否则可能拿到另一资源站的 HLS 而再次弹回，形成重定向环。
+    qline = request.query_params.get("line")
+    if qline and qline != target.get("line"):
+        if target.get("kind") == "episode" and target.get("ep_guid"):
+            switched = store.get_episode_target(target["ep_guid"], qline)
+        else:
+            switched = store.resolve_episode(
+                target["online_guid"], qline, int(target.get("index", 0) or 0))
+        if switched:
+            target = switched
     await _resolve_if_needed(target, request)
     src_url = target["url"]
     if re.search(r"\.m3u8(\?|$)", src_url, re.I):
-        # 源是 HLS 却走到直链：重定向到 preset
-        return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/preset.m3u8", status_code=302)
+        # 源是 HLS 却走到直链（MP4 预判失误）：带线路/集序重定向到 preset
+        q = urllib.parse.urlencode({"line": target["line"],
+                                    "index": target.get("index", 0)})
+        return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/preset.m3u8?{q}",
+                                status_code=302)
     fwd = dict(target.get("headers") or {})
     if request.headers.get("range"):
         fwd["Range"] = request.headers["range"]
@@ -1795,8 +1995,8 @@ def _pick_episode(mg: str, request: Request) -> dict | None:
                 return dict(r, online_guid=target["online_guid"],
                             ep_guid=target.get("ep_guid", ""), kind=target.get("kind"))
         return target
-    # 兼容：未在索引中的旧 mg，退回标题解析
-    og = store.online_guid_by_media(mg)
+    # 兼容：未在索引中的旧 mg，退回标题解析；也支持秒进时登记的待绑定榜单片
+    og = store.online_guid_by_media(mg) or _PENDING_MEDIA_CHART.get(mg)
     if not og:
         return None
     try:
@@ -1804,6 +2004,15 @@ def _pick_episode(mg: str, request: Request) -> dict | None:
     except ValueError:
         index = 0
     return store.resolve_episode(og, request.query_params.get("line"), index)
+
+
+async def _await_pending_chart(mg: str) -> str:
+    """若该 media 属于秒进播放页、尚未绑定完成的榜单片，等待其后台绑定结束。"""
+    og = _PENDING_MEDIA_CHART.get(mg) or store.online_guid_by_media(mg)
+    if og and chart_cache.is_chart_guid(og) and not store.resolve_media_guid(mg):
+        await resolve_chart(og)
+        return og if not store.resolve_media_guid(mg) else ""
+    return ""
 
 
 def _seg_url(mg: str, absolute: str, qs: str = "") -> str:
@@ -1846,6 +2055,9 @@ _PLAYLIST_TTL = 120.0
 # 单飞：同一「集+线路」只允许一次在途抓取，预热与真正取 main 共用同一个 Future
 _PLAYLIST_FUT: dict[str, asyncio.Future] = {}
 
+# 哨兵：该线路解析后实为 mp4 直链（非 HLS），调用方应 302 到 direct
+_NOT_HLS = object()
+
 
 def _playlist_cache_key(picked: dict) -> str:
     return f'{picked.get("online_guid","")}|{picked.get("line","")}|{int(picked.get("index",0) or 0)}'
@@ -1858,6 +2070,10 @@ async def _build_playlist_body(mg: str, picked: dict, request: Request):
     was_redirect = bool(picked.get("redirect"))
     await _resolve_if_needed(picked, request)
     src_url = picked["url"]
+    # 解析后若发现其实是 mp4 直链（wrapper 预判为 HLS 时的兜底），交由调用方 302
+    if not re.search(r"\.m3u8(\?|$)", src_url, re.I) \
+            and re.search(r"\.mp4(\?|$)", src_url, re.I):
+        return _NOT_HLS, None
     text, cur = await _fetch_playlist(request, src_url, headers)
     # 跳转型源站极慢且间歇抖动：解析后的真实地址抓取失败时，对原始跳转地址
     # 强制重新解析一次再抓，避免整列表 502。
@@ -1920,7 +2136,7 @@ async def _get_playlist_cached(mg: str, picked: dict, request: Request):
         async def produce():
             try:
                 body, _base = await _build_playlist_body(mg, picked, request)
-                if body is not None:
+                if body is not None and body is not _NOT_HLS:
                     _PLAYLIST_CACHE[key] = (time.time(), body)
                     if len(_PLAYLIST_CACHE) > 600:
                         for k in list(_PLAYLIST_CACHE)[:300]:
@@ -1951,17 +2167,20 @@ def _warm_playlist(mg: str, picked: dict, request: Request) -> None:
 
 @app.get(f"{ONLINE_PREFIX}/{{mg}}/preset.m3u8")
 async def hls_preset(mg: str, request: Request):
+    failed_g = await _await_pending_chart(mg)
     picked = _pick_episode(mg, request)
     if not picked:
+        if failed_g:
+            return Response("暂无可用在线片源", status_code=503)
         return Response("not found", status_code=404)
     # 注意：此处不 await _resolve_if_needed —— preset 只输出线路变体菜单，
     # 播放页/跳转/专有解码延迟到该线路被选中取 main 时再做，避免拖慢首屏。
     # play/play 选定线路后会带 line/index；此时只输出该线路，避免与清晰度菜单重复
     explicit_line = request.query_params.get("line")
     if explicit_line:
-        targets = [{"line": picked["line"], "url": picked["url"],
-                    "m3u8": bool(re.search(r"\.m3u8(\?|$)", picked["url"], re.I)),
-                    "resolve": False}]
+        # _pick_episode 已按 line/index 解析出该线路完整 target（含
+        # redirect/resolve/xsrc 标志）；这里原样使用，真正解析推迟到取 main 时。
+        targets = [picked]
     else:
         targets = store.target_lines(picked)
     # 起播速度优先：preset 只枚举候选线路，不在关键路径解析播放页/302/专有解码，
@@ -2067,12 +2286,19 @@ async def _fetch_playlist(request: Request, url: str, headers: dict,
 
 @app.get(f"{ONLINE_PREFIX}/{{mg}}/main.m3u8")
 async def hls_main(mg: str, request: Request):
+    failed_g = await _await_pending_chart(mg)
     picked = _pick_episode(mg, request)
     if not picked:
+        if failed_g:
+            return Response("暂无可用在线片源", status_code=503)
         return Response("not found", status_code=404)
     body = await _get_playlist_cached(mg, picked, request)
     if body is None:
         return Response("fetch fail upstream", status_code=502)
+    if body is _NOT_HLS:
+        # 预判为 HLS、解析后实为 mp4：302 到直链代理（direct 复用已解析结果）
+        q = urllib.parse.urlencode({"line": picked["line"], "index": picked["index"]})
+        return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/direct?{q}", status_code=302)
     return Response(body, media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-cache",
                              "Access-Control-Allow-Origin": "*"})
@@ -2085,6 +2311,7 @@ async def hls_seg(mg: str, request: Request):
         src_url = b64d(u)
     except Exception:
         return Response("bad u", status_code=400)
+    await _await_pending_chart(mg)
     picked = _pick_episode(mg, request)
     headers = picked["headers"] if picked else {}
     # 透传 Range（播放器 seek）

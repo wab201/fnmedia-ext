@@ -480,9 +480,11 @@ class Catalog:
                         # 空结果只短缓存，避免慢源一次抖动把该页冻结 10 分钟
                         ttl = EMPTY_TTL if not briefs else PAGE_TTL
                         self._page_cache[key] = (time.time(), briefs, ttl)
-                    fut.set_result(briefs)
+                    if not fut.done():
+                        fut.set_result(briefs)
                 except Exception:
-                    fut.set_result([])
+                    if not fut.done():
+                        fut.set_result([])
                 finally:
                     with self._lock:
                         self._inflight.pop(key, None)

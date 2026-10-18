@@ -113,7 +113,7 @@ class Store:
                                         "ep_title": e.get("title", ""),
                                         "resolve": bool(e.get("resolve")),
                                         "redirect": bool(e.get("redirect")),
-                                        "xsrc": bool(e.get("xsrc")),
+                                        "xsrc": bool(e.get("xsrc") or e.get("dduo")),
                                         "play_from": e.get("play_from", "")}
                 self._ep_index[eg] = {
                     "ep_guid": eg, "online_guid": g, "index": i, "season": 1,
@@ -218,7 +218,7 @@ class Store:
                         "m3u8": bool(re.search(r"\.m3u8(\?|$)", url, re.I)),
                         "redirect": bool(eps[idx].get("redirect")),
                         "resolve": bool(eps[idx].get("resolve")),
-                        "xsrc": bool(eps[idx].get("xsrc")),
+                        "xsrc": bool(eps[idx].get("xsrc") or eps[idx].get("dduo")),
                         "play_from": eps[idx].get("play_from", ""),
                         "online_guid": og, "index": idx,
                         "headers": eps[idx].get("headers", {})})
@@ -414,7 +414,7 @@ class Store:
                 "line": name, "index": ep_index, "total": len(eps),
                 "resolve": bool(ep.get("resolve")),
                 "redirect": bool(ep.get("redirect")),
-                "xsrc": bool(ep.get("xsrc")),
+                "xsrc": bool(ep.get("xsrc") or ep.get("dduo")),
                 "play_from": ep.get("play_from", ""),
                 "online_guid": guid,
                 "ep_title": ep["title"], "title": brief.get("title", "")}
