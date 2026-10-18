@@ -36,6 +36,11 @@ cp "${FPK_DIR}/ICON.PNG" "${FPK_DIR}/ICON_256.PNG" "${STAGE}/" 2>/dev/null || tr
 cp -a "${FPK_DIR}/app/ui/." "${STAGE}/app/ui/"
 cp -a "${FPK_DIR}/cmd" "${STAGE}/cmd"
 cp -a "${FPK_DIR}/config" "${STAGE}/config"
+# 安装向导（安装时展示免责声明，需用户同意）
+if [ -d "${FPK_DIR}/wizard" ]; then
+  mkdir -p "${STAGE}/wizard"
+  cp -a "${FPK_DIR}/wizard/." "${STAGE}/wizard/"
+fi
 chmod +x "${STAGE}"/cmd/*
 
 echo "[fpk] 组装完成: ${STAGE} (version=${VERSION})"

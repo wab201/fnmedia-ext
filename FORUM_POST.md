@@ -83,22 +83,22 @@ GitHub 仓库：
 
 <https://github.com/yujian0815/fnmedia-ext>
 
-最新 Release（v0.1.4）：
+最新 Release（v0.1.5）：
 
-<https://github.com/yujian0815/fnmedia-ext/releases/tag/v0.1.4>
+<https://github.com/yujian0815/fnmedia-ext/releases/tag/v0.1.5>
 
 > 📌 各版本更新记录见 **2 楼**。
 
 请下载附件：
 
 ```text
-fnmedia-ext-0.1.4.fpk
+fnmedia-ext-0.1.5.fpk
 ```
 
 SHA256：
 
 ```text
-9ef85db21bd17ba2616d98abc2e66cab104c26816b98361ce4e073bd32f0cce7
+c7760d23c76c27628a0c85773b215307349a84afd5e527c45c67ee894d70ee61
 ```
 
 > 已安装 0.1.2 的可直接覆盖升级，线路配置与本地缓存会保留。
@@ -116,8 +116,8 @@ SHA256：
 ### 2. 手动安装 FPK
 
 1. 打开 fnOS **应用中心**；
-2. 选择 **手动安装 / 安装 FPK**；
-3. 上传或选择 `fnmedia-ext-0.1.4.fpk`；
+2. 选择 **手动安装 / 安装 FPK**（安装时会先显示免责声明，需勾选“我已阅读并同意”才能继续）；
+3. 上传或选择 `fnmedia-ext-0.1.5.fpk`；
 4. 选择应用安装的数据卷；
 5. 确认依赖应用 **影视 (trim.media)**；
 6. 等待安装完成；
