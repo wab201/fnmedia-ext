@@ -1202,6 +1202,9 @@ async def stream_list(guid: str, request: Request):
         target = store.get_episode_target(guid)
     else:
         brief = store.get_title_by_guid(guid)
+        if not brief and chart_cache.is_chart_guid(guid):
+            await resolve_chart(guid)
+            brief = store.get_title_by_guid(guid)
         if not brief:
             return await forward_upstream(request)
         sl = inj.stream_list(brief)
@@ -1419,6 +1422,11 @@ async def play_info(request: Request):
             info["ts"] = rec.get("ts", 0)
         return JSONResponse({"code": 0, "msg": "", "data": info})
     brief = store.get_title_by_guid(guid)
+    if not brief and chart_cache.is_chart_guid(guid):
+        # 直接点榜单卡片的播放键（未先进详情页）时，chart guid 尚未绑定，
+        # 这里按需解析，否则会被转发给官方后端而得到“资源不存在”。
+        await resolve_chart(guid)
+        brief = store.get_title_by_guid(guid)
     if not brief:
         return await forward_upstream(request)
     # 多集（TV）：标题播放键 → 智能续播（没看过=第1集；看过未看完=该集+进度；
