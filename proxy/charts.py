@@ -39,37 +39,46 @@ CHART_CATEGORIES = [
     ("variety", "🎤热门综艺", "Mix"),
 ]
 
-# 每个库的取数配方：60s 周榜 + 豆瓣 tag 推荐（去重合并，取靠前/高分）。
+# 每个库的取数配方：60s 周榜 + 豆瓣 tag 推荐（tag 可翻多页，pages 每标签取页数，
+# 每页 20 条）。去重合并：周榜固定排在最前，其余按配方/页序补足。
 # kind: weekly=60s 豆瓣周榜；tag=豆瓣官方 search_subjects。
 _CHART_RECIPES: dict[str, list[dict]] = {
     "movie": [
         {"kind": "weekly", "path": "movie"},
-        {"kind": "tag", "type": "movie", "tag": "热门"},
-        {"kind": "tag", "type": "movie", "tag": "豆瓣高分"},
-        {"kind": "tag", "type": "movie", "tag": "最新"},
+        {"kind": "tag", "type": "movie", "tag": "热门", "pages": 4},
+        {"kind": "tag", "type": "movie", "tag": "最新", "pages": 3},
+        {"kind": "tag", "type": "movie", "tag": "豆瓣高分", "pages": 2},
+        {"kind": "tag", "type": "movie", "tag": "华语", "pages": 2},
+        {"kind": "tag", "type": "movie", "tag": "欧美", "pages": 2},
     ],
     "tv": [
         {"kind": "weekly", "path": "tv_chinese"},
         {"kind": "weekly", "path": "tv_global"},
-        {"kind": "tag", "type": "tv", "tag": "热门"},
-        {"kind": "tag", "type": "tv", "tag": "美剧"},
-        {"kind": "tag", "type": "tv", "tag": "韩剧"},
-        {"kind": "tag", "type": "tv", "tag": "日剧"},
+        {"kind": "tag", "type": "tv", "tag": "热门", "pages": 4},
+        {"kind": "tag", "type": "tv", "tag": "美剧", "pages": 3},
+        {"kind": "tag", "type": "tv", "tag": "国产剧", "pages": 3},
+        {"kind": "tag", "type": "tv", "tag": "韩剧", "pages": 2},
+        {"kind": "tag", "type": "tv", "tag": "日剧", "pages": 2},
     ],
     "anime": [
-        {"kind": "tag", "type": "tv", "tag": "日本动画"},
-        {"kind": "tag", "type": "tv", "tag": "动画"},
-        {"kind": "tag", "type": "movie", "tag": "动画"},
+        {"kind": "tag", "type": "tv", "tag": "日本动画", "pages": 5},
+        {"kind": "tag", "type": "tv", "tag": "动画", "pages": 4},
+        {"kind": "tag", "type": "movie", "tag": "动画", "pages": 3},
     ],
     "variety": [
         {"kind": "weekly", "path": "show_chinese"},
         {"kind": "weekly", "path": "show_global"},
-        {"kind": "tag", "type": "tv", "tag": "综艺"},
+        {"kind": "tag", "type": "tv", "tag": "综艺", "pages": 6},
+        {"kind": "tag", "type": "tv", "tag": "真人秀", "pages": 3},
+        {"kind": "tag", "type": "tv", "tag": "脱口秀", "pages": 2},
     ],
 }
 
-# 每个库最终保留的条数
-CHART_LIMIT = 40
+# 每个库最终保留的条数（去重后截断）
+CHART_LIMIT = 160
+TAG_PAGE_SIZE = 20
+# 豆瓣同一 host 的请求并发上限，避免触发限流
+_TAG_CONCURRENCY = 4
 
 _IS_TV_LIB = {"tv", "anime", "variety"}
 
@@ -133,30 +142,37 @@ async def _fetch_weekly(client: httpx.AsyncClient, path: str) -> list[dict]:
 
 
 async def _fetch_tag(client: httpx.AsyncClient, typ: str, tag: str,
-                     limit: int = 20) -> list[dict]:
-    """豆瓣官方 tag 推荐，归一为与周榜近似的结构。"""
-    params = {"type": typ, "tag": tag, "sort": "recommend",
-              "page_limit": limit, "page_start": 0}
-    r = await client.get(DOUBAN_SUBJECTS, params=params,
-                         headers={"User-Agent": _UA,
-                                  "Referer": "https://movie.douban.com/",
-                                  "Accept": "application/json"}, timeout=10)
-    r.raise_for_status()
-    j = r.json()
-    out = []
-    for s in j.get("subjects") or []:
-        if not s.get("title") or not s.get("cover"):
-            continue
-        out.append({
-            "id": str(s.get("id")),
-            "title": s.get("title"),
-            "rating": _to_float(s.get("rate")),
-            "cover": s.get("cover"),
-            "card_subtitle": (s.get("episodes_info") or "").strip(),
-            "is_tv": typ == "tv",
-            "origin": "douban-tag",
-            "tag": tag,
-        })
+                     pages: int = 1) -> list[dict]:
+    """豆瓣官方 tag 推荐，可翻多页（每页 TAG_PAGE_SIZE）。某页失败/为空即停。"""
+    out: list[dict] = []
+    for pg in range(max(1, int(pages))):
+        params = {"type": typ, "tag": tag, "sort": "recommend",
+                  "page_limit": TAG_PAGE_SIZE, "page_start": pg * TAG_PAGE_SIZE}
+        try:
+            r = await client.get(
+                DOUBAN_SUBJECTS, params=params,
+                headers={"User-Agent": _UA,
+                         "Referer": "https://movie.douban.com/",
+                         "Accept": "application/json"}, timeout=10)
+            r.raise_for_status()
+            subjects = (r.json() or {}).get("subjects") or []
+        except Exception:
+            break
+        if not subjects:
+            break
+        for s in subjects:
+            if not s.get("title") or not s.get("cover"):
+                continue
+            out.append({
+                "id": str(s.get("id")),
+                "title": s.get("title"),
+                "rating": _to_float(s.get("rate")),
+                "cover": s.get("cover"),
+                "card_subtitle": (s.get("episodes_info") or "").strip(),
+                "is_tv": typ == "tv",
+                "origin": "douban-tag",
+                "tag": tag,
+            })
     return out
 
 
@@ -212,12 +228,18 @@ def _normalize_weekly(raw: dict, cat: str) -> dict | None:
 
 async def collect_charts() -> dict[str, Any]:
     """并发拉取所有配方，去重合并为 4 个库。返回可持久化结构。"""
-    sem = asyncio.Semaphore(6)
+    sem = asyncio.Semaphore(8)
+    tag_sem = asyncio.Semaphore(_TAG_CONCURRENCY)  # 豆瓣 search_subjects 限流
     provider_ok = 0
     provider_total = 0
 
-    async def with_sem(coro):
+    async def run_weekly(coro):
         async with sem:
+            return await coro
+
+    async def run_tag(coro):
+        # 周榜走 60s 实例，豆瓣 tag 直连 movie.douban.com，分别限流
+        async with tag_sem:
             return await coro
 
     async with httpx.AsyncClient(follow_redirects=True, trust_env=False) as client:
@@ -228,10 +250,12 @@ async def collect_charts() -> dict[str, Any]:
             for rc in recipes:
                 provider_total += 1
                 if rc["kind"] == "weekly":
-                    coro = _fetch_weekly(client, rc["path"])
+                    t = asyncio.ensure_future(
+                        run_weekly(_fetch_weekly(client, rc["path"])))
                 else:
-                    coro = _fetch_tag(client, rc["type"], rc["tag"])
-                t = asyncio.ensure_future(with_sem(coro))
+                    t = asyncio.ensure_future(
+                        run_tag(_fetch_tag(client, rc["type"], rc["tag"],
+                                           pages=int(rc.get("pages", 1)))))
                 recipe_jobs.setdefault(cat, []).append(t)
                 recipe_meta[t] = (cat, rc)
 
