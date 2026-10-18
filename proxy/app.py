@@ -36,6 +36,8 @@ import hot as hotmod
 from hot import hot_cache
 import charts as chartmod
 from charts import chart_cache
+import catalog as catalogmod
+from catalog import catalog
 import history as histmod
 from history import history
 from store import (store, make_guid, media_guid, video_guid, is_online_guid,
@@ -76,6 +78,15 @@ CHART_GUID_CAT = {g: c for c, g in CHART_LIB_GUIDS.items()}
 # chart guid -> 已解析（挂载到 store）的可播放 brief
 _chart_resolved: dict[str, dict] = {}
 _chart_resolving: dict[str, asyncio.Future] = {}
+
+# 海量分类片库（方案 C：按资源站分类深翻，每类数千部，无限滚动）。
+CATALOG_LIB_GUIDS: dict[str, str] = {
+    "movie":   "e91dd7347a49dbd874fb8a0e78ad7ad7",
+    "tv":      "196381f891d66a4de32f9032e8f244f3",
+    "anime":   "97fc49015edcb20cc423658401711b6c",
+    "variety": "cfff30730cffca2d1357e0c2b52fc2f5",
+}
+CATALOG_GUID_CAT = {g: c for c, g in CATALOG_LIB_GUIDS.items()}
 
 
 def charts_enabled() -> bool:
@@ -234,19 +245,28 @@ async def lifespan(app: FastAPI):
 
 
 async def _hot_worker(app: FastAPI):
-    """榜单后台刷新：启动先读旧缓存，稍等启动流程，再按需刷新；之后按配置轮询。"""
+    """榜单 + 海量库路由后台刷新。启动先读旧缓存，稍等再刷新；之后按配置轮询。"""
     await asyncio.sleep(4)
     while not app.state.stop_hot.is_set():
         cfg = config.get()
+        enabled = cfg.get("hot_library_enabled", True)
         interval = max(1800, int(cfg.get("hot_refresh_interval", 6 * 3600)))
-        if cfg.get("hot_library_enabled", True) and chart_cache.stale(interval):
-            try:
-                await asyncio.wait_for(chart_cache.refresh(force=True),
-                                       timeout=chartmod.REFRESH_TIMEOUT)
-            except asyncio.TimeoutError:
-                _log.warning("chart refresh timed out; keeping previous cache")
-            except Exception as exc:
-                _log.warning("chart refresh failed, keeping previous cache: %s", exc)
+        if enabled:
+            if chart_cache.stale(interval):
+                try:
+                    await asyncio.wait_for(chart_cache.refresh(force=True),
+                                           timeout=chartmod.REFRESH_TIMEOUT)
+                except asyncio.TimeoutError:
+                    _log.warning("chart refresh timed out; keeping previous cache")
+                except Exception as exc:
+                    _log.warning("chart refresh failed, keeping previous cache: %s", exc)
+            if catalog.routes_stale():
+                try:
+                    await asyncio.wait_for(
+                        catalog.refresh_routes(config.enabled_sources()),
+                        timeout=90)
+                except Exception as exc:
+                    _log.warning("catalog routes failed: %s", exc)
         try:
             await asyncio.wait_for(app.state.stop_hot.wait(), timeout=300)
         except asyncio.TimeoutError:
@@ -531,6 +551,54 @@ def _chart_rows_all(body: dict, cat: str) -> list[dict]:
     return [r for _, r in indexed]
 
 
+def _catalog_card(brief: dict, cat: str) -> dict:
+    row = inj.search_item(brief)
+    title = (brief.get("title") or "").strip()
+    remarks = (brief.get("remarks") or "").strip()
+    row["title"] = title + (f" ·{remarks}" if remarks else "")
+    row["ancestor_guid"] = CATALOG_LIB_GUIDS[cat]
+    row["ancestor_name"] = catalogmod.catalog_title(cat)
+    row["ancestor_category"] = catalogmod.catalog_mdb(cat)
+    row["video_guid"] = video_guid(brief["guid"])
+    return row
+
+
+def _catalog_filter(rows: list[dict], body: dict) -> list[dict]:
+    tags = body.get("tags")
+    if isinstance(tags, dict):
+        wanted = set(tags.get("type") or [])
+        mw = wanted & {"Movie", "TV", "Movie,TV"}
+        if "Movie,TV" in mw:
+            mw.discard("Movie,TV"); mw.update({"Movie", "TV"})
+        if mw:
+            rows = [r for r in rows if r.get("type") in mw]
+    elif isinstance(tags, list):
+        wanted = set(tags) & {"Movie", "TV"}
+        if wanted:
+            rows = [r for r in rows if r.get("type") in wanted]
+    if int(body.get("is_favorite") or 0):
+        return []
+    kw = str(body.get("keyword") or body.get("q") or body.get("title") or "").strip().lower()
+    if kw:
+        rows = [r for r in rows if kw in (r.get("title") or "").lower()]
+    # 海量库由资源站按“最近更新”排序，前端默认排序即保持此顺序；
+    # 用户显式按评分/年份/片名排序时在本页内排序（单页内有效）。
+    col = body.get("sort_column", "create_time")
+    reverse = str(body.get("sort_type", "DESC")).upper() != "ASC"
+    if col == "sort_title":
+        rows = sorted(rows, key=lambda r: r.get("title") or "", reverse=reverse)
+    elif col in ("release_date", "air_date", "year"):
+        rows = sorted(rows, key=lambda r: r.get("release_date") or "", reverse=reverse)
+    elif col in ("vote_average", "score"):
+        def sc(r):
+            try:
+                return float(r.get("vote_average") or 0)
+            except ValueError:
+                return 0
+        rows = sorted(rows, key=sc, reverse=True)
+    return rows
+
+
 def _page_args(body: dict, total: int) -> tuple[int, int, int]:
     page_size = max(1, min(int(body.get("page_size") or 22), 100))
     page = int(body.get("page") or body.get("p") or body.get("page_index")
@@ -559,12 +627,12 @@ async def mediadb_list(request: Request):
     if payload is None:
         return upstream
     dbs = payload.get("data")
-    chart_guids = set(CHART_LIB_GUIDS.values())
-    if not isinstance(dbs, list) or any(d.get("guid") in chart_guids for d in dbs):
+    vlib_guids = set(CHART_LIB_GUIDS.values()) | set(CATALOG_LIB_GUIDS.values())
+    if not isinstance(dbs, list) or any(d.get("guid") in vlib_guids for d in dbs):
         return upstream
     try:
-        # 注入 4 个真实榜单虚拟媒体库（电影/剧集/动漫/综艺），置于最前。
         inserts = []
+        # 1) 豆瓣真实榜单（精选）
         for cat, _t, _c in chartmod.CHART_CATEGORIES:
             ps = []
             for it in chart_cache.items(cat):
@@ -579,14 +647,36 @@ async def mediadb_list(request: Request):
                 "poster": ps[0] if ps else "",
                 "posters": ps,
                 "category": chartmod.chart_cat_mdb(cat),
-                "view_type": 0,
-                "poster_type": 0,
-                "refresh_disabled": True,
+                "view_type": 0, "poster_type": 0, "refresh_disabled": True,
             })
+        # 2) 海量分类片库（资源站深翻）；仅在已建立分类路由时展示
+        if charts_enabled() and any(catalog.available(c) for c, _, _ in catalogmod.CATALOG_CATEGORIES):
+            for cat, _t, _c in catalogmod.CATALOG_CATEGORIES:
+                if not catalog.available(cat):
+                    continue
+                ps = []
+                try:
+                    first = await catalog.get_page(cat, 1)
+                    for b in first:
+                        p = inj._poster(b.get("poster") or "")
+                        if p:
+                            ps.append(p)
+                        if len(ps) >= 8:
+                            break
+                except Exception:
+                    pass
+                inserts.append({
+                    "guid": CATALOG_LIB_GUIDS[cat],
+                    "title": catalogmod.catalog_title(cat),
+                    "poster": ps[0] if ps else "",
+                    "posters": ps,
+                    "category": catalogmod.catalog_mdb(cat),
+                    "view_type": 0, "poster_type": 0, "refresh_disabled": True,
+                })
         dbs[0:0] = inserts
         return JSONResponse(payload)
     except Exception as exc:
-        _log.warning("inject chart mediadb failed: %s", exc)
+        _log.warning("inject virtual mediadb failed: %s", exc)
         return upstream
 
 
@@ -604,6 +694,12 @@ async def mediadb_sum(request: Request):
         if n:
             payload["data"][CHART_LIB_GUIDS[cat]] = n
             total_added += n
+    for cat, _t, _c in catalogmod.CATALOG_CATEGORIES:
+        if catalog.available(cat):
+            n = catalog.total(cat)
+            if n:
+                payload["data"][CATALOG_LIB_GUIDS[cat]] = n
+                total_added += n
     if total_added:
         payload["data"]["total"] = int(payload["data"].get("total", 0)) + total_added
     return JSONResponse(payload)
@@ -617,6 +713,35 @@ async def item_list(request: Request):
     except Exception:
         body = {}
     aguid = body.get("ancestor_guid")
+
+    # —— 海量分类片库：按资源站分类深翻，前端无限滚动逐页请求 ——
+    ccat = CATALOG_GUID_CAT.get(aguid)
+    if ccat is not None:
+        mdb_name = catalogmod.catalog_title(ccat)
+        mdb_cat = catalogmod.catalog_mdb(ccat)
+        if not charts_enabled() or not catalog.available(ccat):
+            return JSONResponse({"code": 0, "msg": "", "data": {
+                "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
+                "dir": "", "total": 0, "list": [], "jump_list": None}})
+        # 路由表过期则后台重建（不阻塞）
+        if catalog.routes_stale() and not catalog._refreshing:
+            asyncio.create_task(catalog.refresh_routes(config.enabled_sources()))
+        page = int(body.get("page") or body.get("p") or body.get("page_index")
+                   or body.get("pn") or 1)
+        page = max(1, page)
+        page_size = int(body.get("page_size") or 22)
+        page_size = max(1, min(page_size, 100))
+        offset = int(body["offset"]) if body.get("offset") is not None \
+            else (page - 1) * page_size
+        total = catalog.total(ccat)
+        offset = max(0, min(offset, total))
+        briefs = await catalog.get_window(ccat, offset, page_size)
+        rows = _catalog_filter([_catalog_card(b, ccat) for b in briefs], body)
+        return JSONResponse({"code": 0, "msg": "", "data": {
+            "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
+            "dir": "", "total": total, "list": rows,
+            "jump_list": None}})
+
     cat = CHART_GUID_CAT.get(aguid)
     if cat is None:
         # 兼容旧的“最近更新”热门库 guid（单库/剧集库）→ 榜单剧集库
@@ -687,6 +812,18 @@ async def search_list(request: Request):
 
 @app.get("/v/api/v1/item/{guid}")
 async def item_detail(guid: str, request: Request):
+    # 海量库根节点
+    if guid in CATALOG_GUID_CAT:
+        ccat = CATALOG_GUID_CAT[guid]
+        n = catalog.total(ccat)
+        data = inj._base_item(
+            guid=guid, type="MediaDB", title=catalogmod.catalog_title(ccat),
+            can_play=1, number_of_episodes=n, local_number_of_episodes=n,
+            ancestor_guid="", ancestor_name="", ancestor_category="",
+            poster="", logic_type=0)
+        data["play_item_guid"] = ""
+        data["play_error"] = ""
+        return JSONResponse({"code": 0, "msg": "", "data": data})
     # 榜单虚拟媒体库根节点（进入媒体库时前端会请求 item/<库guid>）。
     # 必须在透传前拦截，否则官方后端返回 -6，页面提示「此媒体库不存在」。
     if guid in CHART_GUID_CAT or is_hot_guid(guid):
@@ -1433,12 +1570,19 @@ async def ext_status(request: Request):
             "config": {k: v for k, v in config.get().items() if k != "admin_token"},
             "cached_titles": len(store._titles),
             "hot": hot_cache.status(),
-            "charts": chart_cache.status()}
+            "charts": chart_cache.status(),
+            "catalog": catalog.status()}
 
 
 @app.post("/v/api/ext/hot/refresh")
 async def ext_hot_refresh(request: Request):
-    data = await chart_cache.refresh(force=True)
+    await chart_cache.refresh(force=True)
+    try:
+        if catalog.routes_stale():
+            await asyncio.wait_for(
+                catalog.refresh_routes(config.enabled_sources()), timeout=90)
+    except Exception:
+        pass
     return {"code": 0, "msg": "", "data": chart_cache.status()}
 
 
