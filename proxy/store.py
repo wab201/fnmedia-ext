@@ -111,7 +111,10 @@ class Store:
                         per_line[ln] = {"url": e["url"],
                                         "headers": e.get("headers", {}),
                                         "ep_title": e.get("title", ""),
-                                        "resolve": bool(e.get("resolve"))}
+                                        "resolve": bool(e.get("resolve")),
+                                        "redirect": bool(e.get("redirect")),
+                                        "xsrc": bool(e.get("xsrc")),
+                                        "play_from": e.get("play_from", "")}
                 self._ep_index[eg] = {
                     "ep_guid": eg, "online_guid": g, "index": i, "season": 1,
                     "season_guid": season_guid(g), "title": brief.get("title", ""),
@@ -163,6 +166,9 @@ class Store:
             "index": ep["index"], "url": one["url"], "headers": one["headers"],
             "ep_title": one["ep_title"] or ep["ep_title"], "title": ep["title"],
             "resolve": one.get("resolve", False),
+            "redirect": one.get("redirect", False),
+            "xsrc": one.get("xsrc", False),
+            "play_from": one.get("play_from", ""),
             "total": len(self._direct_eps(self._titles[ep["online_guid"]],
                                           ep["default_line"])),
             "season_guid": ep["season_guid"], "season": 1, "kind": "episode",
@@ -210,6 +216,11 @@ class Store:
             seen_url.add(url)
             out.append({"line": ln, "url": url,
                         "m3u8": bool(re.search(r"\.m3u8(\?|$)", url, re.I)),
+                        "redirect": bool(eps[idx].get("redirect")),
+                        "resolve": bool(eps[idx].get("resolve")),
+                        "xsrc": bool(eps[idx].get("xsrc")),
+                        "play_from": eps[idx].get("play_from", ""),
+                        "online_guid": og, "index": idx,
                         "headers": eps[idx].get("headers", {})})
         return out
 
@@ -278,6 +289,11 @@ class Store:
     def get_title_by_guid(self, guid: str) -> Optional[dict]:
         with self._lock:
             return self._titles.get(guid)
+
+    def provider_of(self, online_guid: str) -> str:
+        """guid 对应标题所属资源源 id（来自 online_id "<provider>:<vod_id>"）。"""
+        with self._lock:
+            return (self._orig.get(online_guid, "") or "").split(":", 1)[0]
 
     def remember_detail(self, t: providers.OnlineTitle) -> str:
         import inject
@@ -397,6 +413,10 @@ class Store:
         return {"url": ep["url"], "headers": ep.get("headers", {}),
                 "line": name, "index": ep_index, "total": len(eps),
                 "resolve": bool(ep.get("resolve")),
+                "redirect": bool(ep.get("redirect")),
+                "xsrc": bool(ep.get("xsrc")),
+                "play_from": ep.get("play_from", ""),
+                "online_guid": guid,
                 "ep_title": ep["title"], "title": brief.get("title", "")}
 
     def first_playable(self, guid: str) -> Optional[dict]:

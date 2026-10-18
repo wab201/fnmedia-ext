@@ -9,7 +9,7 @@ SRC_IN="$ROOT/deploy/fnmedia-ext.service.in"
 DST="/etc/systemd/system/fnmedia-ext.service"
 
 if [ ! -x "$PY" ]; then
-  echo "ERROR: 未找到虚拟环境 $PY；请先：python3 -m venv .venv && .venv/bin/pip install fastapi uvicorn httpx" >&2
+  echo "ERROR: 未找到虚拟环境 $PY；请先：python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
   exit 1
 fi
 

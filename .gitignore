@@ -23,3 +23,6 @@ dist/
 /release/*.fpk
 /release/*.sha256
 /release/*.sha256sum
+
+# 公开发布用的临时 worktree / 暂存
+/.release/

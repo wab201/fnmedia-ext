@@ -15,8 +15,10 @@ from dataclasses import dataclass, field
 
 import httpx
 
+import features
+
 # 2026-10-17 国内直连实测（搜索+m3u8 直链可达性）。403/404 多为走 Clash 代理所致。
-DEFAULT_SOURCES = [
+DEFAULT_SOURCES: list[dict] = [
     {"id": "baofeng", "name": "暴风资源", "api": "https://bfzyapi.com/api.php/provide/vod/at/json", "enabled": True},
     {"id": "ffzy", "name": "非凡资源", "api": "https://cj.ffzyapi.com/api.php/provide/vod/at/json", "enabled": True},
     {"id": "lzi", "name": "量子资源", "api": "https://cj.lziapi.com/api.php/provide/vod/at/json", "enabled": True},
@@ -42,6 +44,12 @@ class Episode:
     direct: bool          # True=可直接播放的媒体地址
     resolve: bool = False  # True=播放页，需 resolve_share 解析
     headers: dict = field(default_factory=dict)
+    # True=该地址是一次 302 跳转，Location 才是真实媒体（如苹果CMS ac=videodiag）
+    redirect: bool = False
+    # 非标准源标记：url 为加密 token，播放前需在专属适配层解码；
+    # play_from 是该集所属线路标识，解码必须一并上送（公开构建下恒为 False）
+    xsrc: bool = False
+    play_from: str = ""
 
 
 @dataclass
@@ -88,11 +96,14 @@ def _parse_play(vod_play_from: str, vod_play_note: str, vod_play_url: str,
             # /share/<id> 等播放页：非直链但可按需解析出媒体地址
             resolvable = (not direct) and bool(
                 re.search(r"/(share|play|player)/[A-Za-z0-9]+", url))
+            # ac=videodiag 等：请求该地址会 302 到真实 m3u8/mp4
+            redirect_ep = bool(re.search(r"[?&]ac=videodiag\b", url, re.I))
             eps.append(Episode(
                 title=name.strip() or f"第{len(eps)+1}集",
                 url=url,
-                direct=direct,
+                direct=direct or redirect_ep,  # 视为可播，播放时跟随 302
                 resolve=resolvable,
+                redirect=redirect_ep,
                 headers={"Referer": referer, "User-Agent": "Mozilla/5.0"},
             ))
         if eps:
@@ -159,6 +170,44 @@ _EMBED_URL_RES = [
 ]
 _resolve_cache: dict[str, tuple[float, str]] = {}
 _RESOLVE_TTL = 30 * 60
+
+
+async def resolve_redirect(client: httpx.AsyncClient, jump_url: str,
+                           referer: str = "") -> str | None:
+    """跟随一次 302 跳转（ac=videodiag 等），返回 Location 指向的真实媒体地址。
+
+    部分私有源该接口极慢且间歇抖动（同一地址有时 1s、有时 16~19s 超时），
+    只试一次会在播放中途偶发解析失败导致整个 m3u8 502。这里放宽超时并做
+    退避重试，成功后缓存较长时间，保证一次会话内地址稳定。
+    """
+    import asyncio as _aio
+    import time as _t
+    jump_url = jump_url.strip()
+    hit = _resolve_cache.get(jump_url)
+    if hit and _t.time() - hit[0] < _RESOLVE_TTL:
+        return hit[1]
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if referer:
+        headers["Referer"] = referer
+    found = None
+    for attempt, tmo in enumerate((20.0, 16.0, 12.0)):
+        try:
+            r = await client.get(jump_url, headers=headers, timeout=tmo,
+                                 follow_redirects=False)
+            loc = r.headers.get("location") or ""
+            if loc and _MEDIA_RE.search(loc):
+                found = urllib.parse.urljoin(jump_url, loc)
+                break
+        except Exception:
+            found = None
+        if attempt < 2:
+            await _aio.sleep(0.3 * (2 ** attempt))
+    if found:
+        _resolve_cache[jump_url] = (_t.time(), found)
+        if len(_resolve_cache) > 2000:
+            for k in list(_resolve_cache)[:1000]:
+                _resolve_cache.pop(k, None)
+    return found
 
 
 async def resolve_share(client: httpx.AsyncClient, page_url: str,
@@ -256,13 +305,16 @@ async def probe_source(api: str, keyword: str = "庆余年",
             "count": len(lst), "direct": direct, "sample": sample, "error": ""}
 
 
+
+
 async def search_all(keyword: str, sources=None) -> list[OnlineTitle]:
     sources = sources or DEFAULT_SOURCES
     enabled = [s for s in sources if s.get("enabled")]
     async with httpx.AsyncClient(follow_redirects=True, trust_env=False) as client:
-        results = await __import__("asyncio").gather(
-            *[search_source(client, s, keyword) for s in enabled],
-            return_exceptions=True)
+        tasks = []
+        for s in enabled:
+            tasks.append(search_source(client, s, keyword))
+        results = await __import__("asyncio").gather(*tasks, return_exceptions=True)
     titles: list[OnlineTitle] = []
     for r in results:
         if isinstance(r, list):

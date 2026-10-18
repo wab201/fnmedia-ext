@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # fnmedia-ext FPK 打包：组装骨架 + 项目主体 → fnpack build → dist/*.fpk
-# 用法：packaging/fpk/build.sh [--stage-only DIR] [--fnpack /path] [--out dist]
+# 用法：packaging/fpk/build.sh [--public] [--stage-only DIR] [--fnpack /path] [--out dist]
+#   --public  公开包：只含通用公开能力（在全功能源码树上会先执行构建期裁剪）
 set -euo pipefail
 
 FPK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,12 +9,13 @@ REPO_ROOT="$(cd "${FPK_DIR}/../.." && pwd)"
 VERSION="$(head -n1 "${REPO_ROOT}/VERSION" | tr -d '[:space:]')"
 [ -n "${VERSION}" ] || { echo "ERROR: 无法读取 VERSION" >&2; exit 1; }
 
-FNPACK_BIN="${FNPACK:-}"; STAGE=""; STAGE_ONLY=0; OUT_DIR="${REPO_ROOT}/dist"
+FNPACK_BIN="${FNPACK:-}"; STAGE=""; STAGE_ONLY=0; OUT_DIR="${REPO_ROOT}/dist"; PUBLIC=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --stage-only) STAGE_ONLY=1; STAGE="$2"; shift 2 ;;
     --fnpack) FNPACK_BIN="$2"; shift 2 ;;
     --out) OUT_DIR="$2"; shift 2 ;;
+    --public) PUBLIC=1; shift ;;
     *) echo "未知参数: $1" >&2; exit 1 ;;
   esac
 done
@@ -29,6 +31,17 @@ rsync -a --delete \
   --exclude='state/' --exclude='packaging/fpk/.build/' \
   --exclude='*.fpk' --exclude='.DS_Store' \
   "${REPO_ROOT}/" "${STAGE}/app/repo/"
+
+# 公开构建：从暂存副本移除可选特性（非标准源适配 / 扩展分类）。
+# 全功能源码树里有构建剥离器时执行剥离；若工作树本身已是公开树
+# （剥离器已不存在），则内容本就干净，直接跳过。
+if [ "${PUBLIC}" -eq 1 ] && [ -f "${STAGE}/app/repo/tools/public_strip.py" ]; then
+  PY3="${PYTHON:-python3}"
+  "${PY3}" "${STAGE}/app/repo/tools/public_strip.py" "${STAGE}/app/repo"
+  # 构建工具不进包；剥空的 assets 目录也清掉
+  rm -rf "${STAGE}/app/repo/tools"
+  rmdir "${STAGE}/app/repo/proxy/assets" 2>/dev/null || true
+fi
 
 MANIFEST_VER="$(echo "${VERSION}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
 sed "s/@VERSION@/${MANIFEST_VER}/" "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
@@ -58,7 +71,9 @@ WORK="$(mktemp -d)"; trap 'rm -rf "${WORK}"' EXIT
 ( cd "${WORK}" && "${FNPACK_BIN}" build --directory "${STAGE}" )
 BUILT="$(find "${WORK}" "${STAGE}" -maxdepth 2 -name '*.fpk' -print -quit 2>/dev/null || true)"
 [ -n "${BUILT}" ] || { echo "ERROR: fnpack 未产出 .fpk" >&2; exit 1; }
-mkdir -p "${OUT_DIR}"; FINAL="${OUT_DIR}/fnmedia-ext-${VERSION}.fpk"
+mkdir -p "${OUT_DIR}"
+SUFFIX=""; [ "${PUBLIC}" -eq 1 ] && SUFFIX="-public"
+FINAL="${OUT_DIR}/fnmedia-ext-${VERSION}${SUFFIX}.fpk"
 mv "${BUILT}" "${FINAL}"
 ( cd "$(dirname "${FINAL}")" && sha256sum "$(basename "${FINAL}")" > "$(basename "${FINAL}").sha256" )
 echo "[fpk] 打包完成: ${FINAL}"

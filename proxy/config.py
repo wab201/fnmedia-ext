@@ -8,6 +8,7 @@ import re
 import threading
 from pathlib import Path
 
+import features
 from providers import DEFAULT_SOURCES
 
 _STATE = Path(__file__).resolve().parent.parent / "state" / "config.json"
@@ -200,6 +201,7 @@ class Config:
             target["loose_filter"] = bool(on)
             self._persist(cfg)
             return True, "ok"
+
 
     def remove_source(self, sid: str) -> tuple[bool, str]:
         with _LOCK:

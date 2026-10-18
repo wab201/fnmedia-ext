@@ -26,6 +26,8 @@ PAGE_SIZE = 20
 MAX_PAGES = 250
 CLASS_REFRESH = 6 * 3600
 PAGE_TTL = 10 * 60
+# 空页（多为慢源抖动超时）只短缓存，避免该页被长时间冻结
+EMPTY_TTL = 15
 HTTP_TIMEOUT = 12.0
 
 # 大类 -> 展示名 / MediaDB category
@@ -47,10 +49,44 @@ _VARIETY_KW = ("综艺", "真人秀", "脱口秀", "娱乐")
 _MOVIE_KW = ("电影", "影片", "纪录片", "纪录")
 _TV_KW = ("电视", "连续剧", "剧集", "美剧", "英剧", "韩剧", "日剧", "泰剧",
           "国产剧", "港台剧", "海外剧", "番剧")
-# 明确排除的脏类（成人/资讯/解说/预告/体育/短剧等）
-_EXCLUDE_KW = ("伦理", "理论", "福利", "写真", "情色", "午夜", "解说", "预告",
+# 明确排除的脏类（伦理/福利/资讯/解说/预告/体育/短剧等）
+_EXCLUDE_KW = ("理论", "福利", "写真", "午夜", "解说", "预告",
                "花絮", "资讯", "新闻", "体育", "赛事", "短剧", "漫剧", "AI",
-               "演员", "音乐", "MV", "萝莉")
+               "演员", "音乐", "MV")
+
+# 硬红线：任何开关都不能放开。涉未成年人性化、非自愿（换脸/迷奸/强奸/偷拍等）。
+# 同时作用于“分类名”和条目标题/备注，命中即丢弃，聚合库、独立库、搜索一律不收录。
+_REDLINE_KW = (
+    # 未成年人
+    "萝莉", "童贞",
+    # 非自愿 / 性暴力
+    "换脸"
+)
+# 即便开启扩展分类，也仍按“非影视/中性噪音”排除的分类
+_NEUTRAL_KW = ("解说", "预告", "花絮", "资讯", "新闻", "体育", "赛事",
+               "演员", "音乐", "MV", "直播", "电台")
+
+# 扩展分类使用的内部 cat id（不进入 CATS，故永不进入跨源聚合的四个海量库）
+ADULT_CAT = "adult"
+
+try:
+    import features
+except Exception:  # 兜底：独立运行/剥离异常时按公开（关闭）处理
+    features = None
+
+
+def _adult_on() -> bool:
+    return bool(getattr(features, "ADULT", False))
+
+
+def is_redline(*texts: str) -> bool:
+    for t in texts:
+        if not t:
+            continue
+        for k in _REDLINE_KW:
+            if k and k in t:
+                return True
+    return False
 
 
 def catalog_title(cat: str) -> str:
@@ -85,6 +121,28 @@ def classify(name: str) -> str | None:
     return None
 
 
+def classify_source_class(name: str, adult_allowed: bool) -> str | None:
+    """按源的扩展授权决定分类归属。
+
+    - 命中硬红线（涉未成年/非自愿）一律返回 None，任何开关都不放行；
+    - 常规四类走 classify（其内部脏类/中性噪音仍排除）；
+    - 仅当该源显式开启扩展分类(adult_allowed)、且为完整构建时，未归入常规
+      四类、又不属于中性噪音/红线的分类，纳入内部扩展分类（只进该源独立库）。
+    """
+    n = (name or "").strip()
+    if not n or is_redline(n):
+        return None
+    cat = classify(n)
+    if cat:
+        return cat
+    if not adult_allowed or not _adult_on():
+        return None
+    if any(k in n for k in _NEUTRAL_KW):
+        return None
+    # 其余扩展分类（公开构建下此分支不可达）
+    return ADULT_CAT
+
+
 async def _fetch_class_list(client: httpx.AsyncClient, source: dict) -> list[dict]:
     base = source["api"].split("/at/json")[0].split("?")[0]
     r = await client.get(base, params={"ac": "list"},
@@ -96,12 +154,13 @@ async def _fetch_class_list(client: httpx.AsyncClient, source: dict) -> list[dic
 
 
 async def _fetch_category_page(client: httpx.AsyncClient, source: dict,
-                               type_id, page: int) -> tuple[list, int]:
+                               type_id, page: int,
+                               timeout: float = HTTP_TIMEOUT) -> tuple[list, int]:
     """返回 (本页 vod 列表, 该分类总页数)。"""
     base = source["api"].split("/at/json")[0].split("?")[0]
     # 注意：分类深翻不能带 h 参数（部分源加 h 后返回空/pagecount=0）。
     r = await client.get(base, params={"ac": "detail", "t": type_id, "pg": page},
-                         headers={"User-Agent": "Mozilla/5.0"}, timeout=HTTP_TIMEOUT)
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
     r.raise_for_status()
     j = r.json()
     if not isinstance(j, dict) or j.get("code") not in (1, "1"):
@@ -127,6 +186,8 @@ class Catalog:
         self._dense: dict[str, list[dict]] = {}
         self._scanned_page: dict[str, int] = {}
         self._dense_count: dict[str, int] = {}
+        # (sid, cat) -> [备用叶子 route...]（首选分类探测失败时 rescue 得到）
+        self._fallbacks: dict[tuple[str, str], list[dict]] = {}
 
     @staticmethod
     def _scope_key(scope: str, cat: str) -> str:
@@ -153,51 +214,102 @@ class Catalog:
                     *[self._load_source_classes(client, s) for s in sources],
                     return_exceptions=True)
 
-            # 每个源每类只探测一个代表性叶子子类（第一页），用 pagecount 判断
-            # 是否可深翻并挑选首选；分类表本身（全部叶子）已在 _classes 中。
-            cand: list[tuple[str, str, dict]] = []  # (cat, sid, cl)
+            # 每个源每类先探测一个代表性叶子；首选超时/空时，回退探测该类下
+            # 其它叶子，选能连通且页数最多的（部分私有源个别分类响应很慢）。
+            # all_by_cat[(sid,cat)] = [cl,...]，首个为首选。
+            all_by_cat: dict[tuple[str, str], list[dict]] = {}
+            order: list[tuple[str, str]] = []
             for sid, classes in self._classes.items():
-                per_cat: dict[str, dict] = {}
+                per_cat: dict[str, list[dict]] = {}
                 for cl in classes:
                     cat = cl.get("cat")
-                    if cat and cat not in per_cat:
-                        per_cat[cat] = cl
-                for cat, cl in per_cat.items():
-                    cand.append((cat, sid, cl))
+                    if cat:
+                        per_cat.setdefault(cat, []).append(cl)
+                for cat, cls in per_cat.items():
+                    key = (sid, cat)
+                    all_by_cat[key] = cls
+                    order.append(key)
             probed: dict[tuple[str, str], dict] = {}
 
             async with httpx.AsyncClient(
                     follow_redirects=True, trust_env=False,
                     verify=False) as client:
-                async def probe(cat, sid, cl):
+                async def probe_one(sid, cat, cl):
                     source = self._source_by_id(sid)
                     if not source:
-                        return
+                        return None
                     try:
                         _lst, pc = await _fetch_category_page(
                             client, source, cl["type_id"], 1)
                     except Exception:
-                        return
+                        return None
                     if not _lst:
+                        return None
+                    return {"source_id": sid, "type_id": cl["type_id"],
+                            "type_name": cl["type_name"],
+                            "pagecount": int(pc or 0)}
+
+                # 第一轮：每个 (源,类) 只探首选
+                first = await asyncio.gather(
+                    *[probe_one(sid, cat, all_by_cat[(sid, cat)][0])
+                      for sid, cat in order],
+                    return_exceptions=True)
+                missing: list[tuple[str, str]] = []
+                for (sid, cat), res in zip(order, first):
+                    if isinstance(res, dict):
+                        probed[(cat, sid)] = res
+                    else:
+                        missing.append((sid, cat))
+
+                # 第二轮：对首轮失败/空的(源,类)，并发尝试其余叶子，取页数最多者
+                async def rescue(sid, cat):
+                    cls = all_by_cat[(sid, cat)][1:9]  # 最多再试 8 个叶子
+                    if not cls:
                         return
-                    probed[(cat, sid)] = {
-                        "source_id": sid, "type_id": cl["type_id"],
-                        "type_name": cl["type_name"],
-                        "pagecount": int(pc or 0)}
-                await asyncio.gather(*[probe(c, s, cl) for c, s, cl in cand],
+                    res = await asyncio.gather(
+                        *[probe_one(sid, cat, cl) for cl in cls],
+                        return_exceptions=True)
+                    ok = [r for r in res if isinstance(r, dict)]
+                    if ok:
+                        ok.sort(key=lambda r: -(r.get("pagecount") or 0))
+                        probed[(cat, sid)] = ok[0]
+                        # 记录备用叶子，供翻页超时/空页时同类并发竞速回退
+                        self._fallbacks[(sid, cat)] = ok[1:7]
+                await asyncio.gather(*[rescue(s, c) for s, c in missing],
                                      return_exceptions=True)
 
             def routes_for_scope(scope: str) -> dict[str, list[dict]]:
                 out: dict[str, list[dict]] = {}
-                for cat in CATS:
+                # 扩展分类只可能出现在单源作用域（该源显式授权），永不进聚合
+                cats = CATS if (scope == AGG_SCOPE or not _adult_on()) else CATS + [ADULT_CAT]
+                for cat in cats:
                     if scope == AGG_SCOPE:
                         rs = [probed[(cat, sid)] for (c2, sid) in probed if c2 == cat]
                         rs.sort(key=lambda r: -(r.get("pagecount") or 0))
                         # 聚合：首选最深的源，并附带其余可深翻源做回退
                         out[cat] = rs
                     else:
+                        # 单源独立库：不依赖建库探测是否成功——直接纳入该类下
+                        # 全部叶子（探测到页数的排前面，未探测到的用 MAX_PAGES
+                        # 兜底），取页时并发抓取合并、天然容错慢/超时叶子。
+                        by_id = {}
+                        seed = []
                         hit = probed.get((cat, scope))
-                        out[cat] = [hit] if hit else []
+                        if hit:
+                            seed.append(hit)
+                        seed.extend(self._fallbacks.get((scope, cat), []))
+                        for r in seed:
+                            by_id[r["type_id"]] = r
+                        for cl in self._classes.get(scope, []):
+                            if cl.get("cat") == cat and cl["type_id"] not in by_id:
+                                by_id[cl["type_id"]] = {
+                                    "source_id": scope,
+                                    "type_id": cl["type_id"],
+                                    "type_name": cl["type_name"],
+                                    "pagecount": MAX_PAGES}
+                        rs = list(by_id.values())
+                        rs.sort(key=lambda r: -(r.get("pagecount") or 0))
+                        out[cat] = rs
                 return out
 
             new_routes: dict[str, list[dict]] = {}
@@ -217,6 +329,11 @@ class Catalog:
                         if k not in valid_keys:
                             d.pop(k, None)
                 self._updated = time.time()
+            warm_scopes = [sid for sid in self.standalone_scopes()
+                           if any(self.available(c, sid) for c in
+                                  (CATS + ([ADULT_CAT] if _adult_on() else [])))]
+            for sid in warm_scopes:
+                asyncio.create_task(self.warm_standalone(sid))
         finally:
             self._refreshing = False
         return self.status()
@@ -232,12 +349,13 @@ class Catalog:
         pids_with_child = {str(x.get("type_pid") or "0") for x in cls
                            if str(x.get("type_pid") or "0") not in ("", "0")}
         norm = []
+        adult_allowed = bool(source.get("adult"))
         for x in cls:
             try:
                 tid = x.get("type_id")
                 pid = str(x.get("type_pid") or "0")
                 name = str(x.get("type_name") or "")
-                cat = classify(name)
+                cat = classify_source_class(name, adult_allowed)
                 if tid is None or cat is None:
                     continue
                 is_leaf = pid != "0" or str(tid) not in pids_with_child
@@ -301,18 +419,27 @@ class Catalog:
         seen = self._seen_guids.setdefault(sk, set())
         dense = self._dense.setdefault(sk, [])
         pg = self._scanned_page.get(sk, 0) + 1
+        empty_streak = 0
         while len(dense) < need_count and pg <= pc:
             rows = await self.get_page(cat, pg, scope)
+            added = 0
             for b in rows:
                 gid = b.get("guid")
                 if gid in seen:
                     continue
-                seen.add(gid); dense.append(b)
-            self._scanned_page[sk] = pg
-            # 整页没有新增（可能是末页/空页）也要前进，避免死循环
-            pg += 1
-            if not rows:
-                break
+                seen.add(gid); dense.append(b); added += 1
+            if added:
+                # 只有真正取到新增才把游标前移，慢源抖动的空页下次可重试
+                self._scanned_page[sk] = pg
+                pg += 1
+                empty_streak = 0
+            else:
+                # 连续多页空（超时/末页）才停止，容忍慢源的偶发抖动
+                empty_streak += 1
+                if empty_streak >= 3:
+                    self._scanned_page[sk] = pg
+                    break
+                pg += 1
         self._dense_count[sk] = len(dense)
         return len(dense)
 
@@ -335,8 +462,11 @@ class Catalog:
         key = (scope, cat, page)
         with self._lock:
             hit = self._page_cache.get(key)
-            if hit and time.time() - hit[0] < PAGE_TTL:
-                return hit[1]
+            if hit:
+                ts, data, ttl = hit
+                if time.time() - ts < ttl:
+                    return data
+                self._page_cache.pop(key, None)
             fut = self._inflight.get(key)
         if fut is None:
             fut = asyncio.get_event_loop().create_future()
@@ -347,7 +477,9 @@ class Catalog:
                 try:
                     briefs = await self._load_page(scope, cat, page)
                     with self._lock:
-                        self._page_cache[key] = (time.time(), briefs)
+                        # 空结果只短缓存，避免慢源一次抖动把该页冻结 10 分钟
+                        ttl = EMPTY_TTL if not briefs else PAGE_TTL
+                        self._page_cache[key] = (time.time(), briefs, ttl)
                     fut.set_result(briefs)
                 except Exception:
                     fut.set_result([])
@@ -358,64 +490,149 @@ class Catalog:
             asyncio.create_task(work())
         return await fut
 
-    async def _load_page(self, scope: str, cat: str, page: int) -> list[dict]:
+    def _briefs_from_vods(self, vods: list, source: dict, route: dict,
+                          scope: str, cat: str) -> list[dict]:
         from config import config as _cfg
+        briefs = []
+        for v in vods:
+            try:
+                t = providers._map_vod(v, source)
+            except Exception:
+                continue
+            if not t or not t.title:
+                continue
+            playable = [e for line in t.sources.values() for e in line
+                        if e.direct or e.resolve]
+            if not playable:
+                continue
+            # 硬红线（任何模式都不放行）：涉未成年/非自愿，标题或备注命中即丢。
+            if is_redline(t.title, t.remarks):
+                continue
+            # 私有源放宽：单源作用域且该源开启 loose_filter 时，
+            # 跳过标题/备注噪音过滤；硬红线与常规分类红线仍在。
+            loose = (scope != AGG_SCOPE and bool(source.get("loose_filter")))
+            if not loose and _cfg.is_junk(t.title, t.remarks):
+                continue
+            briefs.append({
+                "guid": make_guid(t),
+                "online_id": t.online_id, "title": t.title,
+                "type_name": t.type_name, "year": t.year,
+                "poster": t.poster, "overview": t.overview,
+                "remarks": t.remarks, "score": t.score,
+                "actor": t.actor, "director": t.director, "area": t.area,
+                "lines": {name: [e.__dict__ for e in eps]
+                          for name, eps in t.sources.items()},
+                "catalog_cat": cat, "catalog_scope": scope,
+                "catalog_source": route["source_id"],
+            })
+        return briefs
+
+    async def _load_page(self, scope: str, cat: str, page: int) -> list[dict]:
         from store import store
         with self._lock:
             routes = list(self._routes.get(self._scope_key(scope, cat)) or [])
-        last_err = None
+        if scope == AGG_SCOPE:
+            routes = routes[:4]
+        if not routes:
+            return []
+
+        async def fetch_one(client, route, timeout):
+            source = self._source_by_id(route["source_id"])
+            if not source:
+                return None
+            try:
+                vods, pc = await _fetch_category_page(
+                    client, source, route["type_id"], page, timeout=timeout)
+            except Exception:
+                return None
+            if not vods:
+                return None
+            return source, route, vods
+
+        # 单源独立库：把该类下全部叶子的同一页并发抓取后“合并去重”，
+        # 而不是竞速只取一个——慢/不稳的私有源单页常超时，合并所有叶子
+        # 才能保证条目完整。首轮给较长超时，全空再重试两轮。
+        if scope != AGG_SCOPE and len(routes) > 1:
+            sem = asyncio.Semaphore(10)
+
+            async def once(timeout):
+                async with httpx.AsyncClient(follow_redirects=True,
+                                             trust_env=False,
+                                             verify=False) as client:
+                    async def bound(r):
+                        async with sem:
+                            return await fetch_one(client, r, timeout)
+                    results = await asyncio.gather(
+                        *[bound(r) for r in routes],
+                        return_exceptions=True)
+                merged: list[dict] = []
+                seen_g: set[str] = set()
+                for res in results:
+                    if not isinstance(res, tuple):
+                        continue
+                    source, route, vods = res
+                    for b in self._briefs_from_vods(vods, source, route, scope, cat):
+                        g = b.get("guid")
+                        if g and g not in seen_g:
+                            seen_g.add(g)
+                            merged.append(b)
+                return merged
+
+            for attempt, tmo in enumerate((16.0, 10.0, 8.0)):
+                briefs = await once(tmo)
+                if briefs:
+                    return store.remember_merged(briefs)
+            return []
+
+        # 跨源聚合：串行回退（不同源结果应一致，并发会无谓翻倍请求）
         async with httpx.AsyncClient(follow_redirects=True, trust_env=False,
                                      verify=False) as client:
-            for route in routes[:4]:  # 最多回退 4 个源
-                source = self._source_by_id(route["source_id"])
-                if not source:
+            for route in routes:
+                got = await fetch_one(client, route, HTTP_TIMEOUT)
+                if not got:
                     continue
-                try:
-                    vods, pc = await _fetch_category_page(
-                        client, source, route["type_id"], page)
-                except Exception as exc:
-                    last_err = exc
-                    continue
-                if not vods:
-                    # 超出该源页数
-                    if pc and page > min(int(pc), MAX_PAGES):
-                        continue
-                    last_err = RuntimeError("empty page")
-                    continue
-                briefs = []
-                for v in vods:
-                    try:
-                        t = providers._map_vod(v, source)
-                    except Exception:
-                        continue
-                    if not t or not t.title:
-                        continue
-                    playable = [e for line in t.sources.values() for e in line
-                                if e.direct or e.resolve]
-                    if not playable:
-                        continue
-                    # 私有源放宽：单源作用域且该源开启 loose_filter 时，
-                    # 跳过标题/备注噪音过滤；分类层面的红线仍在（classify 已剔除）。
-                    loose = (scope != AGG_SCOPE
-                             and bool(source.get("loose_filter")))
-                    if not loose and _cfg.is_junk(t.title, t.remarks):
-                        continue
-                    brief = {
-                        "guid": make_guid(t),
-                        "online_id": t.online_id, "title": t.title,
-                        "type_name": t.type_name, "year": t.year,
-                        "poster": t.poster, "overview": t.overview,
-                        "remarks": t.remarks, "score": t.score,
-                        "actor": t.actor, "director": t.director, "area": t.area,
-                        "lines": {name: [e.__dict__ for e in eps]
-                                  for name, eps in t.sources.items()},
-                        "catalog_cat": cat, "catalog_scope": scope,
-                        "catalog_source": route["source_id"],
-                    }
-                    briefs.append(brief)
+                source, _route, vods = got
+                briefs = self._briefs_from_vods(vods, source, route, scope, cat)
                 if briefs:
                     return store.remember_merged(briefs)
         return []
+
+    async def warm_standalone(self, scope: str):
+        """建库后后台预热独立库各分类首页，缓解慢源首屏空白。"""
+        try:
+            src = self._source_by_id(scope)
+            pool = CATS + [ADULT_CAT] if (_adult_on() and src and src.get("adult")) else CATS
+            await asyncio.gather(
+                *[self.get_page(c, 1, scope) for c in pool
+                  if self.available(c, scope)],
+                return_exceptions=True)
+        except Exception:
+            pass
+
+    async def _source_cat_window(self, scope: str, cat: str,
+                                 offset: int, limit: int) -> list[dict]:
+        """单源某类窗口：每页 = 该类下全部叶子同页合并去重（首页约数百条）。
+
+        顺序取合并大页直到攒够 offset+limit；容忍慢源偶发的整页空（重试到
+        连续 3 个空页才认为到底），避免一次抖动就把分页永久截断。
+        """
+        out: list[dict] = []
+        seen: set[str] = set()
+        pg = 1
+        empty_streak = 0
+        while len(out) < offset + limit and pg <= MAX_PAGES and empty_streak < 3:
+            rows = await self.get_page(cat, pg, scope)
+            added = 0
+            for b in rows:
+                g = b.get("guid")
+                if g and g not in seen:
+                    seen.add(g); out.append(b); added += 1
+            if added:
+                empty_streak = 0
+            else:
+                empty_streak += 1
+            pg += 1
+        return out[offset:offset + limit]
 
     # --------------------------------------- 单源独立库：跨四类交错窗口
     async def standalone_window(self, scope: str, offset: int,
@@ -425,20 +642,21 @@ class Catalog:
         返回 (brief 列表, 估算 total)。四类各取 offset..offset+limit 的窗，
         再按排名轮次合并去重，最后按全局 offset 切片。
         """
-        cats = [c for c in CATS if self.available(c, scope)]
+        src = self._source_by_id(scope)
+        pool = CATS + [ADULT_CAT] if (_adult_on() and src and src.get("adult")) else CATS
+        cats = [c for c in pool if self.available(c, scope)]
         if not cats:
             return [], 0
         end = offset + limit
         results = await asyncio.gather(
-            *[self.get_window(c, 0, end, scope) for c in cats],
+            *[self._source_cat_window(scope, c, 0, end) for c in cats],
             return_exceptions=True)
         per: list[list[dict]] = []
         total = 0
-        for r in results:
+        for c, r in zip(cats, results):
+            per.append(r if isinstance(r, list) else [])
             if isinstance(r, list):
-                per.append(r)
-        for c in cats:
-            total += self.total(c, scope)
+                total += self.total(c, scope)
         merged: list[dict] = []
         seen: set[str] = set()
         maxlen = max((len(x) for x in per), default=0)
@@ -454,7 +672,9 @@ class Catalog:
         return merged[offset:offset + limit], total
 
     def standalone_available(self, scope: str) -> bool:
-        return any(self.available(c, scope) for c in CATS)
+        src = self._source_by_id(scope)
+        pool = CATS + [ADULT_CAT] if (_adult_on() and src and src.get("adult")) else CATS
+        return any(self.available(c, scope) for c in pool)
 
 
 catalog = Catalog()

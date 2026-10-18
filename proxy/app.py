@@ -28,6 +28,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import (JSONResponse, RedirectResponse,
                                StreamingResponse)
 
+import features
 import providers
 import inject as inj
 import config as cfgmod
@@ -110,6 +111,11 @@ def standalone_source_of(lib_guid: str) -> str | None:
 
 def standalone_sources_active() -> list[dict]:
     return [s for s in config.enabled_sources() if s.get("standalone")]
+
+
+def standalone_lib_name(src: dict) -> str:
+    base = "📡" + (src.get("name") or src.get("id") or "")
+    return base
 
 
 def charts_enabled() -> bool:
@@ -322,6 +328,35 @@ def ext_client(req: Request) -> httpx.AsyncClient:
     return req.app.state.ext
 
 
+# 源站/CDN 偶发抖动（keep-alive 失效、瞬时 5xx/429、读超时）在长视频播放中必然出现。
+# 一次失败就给播放器 502 会表现为“播到一半弹出播放出错”。所有外站 GET
+# （m3u8、分片、密钥、直链）统一走带退避的重试。
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+_RETRIABLE_EXC = (httpx.TimeoutException, httpx.TransportError)
+
+
+async def ext_get_retry(req: Request, url: str, headers: dict | None = None,
+                        *, tries: int = 3, timeout: float | None = 20.0):
+    """带重试的外站 GET。成功（2xx/3xx 或不可重试状态码）即返回；网络异常或
+    可重试状态码指数退避后重试，最后一次把原始响应/异常交给调用方。"""
+    client = ext_client(req)
+    last_exc: Exception | None = None
+    r = None
+    for attempt in range(tries):
+        try:
+            r = await client.get(url, headers=headers or {}, timeout=timeout)
+            if r.status_code not in _RETRY_STATUS or attempt == tries - 1:
+                return r
+            await r.aclose()
+        except _RETRIABLE_EXC as exc:
+            last_exc = exc
+        if attempt < tries - 1:
+            await asyncio.sleep(0.25 * (2 ** attempt))
+    if last_exc is not None:
+        raise last_exc
+    return r  # type: ignore[return-value]
+
+
 async def forward_upstream(request: Request) -> Response:
     """原样透传官方后端（走 unix socket）。"""
     client = up_client(request)
@@ -349,7 +384,9 @@ async def forward_upstream(request: Request) -> Response:
 
 async def _aggregate_briefs(keyword: str, maxn: int | None = None) -> list[dict]:
     """聚合搜索所有启用源 → 跨源合并 → 去噪/去无直链 → brief 列表（已入库）。"""
-    sources = config.enabled_sources()
+    # 可选特性源不进入全局搜索（公开构建下该开关恒关，等价于不过滤）。
+    sources = [s for s in config.enabled_sources()
+               if not (features.ADULT and s.get("adult"))]
     titles = await providers.search_all(keyword, sources)
     if maxn is None:
         maxn = int(config.get().get("max_per_keyword", 12))
@@ -358,6 +395,12 @@ async def _aggregate_briefs(keyword: str, maxn: int | None = None) -> list[dict]
     loose_ids = {s["id"] for s in sources if s.get("loose_filter")}
     groups: dict[tuple, dict] = {}
     for t in titles:
+        # 硬红线（涉未成年/非自愿）：任何情况下不注入搜索结果
+        try:
+            if catalogmod.is_redline(t.title, t.remarks):
+                continue
+        except Exception:
+            pass
         if t.provider not in loose_ids and config.is_junk(t.title, t.remarks):
             continue
         playable = [e for line in t.sources.values() for e in line
@@ -707,7 +750,9 @@ async def mediadb_list(request: Request):
                 continue
             ps = []
             try:
-                win, _ = await catalog.standalone_window(scope, 0, 8)
+                # 卡片海报不能被慢源拖住：只给很短的预算，取到就用、取不到先给空卡片。
+                win, _ = await asyncio.wait_for(
+                    catalog.standalone_window(scope, 0, 8), timeout=3.0)
                 for b in win:
                     p = inj._poster(b.get("poster") or "")
                     if p:
@@ -718,7 +763,7 @@ async def mediadb_list(request: Request):
                 pass
             inserts.append({
                 "guid": standalone_lib_guid(scope),
-                "title": "📡" + (s.get("name") or scope),
+                "title": standalone_lib_name(s),
                 "poster": ps[0] if ps else "",
                 "posters": ps,
                 "category": "Mix", "view_type": 0, "poster_type": 0,
@@ -799,12 +844,13 @@ async def mdb_detail(guid: str, request: Request):
         src = next((s for s in config.all_sources() if s["id"] == sscope), {})
         posters = []
         try:
-            win, _ = await catalog.standalone_window(sscope, 0, 8)
+            win, _ = await asyncio.wait_for(
+                catalog.standalone_window(sscope, 0, 8), timeout=6.0)
             posters = await posters_for([b.get("poster") or "" for b in win])
         except Exception:
             posters = []
         payload = {
-            "guid": guid, "name": "📡" + (src.get("name") or sscope),
+            "guid": guid, "name": standalone_lib_name(src),
             "category": "Mix",
             "dir_list": [], "lan": "zh-CN", "auto_scrap_subtitle": 0,
             "include_adult": False, "subtitle_lan": "zh-CN",
@@ -855,7 +901,10 @@ async def mediadb_sum(request: Request):
     for s in standalone_sources_active():
         scope = s["id"]
         if catalog.standalone_available(scope):
-            n = sum(catalog.total(c, scope) for c, _, _ in catalogmod.CATALOG_CATEGORIES)
+            pool = list(catalogmod.CATALOG_CATEGORIES)
+            if features.ADULT and s.get("adult"):
+                pool = pool + [(catalogmod.ADULT_CAT, "", "")]
+            n = sum(catalog.total(c, scope) for c, _, _ in pool)
             if n:
                 payload["data"][standalone_lib_guid(scope)] = n
                 total_added += n
@@ -878,7 +927,7 @@ async def item_list(request: Request):
     if sscope is not None and \
             any(s["id"] == sscope for s in standalone_sources_active()):
         src = next((s for s in config.all_sources() if s["id"] == sscope), {})
-        lib_name = "📡" + (src.get("name") or sscope)
+        lib_name = standalone_lib_name(src)
         if not charts_enabled() or not catalog.standalone_available(sscope):
             if catalog.routes_stale() and not catalog._refreshing:
                 asyncio.create_task(
@@ -1009,9 +1058,12 @@ async def item_detail(guid: str, request: Request):
     if sscope is not None and \
             any(s["id"] == sscope for s in standalone_sources_active()):
         src = next((s for s in config.all_sources() if s["id"] == sscope), {})
-        n = sum(catalog.total(c, sscope) for c, _, _ in catalogmod.CATALOG_CATEGORIES)
+        _pool = list(catalogmod.CATALOG_CATEGORIES)
+        if features.ADULT and src.get("adult"):
+            _pool = _pool + [(catalogmod.ADULT_CAT, "", "")]
+        n = sum(catalog.total(c, sscope) for c, _, _ in _pool)
         data = inj._base_item(
-            guid=guid, type="MediaDB", title="📡" + (src.get("name") or sscope),
+            guid=guid, type="MediaDB", title=standalone_lib_name(src),
             can_play=1, number_of_episodes=n, local_number_of_episodes=n,
             ancestor_guid="", ancestor_name="", ancestor_category="",
             poster="", logic_type=0)
@@ -1727,8 +1779,18 @@ def _seg_url(mg: str, absolute: str, qs: str = "") -> str:
     return f"{ONLINE_PREFIX}/{mg}/seg?u={b64e(absolute)}{suffix}"
 
 
+
+
 async def _resolve_if_needed(picked: dict, request: Request) -> dict:
-    """播放页(/share/<id>)在播放时解析出真实媒体地址（原地更新 picked）。"""
+    """把播放页(/share/<id>)或 302 跳转地址解析成真实媒体地址（原地更新）。"""
+    if picked and picked.get("redirect"):
+        real = await providers.resolve_redirect(
+            ext_client(request), picked["url"],
+            (picked.get("headers") or {}).get("Referer", ""))
+        if real:
+            picked["url"] = real
+            picked["redirect"] = False
+            picked["m3u8"] = bool(re.search(r"\.m3u8(\?|$)", real, re.I))
     if picked and picked.get("resolve"):
         real = await providers.resolve_share(
             ext_client(request), picked["url"],
@@ -1756,6 +1818,14 @@ async def hls_preset(mg: str, request: Request):
     # 枚举该集/正片在各播放线路下的地址；可解析页先解析
     hls_targets = []
     for t in targets:
+        if t.get("redirect"):
+            real = await providers.resolve_redirect(
+                ext_client(request), t["url"],
+                (t.get("headers") or {}).get("Referer", ""))
+            if real:
+                t["url"] = real
+                t["redirect"] = False
+                t["m3u8"] = bool(re.search(r"\.m3u8(\?|$)", real, re.I))
         if t.get("resolve"):
             real = await providers.resolve_share(
                 ext_client(request), t["url"],
@@ -1763,10 +1833,32 @@ async def hls_preset(mg: str, request: Request):
             if real:
                 t["url"] = real
                 t["m3u8"] = bool(re.search(r"\.m3u8(\?|$)", real, re.I))
-        if t["m3u8"]:
+        if t.get("m3u8") or re.search(r"\.(m3u8|mp4)(\?|$)", t.get("url", ""), re.I):
             hls_targets.append(t)
     if not hls_targets:
         return Response("no hls line", status_code=404)
+
+    # 多线路：用 ffprobe 探测每条真实地址的分辨率，给线路名追加 4K/1080P…
+    # 仅多线路（有切换菜单）时探测；并发、整体限时，失败不影响出单
+    if len(hls_targets) > 1:
+        import quality
+        title_guid = picked.get("online_guid", "")
+
+        async def _tag(t: dict) -> None:
+            try:
+                is_m3u8 = bool(t.get("m3u8")) or \
+                    bool(re.search(r"\.m3u8(\?|$)", t["url"], re.I))
+                t["_q"] = await quality.resolve(
+                    ext_client(request), t["url"], title_guid=title_guid,
+                    line=t["line"], headers=t.get("headers"),
+                    kind="m3u8" if is_m3u8 else "mp4")
+            except Exception:
+                t["_q"] = ""
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*[_tag(t) for t in hls_targets]), timeout=12)
+        except Exception:
+            pass  # 探测超时/异常：无标注也必须能播（结果已按线路缓存，下次更快）
 
     idx = int(picked.get("index", 0) or 0)
 
@@ -1785,7 +1877,10 @@ async def hls_preset(mg: str, request: Request):
         out = ["#EXTM3U", "#EXT-X-VERSION:3"]
         for i, t in enumerate(hls_targets):
             name = _friendly_line(t["line"])
-            # NAME 供支持的播放器显示线路名；BANDWIDTH 差异化避免被合并
+            q = t.get("_q") or ""
+            if q:
+                name = f"{name} · {q}"
+            # NAME 供支持的播放器显示「线路名 · 分辨率」；BANDWIDTH 差异化避免被合并
             out.append(f'#EXT-X-STREAM-INF:BANDWIDTH={1000000 + i * 100000},'
                        f'PROGRAM-ID=1,NAME="{name}"')
             out.append(variant_uri(t))
@@ -1837,29 +1932,63 @@ def _first_variant(text: str, base: str) -> str | None:
     return urllib.parse.urljoin(base, uri)
 
 
-@app.get(f"{ONLINE_PREFIX}/{{mg}}/main.m3u8")
-async def hls_main(mg: str, request: Request):
-    picked = _pick_episode(mg, request)
-    if not picked:
-        return Response("not found", status_code=404)
-    await _resolve_if_needed(picked, request)
-    src_url, headers = picked["url"], picked["headers"]
-    # 跟随嵌套 master（如 index.m3u8 -> 3000k/hls/mixed.m3u8），最多 4 层
-    cur, text = src_url, None
+async def _fetch_playlist(request: Request, url: str, headers: dict,
+                          tries: int = 3):
+    """抓取并跟随嵌套 master，返回最终媒体列表文本与其基准 URL。失败返回 (None,url)。"""
+    cur, text = url, None
     for _ in range(4):
         try:
-            r = await ext_client(request).get(cur, headers=headers)
-            if r.status_code != 200:
-                return Response(f"upstream {r.status_code}", status_code=502)
-            text = r.text
-        except Exception as exc:
-            return Response(f"fetch fail {type(exc).__name__}", status_code=502)
+            r = await ext_get_retry(request, cur, headers, tries=tries, timeout=15.0)
+        except Exception:
+            return None, cur
+        if r.status_code != 200:
+            return None, cur
+        text = r.text
         if _is_media_playlist(text):
             break
         nxt = _first_variant(text, cur)
         if not nxt or nxt == cur:
             break
         cur = nxt
+    return text, cur
+
+
+@app.get(f"{ONLINE_PREFIX}/{{mg}}/main.m3u8")
+async def hls_main(mg: str, request: Request):
+    picked = _pick_episode(mg, request)
+    if not picked:
+        return Response("not found", status_code=404)
+    headers = picked["headers"]
+    was_redirect = bool(picked.get("redirect"))
+    await _resolve_if_needed(picked, request)
+    src_url = picked["url"]
+    # 抓取媒体列表（含嵌套 master 跟随 + 抖动重试）
+    text, cur = await _fetch_playlist(request, src_url, headers)
+    # 跳转型源站极慢且间歇抖动：若用解析后的真实地址抓取失败，则强制重新
+    # 解析一次（直接对原始 videodiag 跳转地址请求）再抓，避免整列表 502。
+    if text is None and was_redirect:
+        from store import store as _store
+        og = picked.get("online_guid")
+        raw = _store.get_title_by_guid(og) if og else None
+        jump = None
+        if raw:
+            for _ln, eps in (raw.get("lines") or {}).items():
+                for e in eps:
+                    if e.get("redirect"):
+                        jump = e.get("url")
+                        break
+                if jump:
+                    break
+        if jump:
+            fresh = await providers.resolve_redirect(
+                ext_client(request), jump,
+                (headers or {}).get("Referer", ""))
+            if fresh:
+                text, cur = await _fetch_playlist(request, fresh, headers)
+                if text is not None:
+                    picked["url"] = fresh
+    if text is None:
+        return Response("fetch fail upstream", status_code=502)
     base_url = cur  # 分片相对地址以最终媒体列表为基准
 
     sel_qs = ""
@@ -1899,14 +2028,40 @@ async def hls_seg(mg: str, request: Request):
     if "range" in request.headers:
         fwd["Range"] = request.headers["range"]
     try:
-        r = await ext_client(request).get(src_url, headers=fwd)
+        # 分片在播放中途持续拉取，对瞬时抖动必须重试，否则单次失败播放器直接报错
+        r = await ext_get_retry(request, src_url, fwd, tries=4, timeout=30.0)
     except Exception as exc:
+        _log.warning("seg fetch fail %s %s", type(exc).__name__,
+                     urllib.parse.urlsplit(src_url).netloc)
         return Response(f"seg fail {type(exc).__name__}", status_code=502)
-    drop = ("content-length", "content-encoding", "transfer-encoding",
-            "connection", "content-security-policy")
+    body = r.content
+    ctype = r.headers.get("content-type", "")
+    unwrapped = False
+    # 部分源把真实 TS 分片伪装成「1×1 PNG 头 + TS」。剥掉 PNG 外壳
+    # 还原成纯 TS，飞牛播放器才能正常解码（通用兼容，对所有源生效）
+    if body[:8] == b"\x89PNG\r\n\x1a\n":
+        try:
+            import quality
+            payload, _ = quality._unwrap_segment(body)
+            if payload is not body:
+                body = payload
+                ctype = "video/mp2t"
+                unwrapped = True
+        except Exception:
+            pass
+    drop = ["content-length", "content-encoding", "transfer-encoding",
+            "connection", "content-security-policy"]
+    if unwrapped:
+        drop.append("content-type")
     h = {k: v for k, v in r.headers.items() if k.lower() not in drop}
     h["Access-Control-Allow-Origin"] = "*"
-    return Response(content=r.content, status_code=r.status_code, headers=h)
+    h["Content-Length"] = str(len(body))
+    if unwrapped or "content-type" not in {k.lower() for k in h}:
+        h["Content-Type"] = ctype or "video/mp2t"
+    if r.status_code in _RETRY_STATUS:
+        _log.warning("seg upstream %s %s", r.status_code,
+                     urllib.parse.urlsplit(src_url).netloc)
+    return Response(content=body, status_code=r.status_code, headers=h)
 
 
 # ------------------------------------------------------------- 海报代理
@@ -2060,6 +2215,8 @@ async def ext_set_config(request: Request):
                     sources_changed = True
                 if isinstance(ch.get("loose_filter"), bool):
                     cur[sid]["loose_filter"] = ch["loose_filter"]
+                if isinstance(ch.get("adult"), bool):
+                    cur[sid]["adult"] = ch["adult"] and bool(cur[sid].get("standalone"))
         patch["sources"] = list(cur.values())
     config.save(patch)
     _search_cache.clear()
@@ -2106,6 +2263,7 @@ async def ext_source_standalone(request: Request):
     body = await request.json()
     sid = body.get("id", "")
     on = bool(body.get("standalone"))
+    target = next((s for s in config.all_sources() if s["id"] == sid), None)
     ok, info = config.set_standalone(sid, on)
     if not ok:
         return JSONResponse({"code": 404, "msg": info}, status_code=404)
@@ -2134,6 +2292,8 @@ async def ext_source_loose(request: Request):
         pass
     _schedule_routes_refresh()
     return {"code": 0, "msg": "ok"}
+
+
 
 
 @app.post("/v/api/ext/source/delete")
