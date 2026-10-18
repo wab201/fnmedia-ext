@@ -128,6 +128,35 @@ def charts_enabled() -> bool:
     return bool(config.get().get("hot_library_enabled", True))
 
 
+def _tv_compat_date(v) -> str:
+    """TV/盒子端用严格日期解析：'2026' 年份会抛异常导致整页空白，补成完整日期。"""
+    s = str(v or "").strip()
+    if len(s) == 4 and s.isdigit():
+        return f"{s}-01-01"
+    return s
+
+
+def _tv_compat_card(row: dict) -> dict:
+    """FNTV(Flutter) 比手机端严格得多：只回它真实本地库卡片里出现过的字段集合，
+    多余字段（can_play/genres/poster_*）或取值形态不符都可能让整页 fromJson 失败。
+
+    已核对真实库卡片字段；status 用数字枚举串 '1'，日期补成 yyyy-MM-dd。
+    """
+    keep = ("guid", "video_guid", "lan", "imdb_id", "trim_id", "tv_title",
+            "parent_guid", "parent_title", "title", "type", "poster",
+            "is_favorite", "watched", "watched_ts", "vote_average", "media_stream",
+            "release_date", "season_number", "episode_number", "air_date",
+            "number_of_seasons", "number_of_episodes",
+            "local_number_of_seasons", "local_number_of_episodes", "status",
+            "overview", "ancestor_guid", "ancestor_name", "ancestor_category",
+            "ts", "duration", "single_child_guid", "file_name", "path", "runtime")
+    out = {k: row[k] for k in keep if k in row}
+    out["status"] = "1"
+    out["release_date"] = _tv_compat_date(row.get("release_date"))
+    out["air_date"] = _tv_compat_date(row.get("air_date"))
+    return out
+
+
 def chart_card(item: dict) -> dict:
     """榜单条目 → 媒体库卡片（不解析播放；点击详情时才搜源）。"""
     cat = item["cat"]
@@ -137,8 +166,14 @@ def chart_card(item: dict) -> dict:
     tags = item.get("tags") or []
     overview = item.get("desc") or ("、".join(tags) if tags else "")
     title = item["title"]
+    guid = item["guid"]
     return {
-        "guid": item["guid"],
+        "guid": guid,
+        # TV/盒子端(Flutter)列表模型要求 video_guid/path/runtime，缺失会整库“加载失败”；
+        # 手机端较宽松。video_guid 与播放/详情接口用的 video_guid(guid) 保持一致。
+        "video_guid": video_guid(guid),
+        "path": "",
+        "runtime": 0,
         "lan": "zh-CN",
         "imdb_id": "",
         "trim_id": "",
@@ -789,13 +824,18 @@ async def mediadb_list(request: Request):
     if not config.get().get("hot_library_enabled", True):
         return upstream
     payload = await _json_from_upstream(upstream)
-    if payload is None:
-        return upstream
-    dbs = payload.get("data")
+    dbs = payload.get("data") if payload else None
     vlib_guids = (set(CHART_LIB_GUIDS.values()) | set(CATALOG_LIB_GUIDS.values())
                   | {standalone_lib_guid(s["id"]) for s in config.all_sources()})
-    if not isinstance(dbs, list) or any(d.get("guid") in vlib_guids for d in dbs):
+    # 官方该接口偶发鉴权/抖动失败（TV 端会整体“加载失败”）。只要拿到过有效列表，
+    # 或本次列表为空，都用本地虚拟库补全；官方失败则只返回我们的虚拟库，不把错误透传给 App。
+    if isinstance(dbs, list) and any(d.get("guid") in vlib_guids for d in dbs):
         return upstream
+    if not isinstance(dbs, list):
+        if not (payload and payload.get("code") == 0):
+            dbs = []  # 官方失败：以我们的虚拟库兜底
+        else:
+            return upstream
     try:
         inserts = []
         # 1) 豆瓣真实榜单（精选）
@@ -815,22 +855,14 @@ async def mediadb_list(request: Request):
                 "category": chartmod.chart_cat_mdb(cat),
                 "view_type": 0, "poster_type": 0, "refresh_disabled": True,
             })
-        # 2) 海量分类片库（资源站深翻）；仅在已建立分类路由时展示
+        # 2) 海量分类片库（资源站深翻）；仅在已建立分类路由时展示。
+        # 海报只读本页/密集缓存，绝不在此联网抓取——TV/安卓 App 对该接口超时很敏感，
+        # 一次资源站首页请求可能耗时十余秒，导致客户端提示“加载失败/媒体库不存在”。
         if charts_enabled() and any(catalog.available(c) for c, _, _ in catalogmod.CATALOG_CATEGORIES):
             for cat, _t, _c in catalogmod.CATALOG_CATEGORIES:
                 if not catalog.available(cat):
                     continue
-                ps = []
-                try:
-                    first = await catalog.get_page(cat, 1)
-                    for b in first:
-                        p = inj._poster(b.get("poster") or "")
-                        if p:
-                            ps.append(p)
-                        if len(ps) >= 8:
-                            break
-                except Exception:
-                    pass
+                ps = [inj._poster(p) for p in catalog.cached_page_posters(cat, 8)]
                 inserts.append({
                     "guid": CATALOG_LIB_GUIDS[cat],
                     "title": catalogmod.catalog_title(cat),
@@ -844,15 +876,16 @@ async def mediadb_list(request: Request):
             scope = s["id"]
             if not catalog.standalone_available(scope):
                 continue
-            ps = []
+            ps: list[str] = []
+            # 同样只用缓存海报，不联网；后台预热会逐步填充海报
             try:
-                # 卡片海报不能被慢源拖住：只给很短的预算，取到就用、取不到先给空卡片。
-                win, _ = await asyncio.wait_for(
-                    catalog.standalone_window(scope, 0, 8), timeout=3.0)
-                for b in win:
-                    p = inj._poster(b.get("poster") or "")
-                    if p:
-                        ps.append(p)
+                for cat in list(catalogmod.CATALOG_CATEGORIES):
+                    if catalog.available(cat, scope):
+                        for p in catalog.cached_page_posters(cat, 8, scope):
+                            if p not in ps:
+                                ps.append(p)
+                            if len(ps) >= 8:
+                                break
                     if len(ps) >= 8:
                         break
             except Exception:
@@ -861,11 +894,18 @@ async def mediadb_list(request: Request):
                 "guid": standalone_lib_guid(scope),
                 "title": standalone_lib_name(s),
                 "poster": ps[0] if ps else "",
-                "posters": ps,
+                "posters": [inj._poster(p) for p in ps],
                 "category": "Mix", "view_type": 0, "poster_type": 0,
                 "refresh_disabled": True,
             })
         dbs[0:0] = inserts
+        if not isinstance(payload, dict):
+            payload = {"code": 0, "msg": "", "data": []}
+        # 官方该接口失败时我们用虚拟库兜底，必须把整体码改为成功，否则 App 直接报错
+        if payload.get("code") != 0:
+            payload["code"] = 0
+            payload["msg"] = ""
+        payload["data"] = dbs
         return JSONResponse(payload)
     except Exception as exc:
         _log.warning("inject virtual mediadb failed: %s", exc)
@@ -916,8 +956,8 @@ async def mdb_detail(guid: str, request: Request):
         posters = []
         try:
             if catalog.available(cat):
-                briefs = await catalog.get_page(cat, 1)
-                posters = await posters_for([b.get("poster") or "" for b in briefs])
+                posters = [inj._poster(p)
+                           for p in catalog.cached_page_posters(cat, 8)]
         except Exception:
             posters = []
         payload = {
@@ -940,9 +980,15 @@ async def mdb_detail(guid: str, request: Request):
         src = next((s for s in config.all_sources() if s["id"] == sscope), {})
         posters = []
         try:
-            win, _ = await asyncio.wait_for(
-                catalog.standalone_window(sscope, 0, 8), timeout=6.0)
-            posters = await posters_for([b.get("poster") or "" for b in win])
+            ps: list[str] = []
+            for cat in list(catalogmod.CATALOG_CATEGORIES):
+                if catalog.available(cat, sscope):
+                    for p in catalog.cached_page_posters(cat, 8, sscope):
+                        if p not in ps:
+                            ps.append(p)
+                    if len(ps) >= 8:
+                        break
+            posters = [inj._poster(p) for p in ps[:8]]
         except Exception:
             posters = []
         payload = {
@@ -1047,6 +1093,8 @@ async def item_list(request: Request):
             row["video_guid"] = video_guid(b["guid"])
             _apply_marks(row)
             rows.append(row)
+        if "trim.tv" in request.headers.get("user-agent", ""):
+            rows = [_tv_compat_card(r) for r in rows]
         return JSONResponse({"code": 0, "msg": "", "data": {
             "mdb_name": lib_name, "mdb_category": "Mix", "top_dir": "",
             "dir": "", "total": total, "list": rows, "jump_list": None}})
@@ -1074,6 +1122,8 @@ async def item_list(request: Request):
         offset = max(0, min(offset, total))
         briefs = await catalog.get_window(ccat, offset, page_size)
         rows = _catalog_filter([_catalog_card(b, ccat) for b in briefs], body)
+        if "trim.tv" in request.headers.get("user-agent", ""):
+            rows = [_tv_compat_card(r) for r in rows]
         return JSONResponse({"code": 0, "msg": "", "data": {
             "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
             "dir": "", "total": total, "list": rows,
@@ -1102,15 +1152,19 @@ async def item_list(request: Request):
         pass
     all_rows = _chart_rows_all(body, cat)
     page_size, start, end = _page_args(body, len(all_rows))
-    return JSONResponse({"code": 0, "msg": "", "data": {
+    out_rows = all_rows[start:end]
+    if "trim.tv" in request.headers.get("user-agent", ""):
+        out_rows = [_tv_compat_card(r) for r in out_rows]
+    _payload = {"code": 0, "msg": "", "data": {
         "mdb_name": mdb_name,
         "mdb_category": mdb_cat,
         "top_dir": "",
         "dir": "",
         "total": len(all_rows),
-        "list": all_rows[start:end],
+        "list": out_rows,
         "jump_list": None,
-    }})
+    }}
+    return JSONResponse(_payload)
 
 
 @app.get("/v/api/v1/search/list")

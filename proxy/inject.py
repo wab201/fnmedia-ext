@@ -107,6 +107,10 @@ def search_item(b: dict) -> dict:
     nep = _ep_count(b)
     return {
         "guid": guid,
+        # TV/盒子端列表模型要求 video_guid/path/runtime，缺失会整库“加载失败”
+        "video_guid": video_guid(guid),
+        "path": "",
+        "runtime": 0,
         "lan": "zh-CN",
         "imdb_id": "",
         "trim_id": "",

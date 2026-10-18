@@ -492,6 +492,29 @@ class Catalog:
             asyncio.create_task(work())
         return await fut
 
+    def cached_page_posters(self, cat: str, n: int = 8,
+                            scope: str = AGG_SCOPE) -> list[str]:
+        """纯本地、零网络：从已缓存的首页/密集列表取海报，供媒体库卡片秒回。"""
+        out: list[str] = []
+        with self._lock:
+            # 优先已翻好的去重密集列表（最新），其次首页缓存
+            dense = self._dense.get(self._scope_key(scope, cat)) or []
+            pool = list(dense)
+            hit = self._page_cache.get((scope, cat, 1))
+            if hit and time.time() - hit[0] < hit[2]:
+                for b in hit[1]:
+                    if b not in pool:
+                        pool.append(b)
+            seen = set()
+            for b in pool:
+                p = b.get("poster") or ""
+                if p and p not in seen:
+                    seen.add(p)
+                    out.append(p)
+                    if len(out) >= n:
+                        break
+        return out
+
     def _briefs_from_vods(self, vods: list, source: dict, route: dict,
                           scope: str, cat: str) -> list[dict]:
         from config import config as _cfg
