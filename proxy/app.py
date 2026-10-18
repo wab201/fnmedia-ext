@@ -680,6 +680,84 @@ async def mediadb_list(request: Request):
         return upstream
 
 
+@app.get("/v/api/v1/mdb/{guid}")
+async def mdb_detail(guid: str, request: Request):
+    """App（Flutter）打开媒体库前会用 /mdb/<guid> 校验库是否存在。
+
+    网页版不调此接口，所以此前仅网页能打开虚拟库；这里为 8 个虚拟库返回与
+    官方同构的库元数据，否则官方后端返回 code=-6，App 提示「此媒体库不存在」。
+    """
+    async def posters_for(items: list[str], n: int = 8) -> list[str]:
+        ps = []
+        for cover in items:
+            p = inj._poster(cover)
+            if p:
+                ps.append(p)
+            if len(ps) >= n:
+                break
+        return ps
+
+    vguid = None
+    if guid in CHART_GUID_CAT:
+        cat = CHART_GUID_CAT[guid]
+        try:
+            posters = await posters_for([it.get("cover") or ""
+                                         for it in chart_cache.items(cat)])
+        except Exception:
+            posters = []
+        payload = {
+            "guid": guid,
+            "name": chartmod.chart_cat_title(cat),
+            "category": chartmod.chart_cat_mdb(cat),
+            "dir_list": [], "lan": "zh-CN", "auto_scrap_subtitle": 0,
+            "include_adult": False, "subtitle_lan": "zh-CN",
+            "poster": posters[0] if posters else "",
+            "poster_type": 0, "posters": posters,
+            "view_type": 0, "last_update_time": 0, "sort_num": 0,
+            "auto_progress_thumb": 0, "skip_filesize": 0,
+            "prefer_local_nfo": 0, "refresh_disabled": True,
+        }
+        return JSONResponse({"code": 0, "msg": "", "data": payload})
+
+    if guid in CATALOG_GUID_CAT:
+        cat = CATALOG_GUID_CAT[guid]
+        posters = []
+        try:
+            if catalog.available(cat):
+                briefs = await catalog.get_page(cat, 1)
+                posters = await posters_for([b.get("poster") or "" for b in briefs])
+        except Exception:
+            posters = []
+        payload = {
+            "guid": guid,
+            "name": catalogmod.catalog_title(cat),
+            "category": catalogmod.catalog_mdb(cat),
+            "dir_list": [], "lan": "zh-CN", "auto_scrap_subtitle": 0,
+            "include_adult": False, "subtitle_lan": "zh-CN",
+            "poster": posters[0] if posters else "",
+            "poster_type": 0, "posters": posters,
+            "view_type": 0, "last_update_time": 0, "sort_num": 0,
+            "auto_progress_thumb": 0, "skip_filesize": 0,
+            "prefer_local_nfo": 0, "refresh_disabled": True,
+        }
+        return JSONResponse({"code": 0, "msg": "", "data": payload})
+
+    # 兼容旧热门库 guid
+    if is_hot_guid(guid):
+        cat = HOT_GUID_CAT.get(guid) or ("tv" if guid == HOT_LEGACY_GUID else "movie")
+        return JSONResponse({"code": 0, "msg": "", "data": {
+            "guid": guid, "name": chartmod.chart_cat_title(cat),
+            "category": chartmod.chart_cat_mdb(cat),
+            "dir_list": [], "lan": "zh-CN", "auto_scrap_subtitle": 0,
+            "include_adult": False, "subtitle_lan": "zh-CN",
+            "poster": "", "poster_type": 0, "posters": [],
+            "view_type": 0, "last_update_time": 0, "sort_num": 0,
+            "auto_progress_thumb": 0, "skip_filesize": 0,
+            "prefer_local_nfo": 0, "refresh_disabled": True}})
+
+    return await forward_upstream(request)
+
+
 @app.get("/v/api/v1/mediadb/sum")
 async def mediadb_sum(request: Request):
     upstream = await forward_upstream(request)
