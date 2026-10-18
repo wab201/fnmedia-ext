@@ -36,6 +36,10 @@ CATALOG_CATEGORIES = [
     ("variety", "🎤海量综艺", "Mix"),
 ]
 
+# 跨源聚合的“海量四库”使用的保留作用域 id；单源独立库作用域为其 source id。
+AGG_SCOPE = "__agg__"
+CATS = [c for c, _, _ in CATALOG_CATEGORIES]
+
 # 名称关键字（匹配 type_name 子串）。顺序：动漫/综艺优先于“电影/剧”判定。
 _ANIME_KW = ("动漫", "动画", "番剧", "卡通")
 _VARIETY_KW = ("综艺", "真人秀", "脱口秀", "娱乐")
@@ -108,21 +112,33 @@ async def _fetch_category_page(client: httpx.AsyncClient, source: dict,
 class Catalog:
     def __init__(self):
         self._lock = threading.RLock()
-        # source_id -> {type_id, type_name, type_pid, cat}
+        # source_id -> [ {type_id, type_name, type_pid, cat} ]
         self._classes: dict[str, list[dict]] = {}
-        # cat -> [ {source_id, type_id, type_name, pagecount?} ] 候选（规范源在最前）
+        # "scope:cat" -> [ {source_id, type_id, type_name, pagecount?} ]（首选在最前）
+        # scope 为 AGG_SCOPE（跨源聚合）或某个 source_id（单源独立媒体库）。
         self._routes: dict[str, list[dict]] = {}
         self._updated = 0.0
         self._refreshing = False
+        # key = (scope, cat, page)
         self._page_cache: dict[tuple, tuple[float, list[dict]]] = {}
         self._inflight: dict[tuple, asyncio.Future] = {}
-        self._totals: dict[str, int] = {}
-        # 会话级去重：资源站分页会让个别 vod 出现在多页，保证每部片全局只出现一次
-        self._seen_guids: dict[str, set[str]] = {c: set() for c, _, _ in CATALOG_CATEGORIES}
-        # 去重后的顺序条目缓冲与已扫描到的 CMS 页号（顺序浏览时构建）
-        self._dense: dict[str, list[dict]] = {c: [] for c, _, _ in CATALOG_CATEGORIES}
-        self._scanned_page: dict[str, int] = {c: 0 for c, _, _ in CATALOG_CATEGORIES}
-        self._dense_count: dict[str, int] = {c: 0 for c, _, _ in CATALOG_CATEGORIES}
+        # "scope:cat" -> 去重缓冲（资源站分页会重复个别 vod）
+        self._seen_guids: dict[str, set[str]] = {}
+        self._dense: dict[str, list[dict]] = {}
+        self._scanned_page: dict[str, int] = {}
+        self._dense_count: dict[str, int] = {}
+
+    @staticmethod
+    def _scope_key(scope: str, cat: str) -> str:
+        return f"{scope}:{cat}"
+
+    def standalone_scopes(self) -> list[str]:
+        """当前需要独立成库的源 id（来源配置中的 standalone 标记）。"""
+        try:
+            from config import config
+            return [s["id"] for s in config.all_sources() if s.get("standalone")]
+        except Exception:
+            return []
 
     # -------------------------------------------------- 分类表 / 路由
     async def refresh_routes(self, sources: list[dict]) -> dict[str, Any]:
@@ -133,53 +149,73 @@ class Catalog:
             async with httpx.AsyncClient(
                     follow_redirects=True, trust_env=False,
                     verify=False) as client:
-                jobs = await asyncio.gather(
+                await asyncio.gather(
                     *[self._load_source_classes(client, s) for s in sources],
                     return_exceptions=True)
-            # 为每个大类挑“可深翻”的规范源：探测每个候选子类第一页，记录 pagecount，
-            # 取页数最多者作为首选，其余作为回退（无需对每个源都探测所有类，抽样首页即可）。
-            routes: dict[str, list[dict]] = {c: [] for c, _, _ in CATALOG_CATEGORIES}
-            cand_by_cat: dict[str, list[tuple[str, dict]]] = {
-                c: [] for c, _, _ in CATALOG_CATEGORIES}
+
+            # 每个源每类只探测一个代表性叶子子类（第一页），用 pagecount 判断
+            # 是否可深翻并挑选首选；分类表本身（全部叶子）已在 _classes 中。
+            cand: list[tuple[str, str, dict]] = []  # (cat, sid, cl)
             for sid, classes in self._classes.items():
+                per_cat: dict[str, dict] = {}
                 for cl in classes:
                     cat = cl.get("cat")
-                    if cat:
-                        cand_by_cat[cat].append((sid, cl))
+                    if cat and cat not in per_cat:
+                        per_cat[cat] = cl
+                for cat, cl in per_cat.items():
+                    cand.append((cat, sid, cl))
+            probed: dict[tuple[str, str], dict] = {}
+
             async with httpx.AsyncClient(
                     follow_redirects=True, trust_env=False,
                     verify=False) as client:
-                probe_jobs = []
-                seen_leaf: set[tuple[str, str, str]] = set()
-                for cat, cands in cand_by_cat.items():
-                    # 每个源每类只探测一个代表性子类（选该源该类的第一个叶子），
-                    # 避免对全部子类发请求；pagecount 仅用于挑选规范源。
-                    per_src: set[str] = set()
-                    for sid, cl in cands:
-                        if sid in per_src:
-                            continue
-                        per_src.add(sid)
-                        sig = (cat, sid, str(cl["type_id"]))
-                        if sig in seen_leaf:
-                            continue
-                        seen_leaf.add(sig)
-                        probe_jobs.append(self._probe_route(client, cat, sid, cl))
-                await asyncio.gather(*probe_jobs, return_exceptions=True)
-            # 汇总到 routes 并按 pagecount 降序
-            for cat in routes:
-                seen_src: set[str] = set()
-                merged = []
-                good = sorted(self._routes.get(cat, []),
-                              key=lambda r: -(r.get("pagecount") or 0))
-                for r in good:
-                    if r["source_id"] in seen_src:
-                        continue
-                    seen_src.add(r["source_id"])
-                    merged.append(r)
-                routes[cat] = merged
-                self._totals[cat] = self.pagecount(cat) * PAGE_SIZE
+                async def probe(cat, sid, cl):
+                    source = self._source_by_id(sid)
+                    if not source:
+                        return
+                    try:
+                        _lst, pc = await _fetch_category_page(
+                            client, source, cl["type_id"], 1)
+                    except Exception:
+                        return
+                    if not _lst:
+                        return
+                    probed[(cat, sid)] = {
+                        "source_id": sid, "type_id": cl["type_id"],
+                        "type_name": cl["type_name"],
+                        "pagecount": int(pc or 0)}
+                await asyncio.gather(*[probe(c, s, cl) for c, s, cl in cand],
+                                     return_exceptions=True)
+
+            def routes_for_scope(scope: str) -> dict[str, list[dict]]:
+                out: dict[str, list[dict]] = {}
+                for cat in CATS:
+                    if scope == AGG_SCOPE:
+                        rs = [probed[(cat, sid)] for (c2, sid) in probed if c2 == cat]
+                        rs.sort(key=lambda r: -(r.get("pagecount") or 0))
+                        # 聚合：首选最深的源，并附带其余可深翻源做回退
+                        out[cat] = rs
+                    else:
+                        hit = probed.get((cat, scope))
+                        out[cat] = [hit] if hit else []
+                return out
+
+            new_routes: dict[str, list[dict]] = {}
+            agg = routes_for_scope(AGG_SCOPE)
+            for cat, rs in agg.items():
+                new_routes[self._scope_key(AGG_SCOPE, cat)] = rs
+            for sid in self.standalone_scopes():
+                for cat, rs in routes_for_scope(sid).items():
+                    if rs:
+                        new_routes[self._scope_key(sid, cat)] = rs
             with self._lock:
-                self._routes = routes
+                # 清理已不再需要的作用域缓冲
+                valid_keys = set(new_routes.keys())
+                self._routes = new_routes
+                for d in (self._seen_guids, self._dense, self._scanned_page):
+                    for k in list(d.keys()):
+                        if k not in valid_keys:
+                            d.pop(k, None)
                 self._updated = time.time()
         finally:
             self._refreshing = False
@@ -214,23 +250,6 @@ class Catalog:
         with self._lock:
             self._classes[source["id"]] = norm
 
-    async def _probe_route(self, client: httpx.AsyncClient, cat: str,
-                           source_id: str, cl: dict):
-        # 优先用叶子子类（有子类的父类不聚合，跳过含子分类的父类）
-        source = self._source_by_id(source_id)
-        if not source:
-            return
-        try:
-            _lst, pc = await _fetch_category_page(client, source, cl["type_id"], 1)
-        except Exception:
-            return
-        if not _lst:
-            return
-        with self._lock:
-            self._routes.setdefault(cat, []).append({
-                "source_id": source_id, "type_id": cl["type_id"],
-                "type_name": cl["type_name"], "pagecount": int(pc or 0)})
-
     def _source_by_id(self, sid: str) -> dict | None:
         try:
             from config import config
@@ -244,70 +263,76 @@ class Catalog:
                 "updated_at": int(self._updated),
                 "categories": {
                     cat: {
-                        "routes": len(self._routes.get(cat, [])),
-                        "source": (self._routes.get(cat) or [{}])[0].get("source_id", ""),
-                        "type_name": (self._routes.get(cat) or [{}])[0].get("type_name", ""),
-                        "pagecount": min(int((self._routes.get(cat) or [{}])[0]
-                                             .get("pagecount") or 0), MAX_PAGES),
+                        "routes": len(self._routes.get(
+                            self._scope_key(AGG_SCOPE, cat), [])),
+                        "source": (self._routes.get(
+                            self._scope_key(AGG_SCOPE, cat)) or [{}])[0].get("source_id", ""),
+                        "type_name": (self._routes.get(
+                            self._scope_key(AGG_SCOPE, cat)) or [{}])[0].get("type_name", ""),
+                        "pagecount": min(int((self._routes.get(
+                            self._scope_key(AGG_SCOPE, cat)) or [{}])[0]
+                            .get("pagecount") or 0), MAX_PAGES),
                     } for cat, _, _ in CATALOG_CATEGORIES},
             }
 
-    def available(self, cat: str) -> bool:
+    def available(self, cat: str, scope: str = AGG_SCOPE) -> bool:
         with self._lock:
-            return bool(self._routes.get(cat))
+            return bool(self._routes.get(self._scope_key(scope, cat)))
 
-    def pagecount(self, cat: str) -> int:
+    def pagecount(self, cat: str, scope: str = AGG_SCOPE) -> int:
         with self._lock:
-            routes = self._routes.get(cat) or []
+            routes = self._routes.get(self._scope_key(scope, cat)) or []
             if not routes:
                 return 0
             return min(int(routes[0].get("pagecount") or 0), MAX_PAGES)
 
-    def total(self, cat: str) -> int:
+    def total(self, cat: str, scope: str = AGG_SCOPE) -> int:
         # 用规范源页数估算 total；最后一页条数未知，前端以空页自然停止。
-        return self.pagecount(cat) * PAGE_SIZE
+        return self.pagecount(cat, scope) * PAGE_SIZE
 
     def routes_stale(self) -> bool:
         return (not self._updated) or (time.time() - self._updated) >= CLASS_REFRESH
 
     # -------------------------------------------------- 页级抓取
-    async def _extend_dense(self, cat: str, need_count: int) -> int:
+    async def _extend_dense(self, scope: str, cat: str, need_count: int) -> int:
         """顺序翻页直到去重后的累计条目数达到 need_count（或翻到该源末页）。"""
-        pc = self.pagecount(cat)
-        seen = self._seen_guids.setdefault(cat, set())
-        dense = self._dense.setdefault(cat, [])
-        pg = self._scanned_page.get(cat, 0) + 1
+        sk = self._scope_key(scope, cat)
+        pc = self.pagecount(cat, scope)
+        seen = self._seen_guids.setdefault(sk, set())
+        dense = self._dense.setdefault(sk, [])
+        pg = self._scanned_page.get(sk, 0) + 1
         while len(dense) < need_count and pg <= pc:
-            rows = await self.get_page(cat, pg)
-            added = 0
+            rows = await self.get_page(cat, pg, scope)
             for b in rows:
                 gid = b.get("guid")
                 if gid in seen:
                     continue
-                seen.add(gid); dense.append(b); added += 1
-            self._scanned_page[cat] = pg
+                seen.add(gid); dense.append(b)
+            self._scanned_page[sk] = pg
             # 整页没有新增（可能是末页/空页）也要前进，避免死循环
             pg += 1
             if not rows:
                 break
-        self._dense_count[cat] = len(dense)
+        self._dense_count[sk] = len(dense)
         return len(dense)
 
-    async def get_window(self, cat: str, offset: int, limit: int) -> list[dict]:
+    async def get_window(self, cat: str, offset: int, limit: int,
+                         scope: str = AGG_SCOPE) -> list[dict]:
         """按“去重后的全局偏移”取一窗 brief，自动顺序跨 CMS 页，密集无重复。"""
         offset = max(0, int(offset))
         limit = max(1, min(int(limit), 100))
-        dense = self._dense.setdefault(cat, [])
+        sk = self._scope_key(scope, cat)
+        dense = self._dense.setdefault(sk, [])
         if len(dense) < offset + limit:
-            await self._extend_dense(cat, offset + limit)
+            await self._extend_dense(scope, cat, offset + limit)
         return dense[offset:offset + limit]
 
-    async def get_page(self, cat: str, page: int) -> list[dict]:
-        """取某大类第 page 页（1 起）的可播放 brief 列表（已入库）。"""
+    async def get_page(self, cat: str, page: int, scope: str = AGG_SCOPE) -> list[dict]:
+        """取某作用域某大类第 page 页（1 起）的可播放 brief 列表（已入库）。"""
         page = max(1, int(page))
         if page > MAX_PAGES:
             return []
-        key = (cat, page)
+        key = (scope, cat, page)
         with self._lock:
             hit = self._page_cache.get(key)
             if hit and time.time() - hit[0] < PAGE_TTL:
@@ -320,7 +345,7 @@ class Catalog:
 
             async def work():
                 try:
-                    briefs = await self._load_page(cat, page)
+                    briefs = await self._load_page(scope, cat, page)
                     with self._lock:
                         self._page_cache[key] = (time.time(), briefs)
                     fut.set_result(briefs)
@@ -333,11 +358,11 @@ class Catalog:
             asyncio.create_task(work())
         return await fut
 
-    async def _load_page(self, cat: str, page: int) -> list[dict]:
+    async def _load_page(self, scope: str, cat: str, page: int) -> list[dict]:
         from config import config as _cfg
         from store import store
         with self._lock:
-            routes = list(self._routes.get(cat) or [])
+            routes = list(self._routes.get(self._scope_key(scope, cat)) or [])
         last_err = None
         async with httpx.AsyncClient(follow_redirects=True, trust_env=False,
                                      verify=False) as client:
@@ -380,12 +405,52 @@ class Catalog:
                         "actor": t.actor, "director": t.director, "area": t.area,
                         "lines": {name: [e.__dict__ for e in eps]
                                   for name, eps in t.sources.items()},
-                        "catalog_cat": cat,
+                        "catalog_cat": cat, "catalog_scope": scope,
+                        "catalog_source": route["source_id"],
                     }
                     briefs.append(brief)
                 if briefs:
                     return store.remember_merged(briefs)
         return []
+
+    # --------------------------------------- 单源独立库：跨四类交错窗口
+    async def standalone_window(self, scope: str, offset: int,
+                                limit: int) -> tuple[list[dict], int]:
+        """单源独立库：把该源的电影/剧/动漫/综艺按轮次交错成一条“最近更新”流。
+
+        返回 (brief 列表, 估算 total)。四类各取 offset..offset+limit 的窗，
+        再按排名轮次合并去重，最后按全局 offset 切片。
+        """
+        cats = [c for c in CATS if self.available(c, scope)]
+        if not cats:
+            return [], 0
+        end = offset + limit
+        results = await asyncio.gather(
+            *[self.get_window(c, 0, end, scope) for c in cats],
+            return_exceptions=True)
+        per: list[list[dict]] = []
+        total = 0
+        for r in results:
+            if isinstance(r, list):
+                per.append(r)
+        for c in cats:
+            total += self.total(c, scope)
+        merged: list[dict] = []
+        seen: set[str] = set()
+        maxlen = max((len(x) for x in per), default=0)
+        # 轮次交错：第 i 轮依次取每类第 i 条，近似源站“最近更新”混合排序
+        for i in range(maxlen):
+            for arr in per:
+                if i < len(arr):
+                    b = arr[i]
+                    g = b.get("guid")
+                    if g and g not in seen:
+                        seen.add(g)
+                        merged.append(b)
+        return merged[offset:offset + limit], total
+
+    def standalone_available(self, scope: str) -> bool:
+        return any(self.available(c, scope) for c in CATS)
 
 
 catalog = Catalog()

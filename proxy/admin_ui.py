@@ -69,16 +69,42 @@ ADMIN_HTML = r"""<!doctype html>
       <button class="ghost sm" onclick="restoreBuiltin()">恢复内置源</button>
     </h2>
     <table>
-      <thead><tr><th style="width:46px">启用</th><th>资源站</th><th style="width:150px">连通性</th>
-        <th style="width:90px">测试</th><th style="width:56px"></th></tr></thead>
-      <tbody id="srcRows"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+      <thead><tr><th style="width:42px">启用</th><th style="width:74px">独立媒体库</th><th>资源站</th><th style="width:150px">连通性</th>
+        <th style="width:80px">测试</th><th style="width:48px"></th></tr></thead>
+      <tbody id="srcRows"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
     </table>
     <div class="addrow">
-      <input type="text" id="addName" placeholder="名称（可选）"/>
-      <input type="text" id="addApi" placeholder="苹果CMS JSON 接口，如 https://xxx.com/api.php/provide/vod/at/json"/>
+      <input type="text" id="addName" placeholder="名称（可选）" style="max-width:150px"/>
+      <input type="text" id="addApi" placeholder="苹果CMS JSON/XML 接口，如 https://xxx.com/api.php/provide/vod/at/json"/>
+      <label style="display:flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap;cursor:pointer">
+        <input type="checkbox" id="addStandalone" style="width:15px;height:15px;accent-color:var(--ac)"/>独立库</label>
       <button onclick="addSource()">添加</button>
     </div>
-    <div class="muted" style="margin-top:8px">国内直连已规避代理；删除内置源只是隐藏，可点“恢复内置源”找回。</div>
+    <div class="muted" style="margin-top:8px">勾选「独立媒体库」会把该资源站单独生成为一张媒体库卡片（混合电影/剧集/动漫/综艺，无限滚动、点开即播）。国内直连已规避代理；删除内置源只是隐藏，可点“恢复内置源”找回。</div>
+  </div>
+
+  <div class="card">
+    <h2>导入 TVBox / 影视仓 / OK影视 配置</h2>
+    <div class="muted" style="margin-bottom:10px">
+      粘贴订阅地址或整段配置 JSON，自动识别并导入其中<strong>标准苹果CMS（type 0/1，JSON/XML）</strong>影视站；
+      Spider 爬虫源（type 3，依赖 jar/JS）、网盘、嗅探解析与直播源会自动跳过。
+    </div>
+    <div class="addrow">
+      <input type="text" id="tvboxUrl" placeholder="配置订阅 URL（http(s)，支持 base64 与多订阅聚合）" style="flex:2"/>
+      <button onclick="importTvbox('url')">按 URL 导入</button>
+    </div>
+    <div class="field" style="margin:10px 0">
+      <textarea id="tvboxText" rows="5" style="width:100%;font-family:monospace;font-size:12px"
+        placeholder="或直接粘贴 TVBox / 影视仓 / OK影视 配置 JSON（含 sites 数组）…"></textarea>
+    </div>
+    <div class="addrow">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+        <input type="checkbox" id="tvboxStandalone" style="width:15px;height:15px;accent-color:var(--ac)"/>
+        导入的源同时「作为独立媒体库」
+      </label>
+      <button onclick="importTvbox('text')">解析并导入</button>
+    </div>
+    <div id="tvboxResult" class="muted" style="margin-top:10px;white-space:pre-wrap"></div>
   </div>
 
   <div class="card">
@@ -250,7 +276,9 @@ function renderSources(){
   $("srcRows").innerHTML=srcs.map(src=>`
     <tr data-id="${src.id}">
       <td><input type="checkbox" class="en" ${src.enabled?"checked":""}/></td>
-      <td><div class="nm">${esc(src.name)}${src.builtin?'':'<span class="tag cu">自定义</span>'}</div>
+      <td style="text-align:center"><input type="checkbox" class="sa" title="作为独立媒体库" ${src.standalone?"checked":""}
+         ${src.enabled?"":"disabled"} style="width:16px;height:16px;accent-color:var(--ac)"/></td>
+      <td><div class="nm">${esc(src.name)}${src.builtin?'':'<span class="tag cu">自定义</span>'}${src.standalone?'<span class="tag cu">媒体库</span>':''}</div>
           <div class="meta">${esc(src.api)}</div></td>
       <td class="st wait" data-st>未测</td>
       <td><button class="ghost sm" data-test>测试</button></td>
@@ -259,9 +287,17 @@ function renderSources(){
   $("srcRows").querySelectorAll("tr").forEach(tr=>{
     const id=tr.dataset.id;
     tr.querySelector(".en").addEventListener("change",()=>toggleEnable(id,tr.querySelector(".en").checked));
+    const sa=tr.querySelector(".sa");
+    sa.addEventListener("change",()=>toggleStandalone(id,sa.checked));
     tr.querySelector("[data-test]").addEventListener("click",()=>testOne(id,tr));
     tr.querySelector("[data-del]").addEventListener("click",()=>delSource(id,srcName(id)));
   });
+}
+async function toggleStandalone(id,on){
+  const r=await jpost("/v/api/ext/source/standalone",{id,standalone:on});
+  if(r.code===0){const s=CFG.sources.find(x=>x.id===id);if(s)s.standalone=on;
+    renderSources();toast(on?"已生成独立媒体库（后台建库中，稍后刷新页面可见）":"已取消独立媒体库");}
+  else{toast(r.msg||"操作失败",false);renderSources();}
 }
 function srcName(id){const s=CFG.sources.find(x=>x.id===id);return s?s.name:id}
 
@@ -299,13 +335,33 @@ async function testAll(){
 
 async function addSource(){
   const name=$("addName").value.trim(),api=$("addApi").value.trim();
+  const standalone=$("addStandalone").checked;
   if(!api){toast("请填写接口地址",false);return}
-  const r=await jpost("/v/api/ext/source/add",{name,api});
-  if(r.code===0){toast("已添加，正在测速…");$("addName").value="";$("addApi").value="";
+  const r=await jpost("/v/api/ext/source/add",{name,api,standalone});
+  if(r.code===0){toast("已添加"+(standalone?"，正在生成独立媒体库…":"，正在测速…"));
+    $("addName").value="";$("addApi").value="";$("addStandalone").checked=false;
     await refreshCfg();
     const tr=$("srcRows").querySelector(`tr[data-id="${r.data.id}"]`);
-    if(tr) testOne(r.data.id,tr);}
+    if(tr&&!standalone) testOne(r.data.id,tr);}
   else toast(r.msg||"添加失败",false);
+}
+async function importTvbox(kind){
+  const standalone=$("tvboxStandalone").checked;
+  const payload={standalone};
+  if(kind==="url"){payload.url=$("tvboxUrl").value.trim();if(!payload.url){toast("请填写订阅 URL",false);return}}
+  else{payload.text=$("tvboxText").value.trim();if(!payload.text){toast("请粘贴配置 JSON",false);return}}
+  const out=$("tvboxResult");out.textContent="正在解析并探测，请稍候…";
+  try{
+    const r=await jpost("/v/api/ext/source/import-tvbox",payload);
+    if(r.code!==0){out.textContent="导入失败："+(r.msg||"");return}
+    const d=r.data||{};
+    const lines=[];
+    lines.push(`共识别 ${d.scanned||0} 个站点，可导入苹果CMS源 ${d.added||0} 个，已存在 ${d.duplicate||0} 个，跳过不支持 ${d.skipped||0} 个。`);
+    (d.added_names||[]).forEach(n=>lines.push("  + "+n));
+    if((d.skipped_detail||[]).length)lines.push("跳过（爬虫/网盘/直播等）："+d.skipped_detail.slice(0,12).join("、")+(d.skipped_detail.length>12?" 等":""));
+    out.textContent=lines.join("\n");
+    toast("导入完成");await refreshCfg();
+  }catch(e){out.textContent="导入出错："+e}
 }
 async function delSource(id,name){
   if(!confirm("确定删除资源站「"+name+"」？"))return;

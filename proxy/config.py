@@ -74,12 +74,14 @@ class Config:
                 m = dict(s)
                 m.update({k: cur[k] for k in ("enabled", "name", "api") if k in cur})
                 m["builtin"] = True
+                m["standalone"] = bool(cur.get("standalone", False))
                 merged.append(m)
             for sid, s in saved_by_id.items():
                 if sid in _BUILTIN_IDS or sid in removed:
                     continue
                 m = {k: s.get(k) for k in ("id", "name", "api", "enabled")}
                 m["enabled"] = bool(s.get("enabled", True))
+                m["standalone"] = bool(s.get("standalone", False))
                 m["builtin"] = bool(s.get("builtin", False))
                 merged.append(m)
             cfg["sources"] = merged
@@ -154,7 +156,8 @@ class Config:
     def make_custom_id(api: str) -> str:
         return "custom_" + hashlib.md5(api.strip().encode()).hexdigest()[:10]
 
-    def add_source(self, name: str, api: str, enabled: bool = True) -> tuple[bool, str]:
+    def add_source(self, name: str, api: str, enabled: bool = True,
+                   standalone: bool = False) -> tuple[bool, str]:
         with _LOCK:
             cfg = self.get()
             api = (api or "").strip()
@@ -170,9 +173,20 @@ class Config:
                 return False, "该资源站地址已存在"
             cfg["sources"].append(
                 {"id": sid, "name": name, "api": api,
-                 "enabled": bool(enabled), "builtin": False})
+                 "enabled": bool(enabled), "standalone": bool(standalone),
+                 "builtin": False})
             self._persist(cfg)
             return True, sid
+
+    def set_standalone(self, sid: str, on: bool) -> tuple[bool, str]:
+        with _LOCK:
+            cfg = self.get()
+            target = next((s for s in cfg["sources"] if s["id"] == sid), None)
+            if not target:
+                return False, "源不存在"
+            target["standalone"] = bool(on)
+            self._persist(cfg)
+            return True, "ok"
 
     def remove_source(self, sid: str) -> tuple[bool, str]:
         with _LOCK:

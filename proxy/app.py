@@ -40,6 +40,8 @@ import catalog as catalogmod
 from catalog import catalog
 import history as histmod
 from history import history
+import marks as marksmod
+from marks import marks
 from store import (store, make_guid, media_guid, video_guid, is_online_guid,
                    season_guid, episode_guid, ep_media_guid, ep_video_guid)
 
@@ -87,6 +89,27 @@ CATALOG_LIB_GUIDS: dict[str, str] = {
     "variety": "cfff30730cffca2d1357e0c2b52fc2f5",
 }
 CATALOG_GUID_CAT = {g: c for c, g in CATALOG_LIB_GUIDS.items()}
+
+# —— 单源独立媒体库：每个启用 standalone 的源生成一张库卡片 ——
+_STANDALONE_PREFIX = "fnmedia-standalone:"
+
+
+def standalone_lib_guid(source_id: str) -> str:
+    return hashlib.md5((_STANDALONE_PREFIX + source_id).encode()).hexdigest()
+
+
+def standalone_source_of(lib_guid: str) -> str | None:
+    """库 guid 反查 source_id；非独立库返回 None。"""
+    if not lib_guid:
+        return None
+    for s in config.all_sources():
+        if standalone_lib_guid(s["id"]) == lib_guid:
+            return s["id"]
+    return None
+
+
+def standalone_sources_active() -> list[dict]:
+    return [s for s in config.enabled_sources() if s.get("standalone")]
 
 
 def charts_enabled() -> bool:
@@ -475,9 +498,9 @@ def _hot_rows_all(body: dict, cat: str) -> list[dict]:
         if wanted:
             rows = [r for r in rows if r.get("type") in wanted]
 
+    rows = [_apply_marks(r) for r in rows]
     if int(body.get("is_favorite") or 0):
-        # 热门虚拟库暂不单独维护收藏；避免错误地展示全部内容。
-        return []
+        rows = [r for r in rows if r.get("is_favorite")]
     kw = str(body.get("keyword") or body.get("q") or body.get("title") or "").strip().lower()
     if kw:
         rows = [r for r in rows if kw in (r.get("title") or "").lower()]
@@ -526,8 +549,9 @@ def _chart_rows_all(body: dict, cat: str) -> list[dict]:
         wanted = set(tags) & {"Movie", "TV"}
         if wanted:
             rows = [r for r in rows if r.get("type") in wanted]
+    rows = [_apply_marks(r) for r in rows]
     if int(body.get("is_favorite") or 0):
-        return []
+        rows = [r for r in rows if r.get("is_favorite")]
     kw = str(body.get("keyword") or body.get("q") or body.get("title") or "").strip().lower()
     if kw:
         rows = [r for r in rows if kw in (r.get("title") or "").lower()]
@@ -576,8 +600,9 @@ def _catalog_filter(rows: list[dict], body: dict) -> list[dict]:
         wanted = set(tags) & {"Movie", "TV"}
         if wanted:
             rows = [r for r in rows if r.get("type") in wanted]
+    rows = [_apply_marks(r) for r in rows]
     if int(body.get("is_favorite") or 0):
-        return []
+        rows = [r for r in rows if r.get("is_favorite")]
     kw = str(body.get("keyword") or body.get("q") or body.get("title") or "").strip().lower()
     if kw:
         rows = [r for r in rows if kw in (r.get("title") or "").lower()]
@@ -627,7 +652,8 @@ async def mediadb_list(request: Request):
     if payload is None:
         return upstream
     dbs = payload.get("data")
-    vlib_guids = set(CHART_LIB_GUIDS.values()) | set(CATALOG_LIB_GUIDS.values())
+    vlib_guids = (set(CHART_LIB_GUIDS.values()) | set(CATALOG_LIB_GUIDS.values())
+                  | {standalone_lib_guid(s["id"]) for s in config.all_sources()})
     if not isinstance(dbs, list) or any(d.get("guid") in vlib_guids for d in dbs):
         return upstream
     try:
@@ -673,6 +699,30 @@ async def mediadb_list(request: Request):
                     "category": catalogmod.catalog_mdb(cat),
                     "view_type": 0, "poster_type": 0, "refresh_disabled": True,
                 })
+        # 3) 单源独立媒体库（用户在管理页为某个源勾选“作为独立媒体库”）
+        for s in standalone_sources_active():
+            scope = s["id"]
+            if not catalog.standalone_available(scope):
+                continue
+            ps = []
+            try:
+                win, _ = await catalog.standalone_window(scope, 0, 8)
+                for b in win:
+                    p = inj._poster(b.get("poster") or "")
+                    if p:
+                        ps.append(p)
+                    if len(ps) >= 8:
+                        break
+            except Exception:
+                pass
+            inserts.append({
+                "guid": standalone_lib_guid(scope),
+                "title": "📡" + (s.get("name") or scope),
+                "poster": ps[0] if ps else "",
+                "posters": ps,
+                "category": "Mix", "view_type": 0, "poster_type": 0,
+                "refresh_disabled": True,
+            })
         dbs[0:0] = inserts
         return JSONResponse(payload)
     except Exception as exc:
@@ -742,6 +792,29 @@ async def mdb_detail(guid: str, request: Request):
         }
         return JSONResponse({"code": 0, "msg": "", "data": payload})
 
+    # 单源独立媒体库
+    sscope = standalone_source_of(guid)
+    if sscope and any(s["id"] == sscope for s in standalone_sources_active()):
+        src = next((s for s in config.all_sources() if s["id"] == sscope), {})
+        posters = []
+        try:
+            win, _ = await catalog.standalone_window(sscope, 0, 8)
+            posters = await posters_for([b.get("poster") or "" for b in win])
+        except Exception:
+            posters = []
+        payload = {
+            "guid": guid, "name": "📡" + (src.get("name") or sscope),
+            "category": "Mix",
+            "dir_list": [], "lan": "zh-CN", "auto_scrap_subtitle": 0,
+            "include_adult": False, "subtitle_lan": "zh-CN",
+            "poster": posters[0] if posters else "",
+            "poster_type": 0, "posters": posters,
+            "view_type": 0, "last_update_time": 0, "sort_num": 0,
+            "auto_progress_thumb": 0, "skip_filesize": 0,
+            "prefer_local_nfo": 0, "refresh_disabled": True,
+        }
+        return JSONResponse({"code": 0, "msg": "", "data": payload})
+
     # 兼容旧热门库 guid
     if is_hot_guid(guid):
         cat = HOT_GUID_CAT.get(guid) or ("tv" if guid == HOT_LEGACY_GUID else "movie")
@@ -778,6 +851,13 @@ async def mediadb_sum(request: Request):
             if n:
                 payload["data"][CATALOG_LIB_GUIDS[cat]] = n
                 total_added += n
+    for s in standalone_sources_active():
+        scope = s["id"]
+        if catalog.standalone_available(scope):
+            n = sum(catalog.total(c, scope) for c, _, _ in catalogmod.CATALOG_CATEGORIES)
+            if n:
+                payload["data"][standalone_lib_guid(scope)] = n
+                total_added += n
     if total_added:
         payload["data"]["total"] = int(payload["data"].get("total", 0)) + total_added
     return JSONResponse(payload)
@@ -791,6 +871,39 @@ async def item_list(request: Request):
     except Exception:
         body = {}
     aguid = body.get("ancestor_guid")
+
+    # —— 单源独立媒体库：该源四类交错成一条最近更新流 ——
+    sscope = standalone_source_of(aguid) if aguid else None
+    if sscope is not None and \
+            any(s["id"] == sscope for s in standalone_sources_active()):
+        src = next((s for s in config.all_sources() if s["id"] == sscope), {})
+        lib_name = "📡" + (src.get("name") or sscope)
+        if not charts_enabled() or not catalog.standalone_available(sscope):
+            if catalog.routes_stale() and not catalog._refreshing:
+                asyncio.create_task(
+                    catalog.refresh_routes(config.enabled_sources()))
+            return JSONResponse({"code": 0, "msg": "", "data": {
+                "mdb_name": lib_name, "mdb_category": "Mix", "top_dir": "",
+                "dir": "", "total": 0, "list": [], "jump_list": None}})
+        page = max(1, int(body.get("page") or body.get("page_index") or 1))
+        page_size = max(1, min(int(body.get("page_size") or 22), 100))
+        offset = int(body["offset"]) if body.get("offset") is not None \
+            else (page - 1) * page_size
+        briefs, total = await catalog.standalone_window(sscope, offset, page_size)
+        rows = []
+        for b in briefs:
+            row = inj.search_item(b)
+            row["title"] = (b.get("title") or "") + (
+                f" ·{b['remarks']}" if b.get("remarks") else "")
+            row["ancestor_guid"] = aguid
+            row["ancestor_name"] = lib_name
+            row["ancestor_category"] = "Mix"
+            row["video_guid"] = video_guid(b["guid"])
+            _apply_marks(row)
+            rows.append(row)
+        return JSONResponse({"code": 0, "msg": "", "data": {
+            "mdb_name": lib_name, "mdb_category": "Mix", "top_dir": "",
+            "dir": "", "total": total, "list": rows, "jump_list": None}})
 
     # —— 海量分类片库：按资源站分类深翻，前端无限滚动逐页请求 ——
     ccat = CATALOG_GUID_CAT.get(aguid)
@@ -890,6 +1003,20 @@ async def search_list(request: Request):
 
 @app.get("/v/api/v1/item/{guid}")
 async def item_detail(guid: str, request: Request):
+    # 单源独立媒体库根节点
+    sscope = standalone_source_of(guid)
+    if sscope is not None and \
+            any(s["id"] == sscope for s in standalone_sources_active()):
+        src = next((s for s in config.all_sources() if s["id"] == sscope), {})
+        n = sum(catalog.total(c, sscope) for c, _, _ in catalogmod.CATALOG_CATEGORIES)
+        data = inj._base_item(
+            guid=guid, type="MediaDB", title="📡" + (src.get("name") or sscope),
+            can_play=1, number_of_episodes=n, local_number_of_episodes=n,
+            ancestor_guid="", ancestor_name="", ancestor_category="",
+            poster="", logic_type=0)
+        data["play_item_guid"] = ""
+        data["play_error"] = ""
+        return JSONResponse({"code": 0, "msg": "", "data": data})
     # 海量库根节点
     if guid in CATALOG_GUID_CAT:
         ccat = CATALOG_GUID_CAT[guid]
@@ -922,6 +1049,7 @@ async def item_detail(guid: str, request: Request):
         meta = chart_cache.get_guid(guid) or {}
         if bound is not None:
             data = inj.detail_item(bound)
+            _apply_marks(data)
             # 用榜单的优质海报/评分/简介覆盖资源站元数据
             if meta.get("cover"):
                 for k in ("backdrops", "posters"):
@@ -948,6 +1076,7 @@ async def item_detail(guid: str, request: Request):
         data["vote_average"] = str(meta.get("rating") or "0")
         data["release_date"] = meta.get("year") or ""
         data["air_date"] = meta.get("year") or ""
+        _apply_marks(data)
         return JSONResponse({"code": 0, "msg": "", "data": data})
     # 伪造的 Season / Episode 节点
     if store.get_episode(guid):
@@ -958,6 +1087,7 @@ async def item_detail(guid: str, request: Request):
             tv_title=ep["title"], season_number=1, episode_number=ep["index"] + 1,
             number_of_seasons=1, can_play=1,
             media_guid=ep_media_guid(guid), video_guid=ep_video_guid(guid))
+        _apply_marks(data)
         return JSONResponse({"code": 0, "msg": "", "data": data})
     from store import season_guid as _sg
     # 反查 season guid
@@ -978,7 +1108,9 @@ async def item_detail(guid: str, request: Request):
     brief = store.get_title_by_guid(guid)
     if not brief:
         return await forward_upstream(request)
-    return JSONResponse({"code": 0, "msg": "", "data": inj.detail_item(brief)})
+    data = inj.detail_item(brief)
+    _apply_marks(data)
+    return JSONResponse({"code": 0, "msg": "", "data": data})
 
 
 @app.get("/v/api/v1/season/list/{guid}")
@@ -1034,6 +1166,191 @@ async def stream_list(guid: str, request: Request):
         sl["qualities"] = quals
         sl["cloud_storage_info"] = None
     return JSONResponse({"code": 0, "msg": "", "data": sl})
+
+
+# ------------------------------------------------------- 收藏 / 已看（本地接管）
+
+def _online_card_meta(guid: str) -> dict | None:
+    """把一个在线 guid 解析成可用于收藏夹展示的元信息（不做网络请求）。"""
+    brief = store.get_title_by_guid(guid)
+    if brief:
+        return {
+            "title": inj._f(brief, "title"),
+            "type": inj.fnos_type(brief),
+            "poster": inj._f(brief, "poster"),
+            "year": inj._f(brief, "year"),
+            "remarks": inj._f(brief, "remarks"),
+        }
+    ep = store.get_episode(guid)
+    if ep:
+        return {"title": ep.get("ep_title") or "episode", "type": "Episode",
+                "poster": "", "year": ""}
+    meta = chart_cache.get_guid(guid) or {}
+    if meta:
+        return {"title": meta.get("title", ""),
+                "type": "Movie" if meta.get("cat") == "movie" else "TV",
+                "poster": meta.get("cover", ""), "year": meta.get("year", ""),
+                "remarks": ""}
+    return None
+
+
+def _is_online_item_guid(guid: str) -> bool:
+    if not guid:
+        return False
+    if (guid in CATALOG_GUID_CAT or guid in CHART_GUID_CAT or is_hot_guid(guid)
+            or standalone_source_of(guid) is not None):
+        return False  # 媒体库根节点不可收藏
+    if store.get_title_by_guid(guid) or store.get_episode(guid):
+        return True
+    if chart_cache.is_chart_guid(guid):
+        return True
+    return False
+
+
+def _apply_marks(row: dict) -> dict:
+    g = row.get("guid", "")
+    if marks.is_favorite(g):
+        row["is_favorite"] = 1
+    if marks.is_watched(g):
+        row["watched"] = 1
+        row["is_watched"] = 1
+        ts = marks.watched_ts(g)
+        if ts:
+            row["watched_ts"] = int(ts)
+    return row
+
+
+def _mark_extra(guid: str) -> dict:
+    meta = _online_card_meta(guid) or {}
+    return {
+        "title": meta.get("title", ""), "type": meta.get("type", ""),
+        "poster": meta.get("poster", ""), "year": meta.get("year", ""),
+        "remarks": meta.get("remarks", ""),
+    }
+
+
+@app.put("/v/api/v1/item/favorite")
+async def item_favorite_add(request: Request):
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except Exception:
+        body = {}
+    guid = (body.get("guid") or body.get("item_guid") or "").strip()
+    if not _is_online_item_guid(guid):
+        return await forward_upstream(request)
+    marks.add_favorite(guid, _mark_extra(guid))
+    return JSONResponse({"code": 0, "msg": "", "data": {"guid": guid}})
+
+
+@app.delete("/v/api/v1/item/favorite")
+async def item_favorite_del(request: Request):
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except Exception:
+        body = {}
+    guid = (body.get("guid") or body.get("item_guid") or "").strip()
+    if not _is_online_item_guid(guid):
+        return await forward_upstream(request)
+    marks.remove_favorite(guid)
+    return JSONResponse({"code": 0, "msg": "", "data": {"guid": guid}})
+
+
+@app.post("/v/api/v1/item/watched")
+async def item_watched_set(request: Request):
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except Exception:
+        body = {}
+    guid = (body.get("guid") or body.get("item_guid") or "").strip()
+    # 允许显式取消（watched=0/is_watched=0）
+    want = body.get("watched", body.get("is_watched", 1))
+    try:
+        want = int(want)
+    except (TypeError, ValueError):
+        want = 1
+    if not _is_online_item_guid(guid):
+        return await forward_upstream(request)
+    if want == 0:
+        marks.remove_watched(guid)
+    else:
+        marks.set_watched(guid, _mark_extra(guid))
+    return JSONResponse({"code": 0, "msg": "", "data": {"guid": guid}})
+
+
+@app.delete("/v/api/v1/item/watched")
+async def item_watched_del(request: Request):
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except Exception:
+        body = {}
+    guid = (body.get("guid") or body.get("item_guid") or "").strip()
+    if not _is_online_item_guid(guid):
+        return await forward_upstream(request)
+    marks.remove_watched(guid)
+    return JSONResponse({"code": 0, "msg": "", "data": {"guid": guid}})
+
+
+def _favorite_card(rec: dict) -> dict | None:
+    guid = rec.get("guid", "")
+    brief = store.get_title_by_guid(guid)
+    if brief:
+        row = inj.search_item(brief)
+        row["title"] = inj._f(brief, "title") + (
+            f" ·{inj._f(brief, 'remarks')}" if inj._f(brief, "remarks") else "")
+    elif chart_cache.is_chart_guid(guid):
+        meta = chart_cache.get_guid(guid) or {}
+        if not meta:
+            return None
+        row = chart_card(meta)
+    else:
+        return None  # 剧集子节点 / 已失效条目暂不在收藏夹展示
+    _apply_marks(row)
+    return row
+
+
+@app.post("/v/api/v1/favorite/list")
+async def favorite_list(request: Request):
+    """收藏夹：合并官方本地收藏与本插件在线收藏，统一分页。"""
+    try:
+        body = json.loads(await request.body() or b"{}")
+    except Exception:
+        body = {}
+    local = await forward_upstream(request)
+    try:
+        ldata = json.loads(local.body)
+    except Exception:
+        return local
+    if not isinstance(ldata, dict):
+        return local
+    ldata.setdefault("data", {})
+    if not isinstance(ldata["data"], dict):
+        return local
+
+    ftype = str(body.get("type") or "all")
+    cards: list[dict] = []
+    for rec in marks.favorite_records():
+        row = _favorite_card(rec)
+        if not row:
+            continue
+        if ftype in ("movie", "tv", "video", "other", "live"):
+            t = (row.get("type") or "").lower()
+            ok = (ftype == "movie" and t == "movie") or \
+                 (ftype == "tv" and t in ("tv", "mix")) or \
+                 (ftype in ("video", "other") and t not in ("movie", "tv", "mix"))
+            if not ok:
+                continue
+        cards.append(row)
+
+    official = (ldata["data"].get("list") or [])
+    merged = cards + list(official)
+    page = max(1, int(body.get("page") or 1))
+    page_size = max(1, int(body.get("page_size") or len(merged) or 50))
+    start = (page - 1) * page_size
+    ldata["data"]["total"] = len(merged)
+    ldata["data"]["list"] = merged[start:start + page_size]
+    ldata["code"] = 0
+    ldata["msg"] = ""
+    return JSONResponse(ldata)
 
 
 @app.post("/v/api/v1/play/info")
@@ -1726,15 +2043,25 @@ async def ext_set_config(request: Request):
     if "hot_refresh_interval" in patch:
         patch["hot_refresh_interval"] = max(1 * 3600, min(24 * 3600,
                                                           int(patch["hot_refresh_interval"])))
+    sources_changed = False
     if "sources" in body and isinstance(body["sources"], list):
         cur = {s["id"]: s for s in config.all_sources()}
         for ch in body["sources"]:
             sid = ch.get("id")
-            if sid in cur and isinstance(ch.get("enabled"), bool):
-                cur[sid]["enabled"] = ch["enabled"]
+            if sid in cur:
+                if isinstance(ch.get("enabled"), bool) and \
+                        cur[sid].get("enabled") != ch["enabled"]:
+                    cur[sid]["enabled"] = ch["enabled"]
+                    sources_changed = True
+                if isinstance(ch.get("standalone"), bool) and \
+                        bool(cur[sid].get("standalone")) != ch["standalone"]:
+                    cur[sid]["standalone"] = ch["standalone"]
+                    sources_changed = True
         patch["sources"] = list(cur.values())
     config.save(patch)
     _search_cache.clear()
+    if sources_changed:
+        _schedule_routes_refresh()
     return {"code": 0, "msg": "saved"}
 
 
@@ -1749,15 +2076,38 @@ async def ext_junk_keywords(request: Request):
     return {"code": 0, "msg": "saved", "data": {"junk_keywords": kws}}
 
 
+def _schedule_routes_refresh():
+    try:
+        if not catalog._refreshing:
+            asyncio.create_task(catalog.refresh_routes(config.enabled_sources()))
+    except Exception:
+        pass
+
+
 @app.post("/v/api/ext/source/add")
 async def ext_source_add(request: Request):
     body = await request.json()
     ok, info = config.add_source(body.get("name", ""), body.get("api", ""),
-                                 bool(body.get("enabled", True)))
+                                 bool(body.get("enabled", True)),
+                                 bool(body.get("standalone", False)))
     if not ok:
         return JSONResponse({"code": 400, "msg": info}, status_code=400)
     _search_cache.clear()
+    if body.get("standalone"):
+        _schedule_routes_refresh()
     return {"code": 0, "msg": "added", "data": {"id": info}}
+
+
+@app.post("/v/api/ext/source/standalone")
+async def ext_source_standalone(request: Request):
+    body = await request.json()
+    sid = body.get("id", "")
+    on = bool(body.get("standalone"))
+    ok, info = config.set_standalone(sid, on)
+    if not ok:
+        return JSONResponse({"code": 404, "msg": info}, status_code=404)
+    _schedule_routes_refresh()
+    return {"code": 0, "msg": "ok"}
 
 
 @app.post("/v/api/ext/source/delete")
@@ -1767,6 +2117,7 @@ async def ext_source_delete(request: Request):
     if not ok:
         return JSONResponse({"code": 404, "msg": info}, status_code=404)
     _search_cache.clear()
+    _schedule_routes_refresh()
     return {"code": 0, "msg": "deleted"}
 
 
@@ -1804,6 +2155,96 @@ async def ext_source_test_all(request: Request):
                                    return_exceptions=True)
     out = [r for r in results if isinstance(r, dict)]
     return {"code": 0, "msg": "", "data": out}
+
+
+@app.post("/v/api/ext/source/import-tvbox")
+async def ext_import_tvbox(request: Request):
+    """导入 TVBox/影视仓/OK影视配置中的标准苹果CMS JSON/XML 源。
+
+    入参：{url?} 或 {text?}，外加 standalone（可选）。对候选源做轻量探测，
+    通过者加入自定义源；爬虫 jar / 网盘 / 直播源跳过。
+    """
+    import tvbox as tvboxmod
+    body = await request.json()
+    standalone = bool(body.get("standalone"))
+    try:
+        if body.get("url"):
+            sites, _subs = await tvboxmod.load_remote(str(body["url"]).strip())
+        elif body.get("text"):
+            cfg = tvboxmod.parse_config_text(str(body["text"]))
+            if not cfg:
+                return JSONResponse({"code": 400, "msg": "无法解析配置（需为 JSON 或其 base64）"},
+                                    status_code=400)
+            sites = tvboxmod.extract_sites(cfg)
+        else:
+            return JSONResponse({"code": 400, "msg": "缺少 url 或 text"}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"code": 502, "msg": f"获取配置失败：{type(exc).__name__}"},
+                            status_code=502)
+
+    candidates: list[dict] = []
+    seen_api: set[str] = set()
+    skipped: list[str] = []
+    for s in sites:
+        status, norm = tvboxmod.classify_site(s)
+        if not norm:
+            nm = str(s.get("name") or s.get("key") or s.get("api") or "未命名")
+            if nm not in skipped:
+                skipped.append(nm[:20])
+            continue
+        key = norm["api"].rstrip("/").lower()
+        if key in seen_api:
+            continue
+        seen_api.add(key)
+        candidates.append(norm)
+
+    existing = {s.get("api", "").rstrip("/").lower() for s in config.all_sources()}
+    added_names, dup = [], 0
+    # 并发探测，最多导入 40 个可用源，避免一次性拉爆
+    sem = asyncio.Semaphore(8)
+
+    async def check(c):
+        async with sem:
+            try:
+                probe = await asyncio.wait_for(
+                    providers.probe_source(c["api"], timeout=8.0), timeout=10)
+            except Exception:
+                probe = {"ok": False}
+            return c, probe
+
+    checked = await asyncio.gather(*[check(c) for c in candidates[:60]])
+    for c, probe in checked:
+        key = c["api"].rstrip("/").lower()
+        if key in existing:
+            dup += 1
+            continue
+        if not probe.get("ok"):
+            skipped.append(c["name"][:20])
+            continue
+        ok, info = config.add_source(c["name"], c["api"], True, standalone)
+        if ok:
+            added_names.append(c["name"])
+            existing.add(key)
+        else:
+            dup += 1
+        if len(added_names) >= 40:
+            break
+    if added_names:
+        _search_cache.clear()
+        if standalone:
+            _schedule_routes_refresh()
+        else:
+            # 新源加入后也刷新一次聚合路由，便于海量库覆盖
+            _schedule_routes_refresh()
+    return {"code": 0, "msg": "", "data": {
+        "scanned": len(sites),
+        "candidates": len(candidates),
+        "added": len(added_names),
+        "added_names": added_names,
+        "duplicate": dup,
+        "skipped": len(skipped),
+        "skipped_detail": skipped[:40],
+    }}
 
 
 @app.get("/v/online-admin")
