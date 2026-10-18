@@ -1161,6 +1161,31 @@ async def stream_post(request: Request):
         "qualities": quals, "cloud_storage_info": None}})
 
 
+@app.get("/v/api/v1/media/range/{mg}")
+async def media_range(mg: str, request: Request):
+    """App（Flutter 原生播放器）不走 /play/play，而是直接 GET /media/range/<mg>。
+
+    官方后端对我们的虚拟 mg 无本地文件记录，会返回 403（App 提示“文件权限不足”）。
+    这里识别在线 mg：按实际源类型把它引导到既有的 HLS 或直链代理（302），
+    非在线 mg 原样透传官方。
+    """
+    target = store.resolve_media_guid(mg)
+    if not target:
+        return await forward_upstream(request)
+    try:
+        await _resolve_if_needed(target, request)
+    except Exception as exc:
+        return Response(f"resolve fail {type(exc).__name__}", status_code=502)
+    src_url = target.get("url", "")
+    q = urllib.parse.urlencode({"line": target["line"], "index": target["index"]})
+    if re.search(r"\.m3u8(\?|$)", src_url, re.I):
+        # HLS：交给 m3u8 代理（重写分片/密钥为同源地址）
+        return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/preset.m3u8?{q}",
+                                status_code=302)
+    # mp4 / 直链：direct 代理本身支持 Range 与 seek
+    return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/direct?{q}", status_code=302)
+
+
 @app.post("/v/api/v1/play/play")
 async def play_play(request: Request):
     import json
