@@ -1211,7 +1211,7 @@ async def stream_list(guid: str, request: Request):
             if egs:
                 target = store.get_episode_target(egs[0])
         else:
-            target = store.resolve_media_guid(store.media_guid(guid))
+            target = store.resolve_media_guid(media_guid(guid))
     quals = _qualities(target) if target else []
     if quals:
         sl["video_streams"][0]["resolution_type"] = quals[0]["resolution"]
