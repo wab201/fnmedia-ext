@@ -34,6 +34,8 @@ import config as cfgmod
 from config import config
 import hot as hotmod
 from hot import hot_cache
+import charts as chartmod
+from charts import chart_cache
 import history as histmod
 from history import history
 from store import (store, make_guid, media_guid, video_guid, is_online_guid,
@@ -62,6 +64,125 @@ HOT_GUID_CAT = {g: c for c, g in HOT_LIB_GUIDS.items()}
 # 兼容历史单库 guid：旧链接/旧缓存仍可打开，映射到剧集库。
 HOT_LEGACY_GUID = "a110c1a0b1a04000900010000000f001"
 HOT_DEFAULT_TITLE = "🌐在线热门"
+
+# 真实榜单虚拟媒体库（方案 B：豆瓣周榜/推荐做展示，点击时按需搜源解析播放）。
+CHART_LIB_GUIDS: dict[str, str] = {
+    "movie":   "0b10d767319eb8cab9d99373ede48d0a",
+    "tv":      "9e75c8f2616bd01851911eea649db367",
+    "anime":   "18372cada44b72c305343c2bfcc026f0",
+    "variety": "cb606d5f699560c630c97f7acc84f75b",
+}
+CHART_GUID_CAT = {g: c for c, g in CHART_LIB_GUIDS.items()}
+# chart guid -> 已解析（挂载到 store）的可播放 brief
+_chart_resolved: dict[str, dict] = {}
+_chart_resolving: dict[str, asyncio.Future] = {}
+
+
+def charts_enabled() -> bool:
+    return bool(config.get().get("hot_library_enabled", True))
+
+
+def chart_card(item: dict) -> dict:
+    """榜单条目 → 媒体库卡片（不解析播放；点击详情时才搜源）。"""
+    cat = item["cat"]
+    typ = "Movie" if cat == "movie" else "TV"
+    year = item.get("year") or ""
+    rating = item.get("rating") or 0
+    tags = item.get("tags") or []
+    overview = item.get("desc") or ("、".join(tags) if tags else "")
+    title = item["title"]
+    return {
+        "guid": item["guid"],
+        "lan": "zh-CN",
+        "imdb_id": "",
+        "trim_id": "",
+        "tv_title": "",
+        "parent_guid": "",
+        "parent_title": "",
+        "title": title,
+        "type": typ,
+        "genres": tags[:3],
+        "poster": inj._poster(item.get("cover")),
+        "poster_width": 0,
+        "poster_height": 0,
+        "is_favorite": 0,
+        "watched": 0,
+        "watched_ts": 0,
+        "vote_average": str(rating) if rating else "0",
+        "media_stream": {"resolutions": None, "audio_type": None, "color_range_type": None},
+        "release_date": year,
+        "season_number": 0,
+        "episode_number": 0,
+        "air_date": year,
+        "number_of_seasons": 1 if typ == "TV" else 0,
+        "number_of_episodes": 0,
+        "local_number_of_seasons": 0,
+        "local_number_of_episodes": 0,
+        # 未解析前乐观标记可播，保证卡片有播放入口；解析失败时详情页会提示暂无片源
+        "can_play": 1,
+        "status": "豆瓣热榜",
+        "overview": overview[:500],
+        "ancestor_guid": CHART_LIB_GUIDS[cat],
+        "ancestor_name": chartmod.chart_cat_title(cat),
+        "ancestor_category": chartmod.chart_cat_mdb(cat),
+        "ts": 0,
+        "duration": 0,
+        "single_child_guid": "",
+        "file_name": "",
+    }
+
+
+async def resolve_chart(guid: str) -> dict | None:
+    """用榜单片名去 CMS 聚合搜索，把最匹配的可播放 brief 挂到该 chart guid。
+
+    单 flight；命中后在内存和 store 都登记，之后整条 season/episode/play 链复用。
+    """
+    existing = store.get_title_by_guid(guid)
+    if existing:
+        return existing
+    fut = _chart_resolving.get(guid)
+    if fut is None:
+        fut = asyncio.get_event_loop().create_future()
+        _chart_resolving[guid] = fut
+
+        async def work():
+            try:
+                item = chart_cache.get_guid(guid)
+                if not item:
+                    fut.set_result(None)
+                    return
+                briefs = await asyncio.wait_for(
+                    _aggregate_briefs(item["title"], 12), timeout=25)
+                # 相关性：归一化片名必须包含完整榜单片名（分词全部命中），否则视为无源
+                want = _norm_title(item["title"])
+                want_tokens = [_norm_title(t) for t in re.split(r"[\s]+", item["title"]) if _norm_title(t)]
+                best = None
+                for b in briefs:
+                    n = _norm_title(b.get("title", ""))
+                    if n and (want in n or (len(want_tokens) > 1
+                                            and all(tok in n for tok in want_tokens))):
+                        best = b
+                        break
+                if best is None and briefs:
+                    # 宽松兜底：取线路最多者（片名归一后高度重叠）
+                    best = briefs[0]
+                if best is not None:
+                    # 关键：把可播放 brief 的身份换成 chart guid，使播放链挂到榜单卡片
+                    bound = dict(best)
+                    bound["guid"] = guid
+                    bound["chart"] = {"title": item["title"], "cat": item["cat"],
+                                      "cover": item.get("cover", ""),
+                                      "rating": item.get("rating", 0)}
+                    _chart_resolved[guid] = bound
+                    store.remember_merged([bound])
+                fut.set_result(best)
+            except Exception:
+                fut.set_result(None)
+            finally:
+                _chart_resolving.pop(guid, None)
+
+        asyncio.create_task(work())
+    return await fut
 
 
 def hot_cat_title(cat: str) -> str:
@@ -113,18 +234,19 @@ async def lifespan(app: FastAPI):
 
 
 async def _hot_worker(app: FastAPI):
-    """热门库后台刷新：启动先读旧缓存，稍等启动流程，再按需刷新；之后按配置轮询。"""
-    await asyncio.sleep(5)
+    """榜单后台刷新：启动先读旧缓存，稍等启动流程，再按需刷新；之后按配置轮询。"""
+    await asyncio.sleep(4)
     while not app.state.stop_hot.is_set():
         cfg = config.get()
         interval = max(1800, int(cfg.get("hot_refresh_interval", 6 * 3600)))
-        if cfg.get("hot_library_enabled", True) and hot_cache.stale(interval):
+        if cfg.get("hot_library_enabled", True) and chart_cache.stale(interval):
             try:
-                await asyncio.wait_for(hot_cache.refresh(store), timeout=hotmod.REFRESH_TIMEOUT)
+                await asyncio.wait_for(chart_cache.refresh(force=True),
+                                       timeout=chartmod.REFRESH_TIMEOUT)
             except asyncio.TimeoutError:
-                _log.warning("hot refresh timed out; keeping previous cache")
+                _log.warning("chart refresh timed out; keeping previous cache")
             except Exception as exc:
-                _log.warning("hot refresh failed, keeping previous cache: %s", exc)
+                _log.warning("chart refresh failed, keeping previous cache: %s", exc)
         try:
             await asyncio.wait_for(app.state.stop_hot.wait(), timeout=300)
         except asyncio.TimeoutError:
@@ -182,6 +304,51 @@ async def forward_upstream(request: Request) -> Response:
 
 # ------------------------------------------------------------- 在线搜索
 
+async def _aggregate_briefs(keyword: str, maxn: int | None = None) -> list[dict]:
+    """聚合搜索所有启用源 → 跨源合并 → 去噪/去无直链 → brief 列表（已入库）。"""
+    sources = config.enabled_sources()
+    titles = await providers.search_all(keyword, sources)
+    if maxn is None:
+        maxn = int(config.get().get("max_per_keyword", 12))
+    # 跨源同名合并：同 规范化片名+年份 聚成一个条目，每个来源各成一条
+    # 播放线路（供播放器「切换线路」）；过滤解说/预告/无直链。
+    groups: dict[tuple, dict] = {}
+    for t in titles:
+        if config.is_junk(t.title, t.remarks):
+            continue
+        playable = [e for line in t.sources.values() for e in line
+                    if e.direct or e.resolve]
+        if not playable:
+            continue
+        key = (_norm_title(t.title), t.year)
+        g = groups.get(key)
+        if g is None:
+            g = {"rep": t, "lines": {}}
+            groups[key] = g
+        for lname, eps in t.sources.items():
+            play = [e for e in eps if e.direct or e.resolve]
+            if not play:
+                continue
+            lkey = f"{t.provider}::{lname}"
+            # 同 key 保留直链更多（更优）者；否则集数更多者
+            cur = g["lines"].get(lkey)
+            nd_new = sum(1 for e in play if e.direct)
+            nd_cur = sum(1 for e in (cur or []) if e.get("direct"))
+            if cur is None or nd_new > nd_cur or \
+                    (nd_new == nd_cur and len(play) > len(cur)):
+                g["lines"][lkey] = [e.__dict__ for e in play]
+    # 排序：按可播直链总数（跨线路）降序
+    ordered = sorted(groups.values(),
+                     key=lambda g: sum(len(v) for v in g["lines"].values()),
+                     reverse=True)[:maxn]
+    briefs = []
+    for g in ordered:
+        brief = inj.brief_of(g["rep"])
+        brief["lines"] = g["lines"]
+        briefs.append(brief)
+    return store.remember_merged(briefs)
+
+
 async def online_search(keyword: str, client: httpx.AsyncClient) -> list:
     now = time.time()
     if keyword in _search_cache and now - _search_cache[keyword][0] < CACHE_TTL:
@@ -193,54 +360,11 @@ async def online_search(keyword: str, client: httpx.AsyncClient) -> list:
 
         async def work():
             try:
-                sources = config.enabled_sources()
-                titles = await providers.search_all(keyword, sources)
-                maxn = int(config.get().get("max_per_keyword", 12))
-                src_name = {s["id"]: s.get("name", s["id"])
-                            for s in config.all_sources()}
-                # 跨源同名合并：同 规范化片名+年份 聚成一个条目，每个来源各成一条
-                # 播放线路（供播放器「切换线路」）；过滤解说/预告/无直链。
-                groups: dict[tuple, dict] = {}
-                for t in titles:
-                    if config.is_junk(t.title, t.remarks):
-                        continue
-                    playable = [e for line in t.sources.values() for e in line
-                                if e.direct or e.resolve]
-                    if not playable:
-                        continue
-                    key = (_norm_title(t.title), t.year)
-                    g = groups.get(key)
-                    if g is None:
-                        g = {"rep": t, "members": [], "lines": {}}
-                        groups[key] = g
-                    g["members"].append(t)
-                    for lname, eps in t.sources.items():
-                        play = [e for e in eps if e.direct or e.resolve]
-                        if not play:
-                            continue
-                        lkey = f"{t.provider}::{lname}"
-                        # 同 key 保留直链更多（更优）者；否则集数更多者
-                        cur = g["lines"].get(lkey)
-                        nd_new = sum(1 for e in play if e.direct)
-                        nd_cur = sum(1 for e in (cur or []) if e.get("direct"))
-                        if cur is None or nd_new > nd_cur or \
-                                (nd_new == nd_cur and len(play) > len(cur)):
-                            g["lines"][lkey] = [e.__dict__ for e in play]
-                # 排序：按可播直链总数（跨线路）降序
-                ordered = sorted(groups.values(),
-                                 key=lambda g: sum(len(v) for v in g["lines"].values()),
-                                 reverse=True)[:maxn]
-                briefs = []
-                for g in ordered:
-                    rep = g["rep"]
-                    brief = inj.brief_of(rep)
-                    brief["lines"] = g["lines"]
-                    briefs.append(brief)
-                briefs = store.remember_merged(briefs)
+                briefs = await _aggregate_briefs(keyword)
                 items = [inj.search_item(b) for b in briefs]
                 _search_cache[keyword] = (time.time(), items)
                 fut.set_result(items)
-            except Exception as exc:
+            except Exception:
                 fut.set_result([])
             finally:
                 _search_inflight.pop(keyword, None)
@@ -363,6 +487,50 @@ def _hot_rows_all(body: dict, cat: str) -> list[dict]:
     return rows
 
 
+def _chart_rows_all(body: dict, cat: str) -> list[dict]:
+    items = chart_cache.items(cat)
+    parent = (body.get("parent_guid") or "").strip()
+    if parent:
+        return []
+    rows = [chart_card(it) for it in items]
+    tags = body.get("tags")
+    if isinstance(tags, dict):
+        wanted = set(tags.get("type") or [])
+        media_wanted = wanted & {"Movie", "TV", "Movie,TV"}
+        if "Movie,TV" in media_wanted:
+            media_wanted.discard("Movie,TV")
+            media_wanted.update({"Movie", "TV"})
+        if media_wanted:
+            rows = [r for r in rows if r.get("type") in media_wanted]
+    elif isinstance(tags, list):
+        wanted = set(tags) & {"Movie", "TV"}
+        if wanted:
+            rows = [r for r in rows if r.get("type") in wanted]
+    if int(body.get("is_favorite") or 0):
+        return []
+    kw = str(body.get("keyword") or body.get("q") or body.get("title") or "").strip().lower()
+    if kw:
+        rows = [r for r in rows if kw in (r.get("title") or "").lower()]
+
+    col = body.get("sort_column", "create_time")
+    order = str(body.get("sort_type", "DESC")).upper()
+    reverse = order.lower() != "asc"
+    # 榜单原始顺序即热度顺序（周榜 rank 在前）。评分/年份/片名排序时保留榜单次序作次级键。
+    indexed = list(enumerate(rows))
+    if col == "sort_title":
+        indexed.sort(key=lambda kv: (kv[1].get("title") or ""), reverse=reverse)
+    elif col in ("release_date", "air_date", "year"):
+        indexed.sort(key=lambda kv: (kv[1].get("release_date") or ""), reverse=reverse)
+    elif col in ("vote_average", "score"):
+        def sc(r):
+            try:
+                return float(r.get("vote_average") or 0)
+            except ValueError:
+                return 0
+        indexed.sort(key=lambda kv: sc(kv[1]), reverse=True)
+    return [r for _, r in indexed]
+
+
 def _page_args(body: dict, total: int) -> tuple[int, int, int]:
     page_size = max(1, min(int(body.get("page_size") or 22), 100))
     page = int(body.get("page") or body.get("p") or body.get("page_index")
@@ -391,30 +559,26 @@ async def mediadb_list(request: Request):
     if payload is None:
         return upstream
     dbs = payload.get("data")
-    hot_guids = set(HOT_LIB_GUIDS.values()) | {HOT_LEGACY_GUID}
-    if not isinstance(dbs, list) or any(d.get("guid") in hot_guids for d in dbs):
+    chart_guids = set(CHART_LIB_GUIDS.values())
+    if not isinstance(dbs, list) or any(d.get("guid") in chart_guids for d in dbs):
         return upstream
     try:
-        # 每个分类注入一个虚拟媒体库，按电影/剧集/动漫/综艺排序置于最前。
-        cat_posters: dict[str, list[str]] = {}
-        for cat, _t, _c in HOT_CATEGORIES:
+        # 注入 4 个真实榜单虚拟媒体库（电影/剧集/动漫/综艺），置于最前。
+        inserts = []
+        for cat, _t, _c in chartmod.CHART_CATEGORIES:
             ps = []
-            for b in _hot_cat_items(cat):
-                p = inj._poster(b.get("poster") or "")
+            for it in chart_cache.items(cat):
+                p = inj._poster(it.get("cover") or "")
                 if p:
                     ps.append(p)
                 if len(ps) >= 8:
                     break
-            cat_posters[cat] = ps
-        inserts = []
-        for cat, _t, _c in HOT_CATEGORIES:
-            ps = cat_posters[cat]
             inserts.append({
-                "guid": HOT_LIB_GUIDS[cat],
-                "title": hot_cat_title(cat),
+                "guid": CHART_LIB_GUIDS[cat],
+                "title": chartmod.chart_cat_title(cat),
                 "poster": ps[0] if ps else "",
                 "posters": ps,
-                "category": hot_cat_category(cat),
+                "category": chartmod.chart_cat_mdb(cat),
                 "view_type": 0,
                 "poster_type": 0,
                 "refresh_disabled": True,
@@ -422,7 +586,7 @@ async def mediadb_list(request: Request):
         dbs[0:0] = inserts
         return JSONResponse(payload)
     except Exception as exc:
-        _log.warning("inject hot mediadb failed: %s", exc)
+        _log.warning("inject chart mediadb failed: %s", exc)
         return upstream
 
 
@@ -435,10 +599,10 @@ async def mediadb_sum(request: Request):
     if not payload or not isinstance(payload.get("data"), dict):
         return upstream
     total_added = 0
-    for cat, _t, _c in HOT_CATEGORIES:
-        n = len(_hot_cat_items(cat))
+    for cat, _t, _c in chartmod.CHART_CATEGORIES:
+        n = len(chart_cache.items(cat))
         if n:
-            payload["data"][HOT_LIB_GUIDS[cat]] = n
+            payload["data"][CHART_LIB_GUIDS[cat]] = n
             total_added += n
     if total_added:
         payload["data"]["total"] = int(payload["data"].get("total", 0)) + total_added
@@ -453,27 +617,28 @@ async def item_list(request: Request):
     except Exception:
         body = {}
     aguid = body.get("ancestor_guid")
-    cat = HOT_GUID_CAT.get(aguid)
-    # 兼容历史单库 guid：作为剧集库打开
-    if aguid == HOT_LEGACY_GUID:
-        cat = "tv"
+    cat = CHART_GUID_CAT.get(aguid)
+    if cat is None:
+        # 兼容旧的“最近更新”热门库 guid（单库/剧集库）→ 榜单剧集库
+        cat = "tv" if aguid in (HOT_LEGACY_GUID, HOT_LIB_GUIDS.get("tv")) else \
+            HOT_GUID_CAT.get(aguid)
     if cat is None:
         return await forward_upstream(request)
-    mdb_name = hot_cat_title(cat)
-    mdb_cat = hot_cat_category(cat)
-    if not config.get().get("hot_library_enabled", True):
+    mdb_name = chartmod.chart_cat_title(cat)
+    mdb_cat = chartmod.chart_cat_mdb(cat)
+    if not charts_enabled():
         return JSONResponse({"code": 0, "msg": "", "data": {
             "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
             "dir": "", "total": 0, "list": [], "jump_list": None,
         }})
-    # 即使缓存还在第一次刷新，也立即返回（不实时串联各资源站拖慢 UI）。
-    # 若缓存已较旧，顺手在后台触发一次刷新（stale-while-revalidate），不阻塞本次响应。
+    # 榜单只读、秒开；缓存过期时后台补刷（stale-while-revalidate），不阻塞本次响应。
     interval = max(1800, int(config.get().get("hot_refresh_interval", 6 * 3600)))
     try:
-        hot_cache.maybe_refresh_in_background(store, min_age=min(interval, 1800))
+        if chart_cache.stale(interval) and not chart_cache._refreshing:
+            asyncio.create_task(chart_cache.refresh(force=True))
     except Exception:
         pass
-    all_rows = _hot_rows_all(body, cat)
+    all_rows = _chart_rows_all(body, cat)
     page_size, start, end = _page_args(body, len(all_rows))
     return JSONResponse({"code": 0, "msg": "", "data": {
         "mdb_name": mdb_name,
@@ -522,18 +687,52 @@ async def search_list(request: Request):
 
 @app.get("/v/api/v1/item/{guid}")
 async def item_detail(guid: str, request: Request):
-    # 在线热门虚拟媒体库根节点（进入媒体库时前端会请求 item/<库guid>）。
+    # 榜单虚拟媒体库根节点（进入媒体库时前端会请求 item/<库guid>）。
     # 必须在透传前拦截，否则官方后端返回 -6，页面提示「此媒体库不存在」。
-    if is_hot_guid(guid):
-        cat = HOT_GUID_CAT.get(guid) or ("tv" if guid == HOT_LEGACY_GUID else "movie")
-        n = len(_hot_cat_items(cat))
+    if guid in CHART_GUID_CAT or is_hot_guid(guid):
+        cat = CHART_GUID_CAT.get(guid) or \
+            HOT_GUID_CAT.get(guid) or ("tv" if guid == HOT_LEGACY_GUID else "movie")
+        n = len(chart_cache.items(cat))
         data = inj._base_item(
-            guid=guid, type="MediaDB", title=hot_cat_title(cat),
+            guid=guid, type="MediaDB", title=chartmod.chart_cat_title(cat),
             can_play=1, number_of_episodes=n, local_number_of_episodes=n,
             ancestor_guid="", ancestor_name="", ancestor_category="",
             poster="", logic_type=0)
         data["play_item_guid"] = ""
         data["play_error"] = ""
+        return JSONResponse({"code": 0, "msg": "", "data": data})
+    # 榜单条目：按需用片名搜源解析；成功后复用标准详情，失败返回“暂无片源”。
+    if chart_cache.is_chart_guid(guid):
+        bound = await resolve_chart(guid)
+        meta = chart_cache.get_guid(guid) or {}
+        if bound is not None:
+            data = inj.detail_item(bound)
+            # 用榜单的优质海报/评分/简介覆盖资源站元数据
+            if meta.get("cover"):
+                for k in ("backdrops", "posters"):
+                    if data.get(k):
+                        data[k] = inj._poster(meta["cover"])
+            if meta.get("rating"):
+                data["vote_average"] = str(meta["rating"])
+            if meta.get("desc") and not data.get("overview"):
+                data["overview"] = meta["desc"]
+            return JSONResponse({"code": 0, "msg": "", "data": data})
+        # 未命中片源：仍返回详情骨架，但禁用播放并给出提示
+        cat = meta.get("cat", "tv")
+        data = inj._base_item(
+            guid=guid,
+            type="Movie" if cat == "movie" else "TV",
+            title=meta.get("title", ""), can_play=0,
+            ancestor_guid=CHART_LIB_GUIDS.get(cat, ""),
+            ancestor_name=chartmod.chart_cat_title(cat),
+            ancestor_category=chartmod.chart_cat_mdb(cat),
+            poster=meta.get("cover", ""), logic_type=0)
+        data["play_error"] = "暂无在线片源"
+        data["overview"] = (meta.get("desc") or
+                            "暂未在内置资源站找到可播片源，可过段时间再试，或用顶部搜索同名资源。")
+        data["vote_average"] = str(meta.get("rating") or "0")
+        data["release_date"] = meta.get("year") or ""
+        data["air_date"] = meta.get("year") or ""
         return JSONResponse({"code": 0, "msg": "", "data": data})
     # 伪造的 Season / Episode 节点
     if store.get_episode(guid):
@@ -1188,8 +1387,14 @@ async def _serve_online_poster(tok_path: str, request: Request) -> Response:
         return _poster_fallback()
     if not u.startswith("http"):
         return _poster_fallback()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    host = urllib.parse.urlsplit(u).netloc.lower()
+    # 豆瓣图床需要带豆瓣 Referer，否则可能 403
+    if host.endswith("doubanio.com") or host.endswith("douban.com") or \
+            host.endswith("doubanio.viki.moe"):
+        headers["Referer"] = "https://movie.douban.com/"
     try:
-        r = await ext_client(request).get(u, headers={"User-Agent": "Mozilla/5.0"})
+        r = await ext_client(request).get(u, headers=headers)
         ctype = (r.headers.get("content-type") or "").lower()
         if r.status_code != 200 or not r.content or not ctype.startswith("image/"):
             return _poster_fallback()
@@ -1227,13 +1432,14 @@ async def ext_status(request: Request):
     return {"ok": True,
             "config": {k: v for k, v in config.get().items() if k != "admin_token"},
             "cached_titles": len(store._titles),
-            "hot": hot_cache.status()}
+            "hot": hot_cache.status(),
+            "charts": chart_cache.status()}
 
 
 @app.post("/v/api/ext/hot/refresh")
 async def ext_hot_refresh(request: Request):
-    data = await hot_cache.refresh(store, force=True)
-    return {"code": 0, "msg": "", "data": hot_cache.status()}
+    data = await chart_cache.refresh(force=True)
+    return {"code": 0, "msg": "", "data": chart_cache.status()}
 
 
 @app.get("/v/api/ext/online")

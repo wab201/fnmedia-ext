@@ -121,28 +121,25 @@ ADMIN_HTML = r"""<!doctype html>
   </div>
 
   <div class="card">
-    <h2>在线热门媒体库 <span class="badge" id="hotState">检测中</span>
+    <h2>热门榜单媒体库 <span class="badge" id="hotState">检测中</span>
       <button class="ghost sm" style="margin-left:auto" onclick="refreshHot()">立即刷新</button>
     </h2>
     <div class="row" style="margin-bottom:12px">
       <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
         <input type="checkbox" id="hotEnabled" style="width:16px;height:16px;accent-color:var(--ac)"/>
-        在飞牛影视媒体库中显示四个在线分类库：
-        <strong style="margin-left:4px">🌐在线电影 · 🌐在线剧集 · 🌐在线动漫 · 🌐在线综艺</strong>
+        在飞牛影视媒体库中显示四个真实榜单库（豆瓣周榜/推荐，点击时按需搜源播放）：
+        <strong style="margin-left:4px">🎬热门电影 · 📺热门剧集 · 🌸动漫新番 · 🎤热门综艺</strong>
       </label>
     </div>
-    <div class="addrow" style="grid-template-columns:1fr 1fr 1fr 1fr">
-      <input type="number" id="hotLimit" min="60" max="800" title="四库合计保留条数上限" placeholder="总条数上限"/>
-      <input type="number" id="hotPerSource" min="20" max="240" title="每个资源站抓取条数" placeholder="每源条数"/>
-      <input type="number" id="hotPages" min="1" max="10" title="每个资源站翻最近更新页数（每页约20条）" placeholder="每源页数"/>
-      <input type="number" id="hotInterval" min="1" max="24" title="自动刷新间隔（小时）" placeholder="刷新小时"/>
+    <div class="addrow" style="grid-template-columns:1fr">
+      <input type="number" id="hotInterval" min="1" max="24" title="榜单自动刷新间隔（小时）" placeholder="榜单刷新小时"/>
     </div>
     <div class="muted" style="margin:6px 0 10px">
-      后台深度爬取各源「最近更新」多页并跨源去重，自动归入电影/剧集/动漫/综艺，数值越大内容越多、刷新越慢。
-      打开媒体库只读缓存（秒开），缓存过期会在后台自动更新，失败保留旧缓存。
+      海报/评分/排名来自豆瓣榜单（经 60s 公开接口），后台每数小时刷新一次、打开媒体库秒读缓存；
+      点进某部片时才用片名实时搜索内置资源站解析播放，找不到片源会提示「暂无片源」。
     </div>
     <div id="hotStatus" class="meta">等待加载状态…</div>
-    <button onclick="saveHotCfg()" style="margin-top:10px">保存热门设置</button>
+    <button onclick="saveHotCfg()" style="margin-top:10px">保存榜单设置</button>
     <span id="hotMsg" class="muted"></span>
   </div>
 
@@ -176,30 +173,29 @@ async function init(){
   $("maxn").value=CFG.max_per_keyword;
   $("junk").checked=CFG.filter_junk;
   $("onlineFirst").checked=CFG.online_first!==false;
-  renderHot(s.hot||{});
+  renderHot(s.charts||{});
   KWS=Array.isArray(CFG.junk_keywords)?CFG.junk_keywords.slice():[];
   renderKw();
   renderSources();
   loadOnline();
 }
 
+function fmtTs(ts){if(!ts)return "尚未刷新";const d=new Date(ts*1000);const p=(n)=>String(n).padStart(2,"0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;}
 function renderHot(h){
   $("hotEnabled").checked=CFG.hot_library_enabled!==false;
-  $("hotLimit").value=CFG.hot_limit||300;
-  $("hotPerSource").value=CFG.hot_per_source||120;
-  $("hotPages").value=CFG.hot_pages_per_source||6;
   $("hotInterval").value=Math.round((CFG.hot_refresh_interval||21600)/3600);
-  const n=h.count||0, ok=h.provider_ok||0, total=h.total_sources||0;
+  const c=h.counts||{};
+  const n=(c.movie||0)+(c.tv||0)+(c.anime||0)+(c.variety||0);
   $("hotState").textContent=n+" 条";
-  $("hotStatus").textContent=(h.refreshing?"正在后台深度刷新…":"最近刷新："+(h.updated_at_text||"尚未刷新"))
-    +` · 成功线路 ${ok}/${total}` + (h.last_error?(" · "+h.last_error):"");
+  $("hotStatus").textContent=(h.refreshing?"正在后台刷新榜单…":"最近刷新："+fmtTs(h.updated_at))
+    +` · 数据源 ${h.provider_ok||0}/${h.provider_total||0}`
+    +` · 电影${c.movie||0}/剧${c.tv||0}/动漫${c.anime||0}/综艺${c.variety||0}`
+    +(h.last_error?(" · "+h.last_error):"");
 }
 async function saveHotCfg(){
   const body={
     hot_library_enabled:$("hotEnabled").checked,
-    hot_limit:Math.max(60,Math.min(800,parseInt($("hotLimit").value)||300)),
-    hot_per_source:Math.max(20,Math.min(240,parseInt($("hotPerSource").value)||120)),
-    hot_pages_per_source:Math.max(1,Math.min(10,parseInt($("hotPages").value)||6)),
     hot_refresh_interval:Math.max(1,Math.min(24,parseInt($("hotInterval").value)||6))*3600
   };
   const r=await jpost("/v/api/ext/config",body);
@@ -207,11 +203,11 @@ async function saveHotCfg(){
   else toast(r.msg||"保存失败",false);
 }
 async function refreshHot(){
-  toast("开始刷新热门缓存…");
+  toast("开始刷新榜单…");
   const r=await jpost("/v/api/ext/hot/refresh",{});
-  const cfg=(await jget("/v/api/ext/status"));
-  CFG=cfg.config; renderHot(cfg.hot||r.data||{});
-  if(r.code===0) toast("热门缓存已刷新"); else toast(r.msg||"刷新失败",false);
+  const st=(await jget("/v/api/ext/status"));
+  CFG=st.config; renderHot(st.charts||r.data||{});
+  if(r.code===0) toast("榜单已刷新"); else toast(r.msg||"刷新失败",false);
 }
 function renderKw(){
   $("kwN").textContent="（共 "+KWS.length+" 个）";
