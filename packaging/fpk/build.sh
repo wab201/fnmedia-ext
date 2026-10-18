@@ -29,7 +29,7 @@ rsync -a --delete \
   --exclude='.venv/' --exclude='__pycache__/' --exclude='*.pyc' \
   --exclude='.git/' --exclude='dist/' --exclude='logs/' \
   --exclude='state/' --exclude='packaging/fpk/.build/' \
-  --exclude='.release/' --exclude='*.fpk' --exclude='.DS_Store' \
+  --exclude='.release/' --exclude='*.fpk' --exclude='*.apk' --exclude='.DS_Store' \
   "${REPO_ROOT}/" "${STAGE}/app/repo/"
 
 # 公开构建：从暂存副本移除可选特性（非标准源适配 / 扩展分类）。
