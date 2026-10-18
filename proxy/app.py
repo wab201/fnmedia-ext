@@ -118,14 +118,9 @@ async def _hot_worker(app: FastAPI):
     while not app.state.stop_hot.is_set():
         cfg = config.get()
         interval = max(1800, int(cfg.get("hot_refresh_interval", 6 * 3600)))
-        status = hot_cache.status()
-        stale_for = interval
-        if status.get("updated_at"):
-            stale_for = max(0, int(time.time() - status["updated_at"]))
-        if cfg.get("hot_library_enabled", True) and (
-                not status.get("updated_at") or stale_for >= interval):
+        if cfg.get("hot_library_enabled", True) and hot_cache.stale(interval):
             try:
-                await asyncio.wait_for(hot_cache.refresh(store), timeout=90)
+                await asyncio.wait_for(hot_cache.refresh(store), timeout=hotmod.REFRESH_TIMEOUT)
             except asyncio.TimeoutError:
                 _log.warning("hot refresh timed out; keeping previous cache")
             except Exception as exc:
@@ -471,7 +466,13 @@ async def item_list(request: Request):
             "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
             "dir": "", "total": 0, "list": [], "jump_list": None,
         }})
-    # 即使缓存还在第一次刷新，也立即返回（不实时串联各资源站拖慢 UI）
+    # 即使缓存还在第一次刷新，也立即返回（不实时串联各资源站拖慢 UI）。
+    # 若缓存已较旧，顺手在后台触发一次刷新（stale-while-revalidate），不阻塞本次响应。
+    interval = max(1800, int(config.get().get("hot_refresh_interval", 6 * 3600)))
+    try:
+        hot_cache.maybe_refresh_in_background(store, min_age=min(interval, 1800))
+    except Exception:
+        pass
     all_rows = _hot_rows_all(body, cat)
     page_size, start, end = _page_args(body, len(all_rows))
     return JSONResponse({"code": 0, "msg": "", "data": {
@@ -1264,13 +1265,13 @@ async def ext_set_config(request: Request):
     if "hot_library_title" in patch:
         patch["hot_library_title"] = str(patch["hot_library_title"]).strip()[:20] or HOT_DEFAULT_TITLE
     if "hot_limit" in patch:
-        patch["hot_limit"] = max(20, min(120, int(patch["hot_limit"])))
+        patch["hot_limit"] = max(60, min(800, int(patch["hot_limit"])))
     if "hot_per_source" in patch:
-        patch["hot_per_source"] = max(10, min(40, int(patch["hot_per_source"])))
+        patch["hot_per_source"] = max(20, min(240, int(patch["hot_per_source"])))
     if "hot_pages_per_source" in patch:
-        patch["hot_pages_per_source"] = max(1, min(3, int(patch["hot_pages_per_source"])))
+        patch["hot_pages_per_source"] = max(1, min(10, int(patch["hot_pages_per_source"])))
     if "hot_refresh_interval" in patch:
-        patch["hot_refresh_interval"] = max(3 * 3600, min(24 * 3600,
+        patch["hot_refresh_interval"] = max(1 * 3600, min(24 * 3600,
                                                           int(patch["hot_refresh_interval"])))
     if "sources" in body and isinstance(body["sources"], list):
         cur = {s["id"]: s for s in config.all_sources()}

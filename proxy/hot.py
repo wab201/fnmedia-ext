@@ -24,7 +24,7 @@ from typing import Any
 import providers
 
 STATE = Path(__file__).resolve().parent.parent / "state" / "hot.json"
-REFRESH_TIMEOUT = 75.0
+REFRESH_TIMEOUT = 180.0
 
 
 def norm_title(title: str) -> str:
@@ -221,9 +221,15 @@ async def collect_hot(sources: list[dict], limit_per_source: int,
 class HotCache:
     def __init__(self):
         self._lock = threading.RLock()
-        self._data: dict[str, Any] = {"items": []}
+        # _items 是只读快照：刷新时整体替换引用，绝不在原地修改，
+        # 因此列表请求可直接读引用而无需对数百条 brief 做整包深拷贝。
+        self._meta: dict[str, Any] = {"updated_at": 0, "updated_at_text": "",
+                                      "provider_ok": 0, "total_sources": 0,
+                                      "last_error": ""}
+        self._items: list[dict] = []
         self._refreshing = False
         self._task: asyncio.Future | None = None
+        self._index: dict[str, dict] = {}
         self.load()
 
     def load(self):
@@ -231,25 +237,40 @@ class HotCache:
             try:
                 j = json.loads(STATE.read_text())
                 if isinstance(j, dict) and isinstance(j.get("items"), list):
-                    self._data = j
+                    self._apply(j)
+                    return
             except Exception:
-                self._data = {
-                    "updated_at": 0, "updated_at_text": "", "provider_ok": 0,
-                    "total_sources": 0, "count": 0, "items": [],
-                    "last_error": "尚未刷新",
-                }
+                pass
+            self._meta = {"updated_at": 0, "updated_at_text": "", "provider_ok": 0,
+                          "total_sources": 0, "last_error": "尚未刷新"}
+            self._items = []
+            self._index = {}
+
+    def _apply(self, data: dict[str, Any]):
+        self._items = list(data.get("items") or [])
+        self._index = {b.get("guid"): b for b in self._items if b.get("guid")}
+        self._meta = {k: data.get(k, "") for k in
+                      ("updated_at", "updated_at_text", "provider_ok",
+                       "total_sources", "last_error")}
+
+    def meta(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._meta)
 
     def get(self) -> dict[str, Any]:
         with self._lock:
-            return json.loads(json.dumps(self._data, ensure_ascii=False))
+            d = dict(self._meta)
+            d["items"] = self._items
+            d["count"] = len(self._items)
+            return d
 
     def items(self) -> list[dict]:
-        return self.get().get("items", [])
+        with self._lock:
+            return self._items
 
     def get_guid(self, guid: str) -> dict | None:
         with self._lock:
-            return next((dict(b) for b in self._data.get("items", [])
-                         if b.get("guid") == guid), None)
+            return self._index.get(guid)
 
     def posters(self, limit: int = 4) -> list[str]:
         out = []
@@ -261,22 +282,59 @@ class HotCache:
         return out
 
     def status(self) -> dict[str, Any]:
-        d = self.get()
-        return {
-            "enabled": bool(config_hot_enabled()),
-            "refreshing": self._refreshing,
-            "updated_at": d.get("updated_at", 0),
-            "updated_at_text": d.get("updated_at_text", ""),
-            "count": len(d.get("items", [])),
-            "provider_ok": d.get("provider_ok", 0),
-            "total_sources": d.get("total_sources", 0),
-            "last_error": d.get("last_error", ""),
-        }
+        with self._lock:
+            return {
+                "enabled": bool(config_hot_enabled()),
+                "refreshing": self._refreshing,
+                "updated_at": self._meta.get("updated_at", 0),
+                "updated_at_text": self._meta.get("updated_at_text", ""),
+                "count": len(self._items),
+                "provider_ok": self._meta.get("provider_ok", 0),
+                "total_sources": self._meta.get("total_sources", 0),
+                "last_error": self._meta.get("last_error", ""),
+            }
+
+    def stale(self, interval: float, grace: float = 0.0) -> bool:
+        """缓存是否已超过 interval(+grace) 秒。无缓存视为过期。"""
+        with self._lock:
+            ts = float(self._meta.get("updated_at") or 0)
+        if not ts:
+            return True
+        return (time.time() - ts) >= max(0.0, interval - grace)
+
+    def maybe_refresh_in_background(self, store_obj=None, min_age: float = 900):
+        """过期则在后台触发一次刷新（stale-while-revalidate）。
+
+        页面请求只读缓存、立即返回；这里只负责“顺手”安排一次后台更新，
+        min_age 限制两次自动刷新的最小间隔，避免连续翻页打爆资源站。
+        """
+        if self._refreshing:
+            return False
+        with self._lock:
+            ts = float(self._meta.get("updated_at") or 0)
+            age = time.time() - ts if ts else 1e18
+        if age < min_age:
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+
+        async def _run():
+            try:
+                await asyncio.wait_for(self.refresh(store_obj, force=True),
+                                       timeout=REFRESH_TIMEOUT)
+            except Exception:
+                pass
+
+        loop.create_task(_run())
+        return True
 
     def _persist(self, data: dict[str, Any]):
         tmp = STATE.with_suffix(".tmp")
         STATE.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        # 大缓存用紧凑 JSON 落盘，体积可下降 15-25%。
+        tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
         tmp.replace(STATE)
 
     async def refresh(self, store_obj=None, force: bool = False) -> dict[str, Any]:
@@ -291,7 +349,9 @@ class HotCache:
         try:
             cfg = config.get()
             if not cfg.get("hot_library_enabled", True):
-                result = {**self.get(), "last_error": "热门媒体库已关闭"}
+                with self._lock:
+                    self._meta["last_error"] = "热门媒体库已关闭"
+                    result = self.get()
                 self._task.set_result(result)
                 return result
             sources = config.enabled_sources()
@@ -299,10 +359,10 @@ class HotCache:
             data = await asyncio.wait_for(
                 collect_hot(
                     sources=sources,
-                    limit_per_source=int(cfg.get("hot_per_source", 30)),
-                    max_items=int(cfg.get("hot_limit", 60)),
+                    limit_per_source=int(cfg.get("hot_per_source", 120)),
+                    max_items=int(cfg.get("hot_limit", 300)),
                     is_junk=config.is_junk,
-                    pages_per_source=int(cfg.get("hot_pages_per_source", 2)),
+                    pages_per_source=int(cfg.get("hot_pages_per_source", 6)),
                 ),
                 timeout=REFRESH_TIMEOUT,
             )
@@ -316,15 +376,14 @@ class HotCache:
                 store_obj.remember_merged(data["items"])
             with self._lock:
                 self._persist(data)
-                self._data = data
+                self._apply(data)
             result = data
         except Exception as exc:
             # 关键容错：任一资源站、整体超时或写盘失败都不清空旧缓存。
-            old = self.get()
-            old["last_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
-            result = old
+            err = f"{type(exc).__name__}: {str(exc)[:120]}"
             with self._lock:
-                self._data = old
+                self._meta["last_error"] = err
+                result = self.get()
         finally:
             self._refreshing = False
             if self._task and not self._task.done():

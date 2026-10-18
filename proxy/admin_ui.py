@@ -131,13 +131,15 @@ ADMIN_HTML = r"""<!doctype html>
         <strong style="margin-left:4px">🌐在线电影 · 🌐在线剧集 · 🌐在线动漫 · 🌐在线综艺</strong>
       </label>
     </div>
-    <div class="addrow" style="grid-template-columns:1fr 1fr 1fr">
-      <input type="number" id="hotLimit" min="20" max="120" title="总展示条数上限" placeholder="总条数上限"/>
-      <input type="number" id="hotPerSource" min="10" max="40" title="每源条数" placeholder="每源条数"/>
-      <input type="number" id="hotInterval" min="3" max="24" title="自动刷新间隔（小时）" placeholder="刷新小时"/>
+    <div class="addrow" style="grid-template-columns:1fr 1fr 1fr 1fr">
+      <input type="number" id="hotLimit" min="60" max="800" title="四库合计保留条数上限" placeholder="总条数上限"/>
+      <input type="number" id="hotPerSource" min="20" max="240" title="每个资源站抓取条数" placeholder="每源条数"/>
+      <input type="number" id="hotPages" min="1" max="10" title="每个资源站翻最近更新页数（每页约20条）" placeholder="每源页数"/>
+      <input type="number" id="hotInterval" min="1" max="24" title="自动刷新间隔（小时）" placeholder="刷新小时"/>
     </div>
     <div class="muted" style="margin:6px 0 10px">
-      按资源站类型自动归入电影/剧集/动漫/综艺；总条数上限 / 每源条数 / 刷新间隔小时。最近更新按跨源命中数、更新时间和直链数量排序，失败时保留旧缓存。
+      后台深度爬取各源「最近更新」多页并跨源去重，自动归入电影/剧集/动漫/综艺，数值越大内容越多、刷新越慢。
+      打开媒体库只读缓存（秒开），缓存过期会在后台自动更新，失败保留旧缓存。
     </div>
     <div id="hotStatus" class="meta">等待加载状态…</div>
     <button onclick="saveHotCfg()" style="margin-top:10px">保存热门设置</button>
@@ -183,20 +185,22 @@ async function init(){
 
 function renderHot(h){
   $("hotEnabled").checked=CFG.hot_library_enabled!==false;
-  $("hotLimit").value=CFG.hot_limit||60;
-  $("hotPerSource").value=CFG.hot_per_source||30;
+  $("hotLimit").value=CFG.hot_limit||300;
+  $("hotPerSource").value=CFG.hot_per_source||120;
+  $("hotPages").value=CFG.hot_pages_per_source||6;
   $("hotInterval").value=Math.round((CFG.hot_refresh_interval||21600)/3600);
   const n=h.count||0, ok=h.provider_ok||0, total=h.total_sources||0;
   $("hotState").textContent=n+" 条";
-  $("hotStatus").textContent=(h.refreshing?"正在后台刷新…":"最近刷新："+(h.updated_at_text||"尚未刷新"))
+  $("hotStatus").textContent=(h.refreshing?"正在后台深度刷新…":"最近刷新："+(h.updated_at_text||"尚未刷新"))
     +` · 成功线路 ${ok}/${total}` + (h.last_error?(" · "+h.last_error):"");
 }
 async function saveHotCfg(){
   const body={
     hot_library_enabled:$("hotEnabled").checked,
-    hot_limit:Math.max(20,Math.min(120,parseInt($("hotLimit").value)||60)),
-    hot_per_source:Math.max(10,Math.min(40,parseInt($("hotPerSource").value)||30)),
-    hot_refresh_interval:Math.max(3,Math.min(24,parseInt($("hotInterval").value)||6))*3600
+    hot_limit:Math.max(60,Math.min(800,parseInt($("hotLimit").value)||300)),
+    hot_per_source:Math.max(20,Math.min(240,parseInt($("hotPerSource").value)||120)),
+    hot_pages_per_source:Math.max(1,Math.min(10,parseInt($("hotPages").value)||6)),
+    hot_refresh_interval:Math.max(1,Math.min(24,parseInt($("hotInterval").value)||6))*3600
   };
   const r=await jpost("/v/api/ext/config",body);
   if(r.code===0){Object.assign(CFG,body);toast("热门设置已保存")}

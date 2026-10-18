@@ -62,8 +62,9 @@ def hot_category(b: dict) -> str:
         return "variety"
     if any(w in typ for w in _MOVIE_CAT_WORDS):
         return "movie"
-    # type_name 不足以判定时，用是否多集兜底：多集=剧集，单集=电影
-    return "tv" if _ep_count(b) > 1 else "movie"
+    # 其余（日剧/韩剧/海外剧/连续剧等，以及类型缺失）统一归入剧集库；
+    # 不用“单集=电影”兜底，避免连载剧刚出第一集被错放进电影库。
+    return "tv"
 
 
 def brief_of(t: providers.OnlineTitle) -> dict:

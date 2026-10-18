@@ -28,12 +28,12 @@ DEFAULTS = {
     "junk_keywords": JUNK_KEYWORDS,
     # 在线资源前排展示（在线片库更齐全，默认前排）
     "online_first": True,
-    # 虚拟“在线热门”媒体库
+    # 虚拟“在线热门”分类媒体库（深度爬取：每源多页、跨源聚合去重）
     "hot_library_enabled": True,
     "hot_library_title": "🌐在线热门",
-    "hot_limit": 60,
-    "hot_per_source": 30,
-    "hot_pages_per_source": 2,
+    "hot_limit": 300,          # 四库合计保留条数上限
+    "hot_per_source": 120,    # 每个资源站最多抓取的可播条目
+    "hot_pages_per_source": 6,  # 每个资源站翻“最近更新”的页数（每页约20条）
     "hot_refresh_interval": 6 * 3600,
     "admin_token": "",
 }
@@ -84,6 +84,25 @@ class Config:
                 merged.append(m)
             cfg["sources"] = merged
             cfg["removed_ids"] = sorted(removed)
+            # 旧版本（单库/小数量）保存过的热门参数自动升级到深度爬取规模；
+            # 仅在检测到旧小值时迁移一次，用户之后自定义的大值不会被覆盖。
+            migrated = False
+            try:
+                if int(cfg.get("hot_limit", 0)) <= 120 and int(DEFAULTS["hot_limit"]) > 120:
+                    cfg["hot_limit"] = DEFAULTS["hot_limit"]; migrated = True
+                if int(cfg.get("hot_per_source", 0)) <= 40:
+                    cfg["hot_per_source"] = DEFAULTS["hot_per_source"]; migrated = True
+                if not cfg.get("hot_pages_per_source"):
+                    cfg["hot_pages_per_source"] = DEFAULTS["hot_pages_per_source"]; migrated = True
+            except (TypeError, ValueError):
+                pass
+            if migrated:
+                j.update({k: cfg[k] for k in
+                          ("hot_limit", "hot_per_source", "hot_pages_per_source")})
+                try:
+                    _STATE.write_text(json.dumps(j, ensure_ascii=False, indent=2))
+                except Exception:
+                    pass
             if not cfg.get("admin_token"):
                 import secrets
                 cfg["admin_token"] = secrets.token_hex(8)
