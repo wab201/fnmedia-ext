@@ -30,6 +30,8 @@ from fastapi.responses import (JSONResponse, RedirectResponse,
 
 import features
 import providers
+import client as clientmod
+import live as livemod
 import inject as inj
 import config as cfgmod
 from config import config
@@ -124,8 +126,19 @@ def standalone_lib_name(src: dict) -> str:
     return base
 
 
+
+
 def charts_enabled() -> bool:
     return bool(config.get().get("hot_library_enabled", True))
+
+
+def catalog_enabled() -> bool:
+    """海量四库独立开关（与热门榜单互不影响）。"""
+    return bool(config.get().get("catalog_library_enabled", True))
+
+
+def any_virtual_lib_enabled() -> bool:
+    return charts_enabled() or catalog_enabled()
 
 
 def _tv_compat_date(v) -> str:
@@ -136,25 +149,15 @@ def _tv_compat_date(v) -> str:
     return s
 
 
-def _tv_compat_card(row: dict) -> dict:
-    """FNTV(Flutter) 比手机端严格得多：只回它真实本地库卡片里出现过的字段集合，
-    多余字段（can_play/genres/poster_*）或取值形态不符都可能让整页 fromJson 失败。
+def _client_of(request: Request) -> clientmod.Client:
+    """从请求 UA 解析客户端画像（TV/iOS/Android/Web）。"""
+    return clientmod.parse_user_agent(request.headers.get("user-agent", ""))
 
-    已核对真实库卡片字段；status 用数字枚举串 '1'，日期补成 yyyy-MM-dd。
-    """
-    keep = ("guid", "video_guid", "lan", "imdb_id", "trim_id", "tv_title",
-            "parent_guid", "parent_title", "title", "type", "poster",
-            "is_favorite", "watched", "watched_ts", "vote_average", "media_stream",
-            "release_date", "season_number", "episode_number", "air_date",
-            "number_of_seasons", "number_of_episodes",
-            "local_number_of_seasons", "local_number_of_episodes", "status",
-            "overview", "ancestor_guid", "ancestor_name", "ancestor_category",
-            "ts", "duration", "single_child_guid", "file_name", "path", "runtime")
-    out = {k: row[k] for k in keep if k in row}
-    out["status"] = "1"
-    out["release_date"] = _tv_compat_date(row.get("release_date"))
-    out["air_date"] = _tv_compat_date(row.get("air_date"))
-    return out
+
+def _tv_compat_card(row: dict) -> dict:
+    """已废弃的单点规整，保留为兼容包装；新代码请用 client.normalize_card。"""
+    return clientmod.normalize_card(
+        row, clientmod.Client(kind=clientmod.TV, is_tv=True, strict_card=True))
 
 
 def chart_card(item: dict) -> dict:
@@ -409,24 +412,24 @@ async def _hot_worker(app: FastAPI):
     await asyncio.sleep(4)
     while not app.state.stop_hot.is_set():
         cfg = config.get()
-        enabled = cfg.get("hot_library_enabled", True)
+        charts_on = cfg.get("hot_library_enabled", True)
+        catalog_on = cfg.get("catalog_library_enabled", True)
         interval = max(1800, int(cfg.get("hot_refresh_interval", 6 * 3600)))
-        if enabled:
-            if chart_cache.stale(interval):
-                try:
-                    await asyncio.wait_for(chart_cache.refresh(force=True),
-                                           timeout=chartmod.REFRESH_TIMEOUT)
-                except asyncio.TimeoutError:
-                    _log.warning("chart refresh timed out; keeping previous cache")
-                except Exception as exc:
-                    _log.warning("chart refresh failed, keeping previous cache: %s", exc)
-            if catalog.routes_stale():
-                try:
-                    await asyncio.wait_for(
-                        catalog.refresh_routes(config.enabled_sources()),
-                        timeout=90)
-                except Exception as exc:
-                    _log.warning("catalog routes failed: %s", exc)
+        if charts_on and chart_cache.stale(interval):
+            try:
+                await asyncio.wait_for(chart_cache.refresh(force=True),
+                                       timeout=chartmod.REFRESH_TIMEOUT)
+            except asyncio.TimeoutError:
+                _log.warning("chart refresh timed out; keeping previous cache")
+            except Exception as exc:
+                _log.warning("chart refresh failed, keeping previous cache: %s", exc)
+        if catalog_on and catalog.routes_stale():
+            try:
+                await asyncio.wait_for(
+                    catalog.refresh_routes(config.enabled_sources()),
+                    timeout=90)
+            except Exception as exc:
+                _log.warning("catalog routes failed: %s", exc)
         try:
             await asyncio.wait_for(app.state.stop_hot.wait(), timeout=300)
         except asyncio.TimeoutError:
@@ -448,7 +451,90 @@ async def _access(request: Request, call_next):
         _log.info("%s %s -> %s", request.method,
                   (p + ("?" + request.url.query if request.url.query else ""))[:120],
                   resp.status_code)
+    _live_record(request, resp.status_code, p)
     return resp
+
+
+# 实时诊断：需要展示的播放链路路径 -> 阶段标签
+_LIVE_STAGES = [
+    ("/v/api/v1/mediadb/list", "library", "local"),
+    ("/v/api/v1/mdb/", "library", "local"),
+    ("/v/api/v1/mediadb/sum", "library", "mixed"),
+    ("/v/api/v1/item/list", "browse", "local"),
+    ("/v/api/v1/search/list", "search", "mixed"),
+    ("/v/api/v1/item/", "detail", "mixed"),
+    ("/v/api/v1/season/list", "season", "local"),
+    ("/v/api/v1/episode/list", "episode", "local"),
+    ("/v/api/v1/stream/list", "streams", "local"),
+    ("/v/api/v1/play/info", "play", "local"),
+    ("/v/api/v1/stream", "play", "local"),
+    ("/v/api/v1/play/play", "play", "local"),
+    ("/v/api/v1/media/range/", "media", "local"),
+    ("/v/api/v1/favorite/list", "favorite", "mixed"),
+    ("/v/api/v1/play/list", "history", "mixed"),
+]
+# 即使走了官方透传，也属于“本地与官方合并”的路径（不能简单判为纯透传）
+_LIVE_MERGE_PATHS = {"/v/api/v1/mediadb/list", "/v/api/v1/mediadb/sum",
+                     "/v/api/v1/search/list",
+                     "/v/api/v1/favorite/list", "/v/api/v1/play/list"}
+
+
+def _live_stage(p: str):
+    for pref, stage, origin in _LIVE_STAGES:
+        if p.startswith(pref):
+            return stage, origin
+    if p.startswith(ONLINE_PREFIX):
+        if p.endswith(".m3u8"):
+            return "hls", "local"
+        if p.endswith("/seg"):
+            return "seg", "local"
+        if p.endswith("/direct"):
+            return "direct", "local"
+        return "media", "local"
+    return None, None
+
+
+def _live_title_for(path: str, query_params) -> str:
+    """尽力从播放 URL 的 mg 反查片名，仅用于实时展示。"""
+    try:
+        if path.startswith(ONLINE_PREFIX):
+            mg = path[len(ONLINE_PREFIX) + 1:].split("/", 1)[0]
+            tgt = store.resolve_media_guid(mg)
+            if tgt:
+                return (tgt.get("ep_title") or tgt.get("title") or "")[:40]
+        if path.startswith("/v/api/v1/media/range/"):
+            mg = path.rsplit("/", 1)[-1]
+            tgt = store.resolve_media_guid(mg)
+            if tgt:
+                return (tgt.get("ep_title") or tgt.get("title") or "")[:40]
+    except Exception:
+        pass
+    return ""
+
+
+def _live_record(request: Request, status: int, path: str) -> None:
+    try:
+        stage, default_origin = _live_stage(path)
+        if not stage:
+            return
+        touched_up = bool(getattr(request.state, "live_upstream", False))
+        origin = getattr(request.state, "live_origin", "") or (
+            "mixed" if touched_up and path in _LIVE_MERGE_PATHS
+            else ("upstream" if touched_up else default_origin))
+        title = _live_title_for(path, request.query_params)
+        ip = request.headers.get("x-real-ip") or \
+            request.headers.get("x-forwarded-for", "").split(",")[0].strip() or \
+            (request.client.host if request.client else "")
+        note = ""
+        if status >= 400:
+            note = {403: "源站鉴权拒绝", 404: "无此片源/线路",
+                    500: "服务端错误", 502: "上游抓取失败",
+                    503: "暂无可播片源", 504: "上游超时"}.get(status, "请求失败")
+        livemod.record(request.headers.get("user-agent", ""), ip,
+                       request.method, path, request.url.query, status,
+                       origin, title=title, stage=stage, note=note)
+    except Exception:
+        pass  # 诊断本身绝不影响正常请求
 
 
 def up_client(req: Request) -> httpx.AsyncClient:
@@ -488,8 +574,41 @@ async def ext_get_retry(req: Request, url: str, headers: dict | None = None,
     return r  # type: ignore[return-value]
 
 
+# 透传上游响应头时必须丢弃的 hop-by-hop / 会与本代理冲突的头。
+_HOP_HEADERS = {"connection", "content-length", "content-encoding",
+                "transfer-encoding", "keep-alive", "upgrade", "proxy-authenticate",
+                "proxy-authorization", "te", "trailers", "host"}
+
+
+def _safe_response_headers(src, drop: "set[str] | None" = None) -> "dict[str, str]":
+    """把上游响应头过滤成可安全回传的 latin-1 头字典。
+
+    关键修复：不少资源站会在 Content-Disposition / Set-Cookie / 自定义头里塞中文
+    （如 filename="第一集.ts"）。HTTP 头只允许 latin-1，原值直接交给 Starlette 会抛
+    UnicodeEncodeError 导致整个响应 500，播放器拉到该分片/清单即“播放出错”。
+    这里：①丢 hop-by-hop 与调用方指定头；②值无法 latin-1 编码的头一律丢弃
+    （Content-Disposition 对解码无意义），绝不因一个头毁掉整个播放响应。
+    """
+    blocked = _HOP_HEADERS | (drop or set())
+    out: dict[str, str] = {}
+    for k, v in src.items():
+        if k.lower() in blocked:
+            continue
+        try:
+            v.encode("latin-1")
+        except (UnicodeEncodeError, AttributeError):
+            continue  # 非 latin-1（含中文）头：对播放无价值，丢弃
+        out[k] = v
+    return out
+
+
 async def forward_upstream(request: Request) -> Response:
     """原样透传官方后端（走 unix socket）。"""
+    # 实时诊断：标记本请求接触过官方后端
+    try:
+        request.state.live_upstream = True
+    except Exception:
+        pass
     client = up_client(request)
     url = "http://localhost" + request.url.path
     if request.url.query:
@@ -503,9 +622,7 @@ async def forward_upstream(request: Request) -> Response:
     except Exception as exc:
         return JSONResponse({"code": -1, "msg": f"upstream {type(exc).__name__}", "data": None},
                             status_code=502)
-    resp_headers = {k: v for k, v in r.headers.items()
-                    if k.lower() not in ("content-length", "content-encoding",
-                                         "transfer-encoding", "connection")}
+    resp_headers = _safe_response_headers(r.headers)
     return Response(content=r.content, status_code=r.status_code,
                     headers=resp_headers,
                     media_type=r.headers.get("content-type"))
@@ -555,10 +672,18 @@ async def _aggregate_briefs(keyword: str, maxn: int | None = None) -> list[dict]
             if cur is None or nd_new > nd_cur or \
                     (nd_new == nd_cur and len(play) > len(cur)):
                 g["lines"][lkey] = [e.__dict__ for e in play]
-    # 排序：按可播直链总数（跨线路）降序
-    ordered = sorted(groups.values(),
-                     key=lambda g: sum(len(v) for v in g["lines"].values()),
-                     reverse=True)[:maxn]
+    # 排序：热门资源优先高质量源（源质量权重），同权重再按可播直链总数（跨线路）降序
+    prefer_q = bool(config.get().get("prefer_quality_source", True))
+    overrides = config.get().get("source_priority") or {}
+
+    def _group_key(g) -> tuple:
+        lines_n = sum(len(v) for v in g["lines"].values())
+        if not prefer_q:
+            return (0, lines_n)
+        pr = providers.source_priority({"id": g["rep"].provider}, overrides)
+        return (pr, lines_n)
+
+    ordered = sorted(groups.values(), key=_group_key, reverse=True)[:maxn]
     briefs = []
     for g in ordered:
         brief = inj.brief_of(g["rep"])
@@ -581,9 +706,12 @@ async def online_search(keyword: str, client: httpx.AsyncClient) -> list:
                 briefs = await _aggregate_briefs(keyword)
                 items = [inj.search_item(b) for b in briefs]
                 _search_cache[keyword] = (time.time(), items)
-                fut.set_result(items)
+                if not fut.done():
+                    fut.set_result(items)
             except Exception:
-                fut.set_result([])
+                # 客户端断连会让 fut 被取消，此时再 set_result 会抛 InvalidStateError
+                if not fut.done():
+                    fut.set_result([])
             finally:
                 _search_inflight.pop(keyword, None)
 
@@ -821,7 +949,9 @@ async def _json_from_upstream(upstream: Response) -> dict | None:
 @app.get("/v/api/v1/mediadb/list")
 async def mediadb_list(request: Request):
     upstream = await forward_upstream(request)
-    if not config.get().get("hot_library_enabled", True):
+    # 热门四库与海量四库各有独立开关；两类都关时才完全不注入（单源独立库/加固专区
+    # 仍应展示，故这里只判断“聚合四库”开关）。
+    if not any_virtual_lib_enabled():
         return upstream
     payload = await _json_from_upstream(upstream)
     dbs = payload.get("data") if payload else None
@@ -838,27 +968,29 @@ async def mediadb_list(request: Request):
             return upstream
     try:
         inserts = []
-        # 1) 豆瓣真实榜单（精选）
-        for cat, _t, _c in chartmod.CHART_CATEGORIES:
-            ps = []
-            for it in chart_cache.items(cat):
-                p = inj._poster(it.get("cover") or "")
-                if p:
-                    ps.append(p)
-                if len(ps) >= 8:
-                    break
-            inserts.append({
-                "guid": CHART_LIB_GUIDS[cat],
-                "title": chartmod.chart_cat_title(cat),
-                "poster": ps[0] if ps else "",
-                "posters": ps,
-                "category": chartmod.chart_cat_mdb(cat),
-                "view_type": 0, "poster_type": 0, "refresh_disabled": True,
-            })
+        # 1) 豆瓣真实榜单四库（独立开关 hot_library_enabled）
+        if charts_enabled():
+            for cat, _t, _c in chartmod.CHART_CATEGORIES:
+                ps = []
+                for it in chart_cache.items(cat):
+                    p = inj._poster(it.get("cover") or "")
+                    if p:
+                        ps.append(p)
+                    if len(ps) >= 8:
+                        break
+                inserts.append({
+                    "guid": CHART_LIB_GUIDS[cat],
+                    "title": chartmod.chart_cat_title(cat),
+                    "poster": ps[0] if ps else "",
+                    "posters": ps,
+                    "category": chartmod.chart_cat_mdb(cat),
+                    "view_type": 0, "poster_type": 0, "refresh_disabled": True,
+                })
         # 2) 海量分类片库（资源站深翻）；仅在已建立分类路由时展示。
         # 海报只读本页/密集缓存，绝不在此联网抓取——TV/安卓 App 对该接口超时很敏感，
         # 一次资源站首页请求可能耗时十余秒，导致客户端提示“加载失败/媒体库不存在”。
-        if charts_enabled() and any(catalog.available(c) for c, _, _ in catalogmod.CATALOG_CATEGORIES):
+        # 海量四库独立开关 catalog_library_enabled
+        if catalog_enabled() and any(catalog.available(c) for c, _, _ in catalogmod.CATALOG_CATEGORIES):
             for cat, _t, _c in catalogmod.CATALOG_CATEGORIES:
                 if not catalog.available(cat):
                     continue
@@ -898,7 +1030,20 @@ async def mediadb_list(request: Request):
                 "category": "Mix", "view_type": 0, "poster_type": 0,
                 "refresh_disabled": True,
             })
-        dbs[0:0] = inserts
+        # 4) TVBox 加固源专区（每个启用且运行时在线的加固源一张库卡片）。
+        # 海报只读缓存（后台预热），绝不在此联网——该接口对超时极敏感。
+        # —— 置顶控制 ——
+        # 置顶库（pinned_libs）插到列表最前并给较大 sort_num；未置顶的虚拟库仍排在
+        # 官方本地库之前，但置于置顶组之后。客户端按返回顺序/ sort_num 展示。
+        pinned_set = config.pinned_lib_guids()
+        pinned = [d for d in inserts if d["guid"] in pinned_set]
+        normal = [d for d in inserts if d["guid"] not in pinned_set]
+        for i, d in enumerate(pinned):
+            d["sort_num"] = 10_000_000 - i
+        for d in normal:
+            d["sort_num"] = 0
+        dbs[0:0] = normal
+        dbs[0:0] = pinned
         if not isinstance(payload, dict):
             payload = {"code": 0, "msg": "", "data": []}
         # 官方该接口失败时我们用虚拟库兜底，必须把整体码改为成功，否则 App 直接报错
@@ -1004,6 +1149,8 @@ async def mdb_detail(guid: str, request: Request):
         }
         return JSONResponse({"code": 0, "msg": "", "data": payload})
 
+    # TVBox 加固源专区库
+
     # 兼容旧热门库 guid
     if is_hot_guid(guid):
         cat = HOT_GUID_CAT.get(guid) or ("tv" if guid == HOT_LEGACY_GUID else "movie")
@@ -1023,23 +1170,25 @@ async def mdb_detail(guid: str, request: Request):
 @app.get("/v/api/v1/mediadb/sum")
 async def mediadb_sum(request: Request):
     upstream = await forward_upstream(request)
-    if not config.get().get("hot_library_enabled", True):
+    if not any_virtual_lib_enabled():
         return upstream
     payload = await _json_from_upstream(upstream)
     if not payload or not isinstance(payload.get("data"), dict):
         return upstream
     total_added = 0
-    for cat, _t, _c in chartmod.CHART_CATEGORIES:
-        n = len(chart_cache.items(cat))
-        if n:
-            payload["data"][CHART_LIB_GUIDS[cat]] = n
-            total_added += n
-    for cat, _t, _c in catalogmod.CATALOG_CATEGORIES:
-        if catalog.available(cat):
-            n = catalog.total(cat)
+    if charts_enabled():
+        for cat, _t, _c in chartmod.CHART_CATEGORIES:
+            n = len(chart_cache.items(cat))
             if n:
-                payload["data"][CATALOG_LIB_GUIDS[cat]] = n
+                payload["data"][CHART_LIB_GUIDS[cat]] = n
                 total_added += n
+    if catalog_enabled():
+        for cat, _t, _c in catalogmod.CATALOG_CATEGORIES:
+            if catalog.available(cat):
+                n = catalog.total(cat)
+                if n:
+                    payload["data"][CATALOG_LIB_GUIDS[cat]] = n
+                    total_added += n
     for s in standalone_sources_active():
         scope = s["id"]
         if catalog.standalone_available(scope):
@@ -1055,6 +1204,8 @@ async def mediadb_sum(request: Request):
     return JSONResponse(payload)
 
 
+
+
 @app.post("/v/api/v1/item/list")
 async def item_list(request: Request):
     raw = await request.body()
@@ -1063,6 +1214,9 @@ async def item_list(request: Request):
     except Exception:
         body = {}
     aguid = body.get("ancestor_guid")
+    client = _client_of(request)
+
+    # —— TVBox 加固源专区库 ——
 
     # —— 单源独立媒体库：该源四类交错成一条最近更新流 ——
     sscope = standalone_source_of(aguid) if aguid else None
@@ -1070,7 +1224,7 @@ async def item_list(request: Request):
             any(s["id"] == sscope for s in standalone_sources_active()):
         src = next((s for s in config.all_sources() if s["id"] == sscope), {})
         lib_name = standalone_lib_name(src)
-        if not charts_enabled() or not catalog.standalone_available(sscope):
+        if not catalog.standalone_available(sscope):
             if catalog.routes_stale() and not catalog._refreshing:
                 asyncio.create_task(
                     catalog.refresh_routes(config.enabled_sources()))
@@ -1093,8 +1247,7 @@ async def item_list(request: Request):
             row["video_guid"] = video_guid(b["guid"])
             _apply_marks(row)
             rows.append(row)
-        if "trim.tv" in request.headers.get("user-agent", ""):
-            rows = [_tv_compat_card(r) for r in rows]
+        rows = clientmod.normalize_cards(rows, client)
         return JSONResponse({"code": 0, "msg": "", "data": {
             "mdb_name": lib_name, "mdb_category": "Mix", "top_dir": "",
             "dir": "", "total": total, "list": rows, "jump_list": None}})
@@ -1104,7 +1257,7 @@ async def item_list(request: Request):
     if ccat is not None:
         mdb_name = catalogmod.catalog_title(ccat)
         mdb_cat = catalogmod.catalog_mdb(ccat)
-        if not charts_enabled() or not catalog.available(ccat):
+        if not catalog_enabled() or not catalog.available(ccat):
             return JSONResponse({"code": 0, "msg": "", "data": {
                 "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
                 "dir": "", "total": 0, "list": [], "jump_list": None}})
@@ -1122,8 +1275,7 @@ async def item_list(request: Request):
         offset = max(0, min(offset, total))
         briefs = await catalog.get_window(ccat, offset, page_size)
         rows = _catalog_filter([_catalog_card(b, ccat) for b in briefs], body)
-        if "trim.tv" in request.headers.get("user-agent", ""):
-            rows = [_tv_compat_card(r) for r in rows]
+        rows = clientmod.normalize_cards(rows, client)
         return JSONResponse({"code": 0, "msg": "", "data": {
             "mdb_name": mdb_name, "mdb_category": mdb_cat, "top_dir": "",
             "dir": "", "total": total, "list": rows,
@@ -1153,8 +1305,7 @@ async def item_list(request: Request):
     all_rows = _chart_rows_all(body, cat)
     page_size, start, end = _page_args(body, len(all_rows))
     out_rows = all_rows[start:end]
-    if "trim.tv" in request.headers.get("user-agent", ""):
-        out_rows = [_tv_compat_card(r) for r in out_rows]
+    out_rows = clientmod.normalize_cards(out_rows, client)
     _payload = {"code": 0, "msg": "", "data": {
         "mdb_name": mdb_name,
         "mdb_category": mdb_cat,
@@ -1191,6 +1342,8 @@ async def search_list(request: Request):
         except Exception:
             online = []
     # 在线片库更齐全，默认把在线结果排到前面；可在管理页关闭
+    if online:
+        online = clientmod.normalize_cards(online, _client_of(request))
     if config.get().get("online_first", True):
         data["data"] = online + items
     else:
@@ -1203,6 +1356,7 @@ async def search_list(request: Request):
 
 @app.get("/v/api/v1/item/{guid}")
 async def item_detail(guid: str, request: Request):
+    client = _client_of(request)
     # 单源独立媒体库根节点
     sscope = standalone_source_of(guid)
     if sscope is not None and \
@@ -1220,6 +1374,7 @@ async def item_detail(guid: str, request: Request):
         data["play_item_guid"] = ""
         data["play_error"] = ""
         return JSONResponse({"code": 0, "msg": "", "data": data})
+    # TVBox 加固源专区库根节点
     # 海量库根节点
     if guid in CATALOG_GUID_CAT:
         ccat = CATALOG_GUID_CAT[guid]
@@ -1274,7 +1429,8 @@ async def item_detail(guid: str, request: Request):
                 data["vote_average"] = str(meta["rating"])
             if meta.get("desc") and not data.get("overview"):
                 data["overview"] = meta["desc"]
-            return JSONResponse({"code": 0, "msg": "", "data": data})
+            return JSONResponse({"code": 0, "msg": "",
+                                 "data": clientmod.normalize_detail(data, client)})
         cat = meta.get("cat", "tv")
         failed = time.time() - _CHART_FAILED_TS.get(guid, 0) < _CHART_FAILED_TTL
         data = inj._base_item(
@@ -1298,7 +1454,8 @@ async def item_detail(guid: str, request: Request):
         data["release_date"] = meta.get("year") or ""
         data["air_date"] = meta.get("year") or ""
         _apply_marks(data)
-        return JSONResponse({"code": 0, "msg": "", "data": data})
+        return JSONResponse({"code": 0, "msg": "",
+                             "data": clientmod.normalize_detail(data, client)})
     # 伪造的 Season / Episode 节点
     if store.get_episode(guid):
         ep = store.get_episode(guid)
@@ -1309,7 +1466,8 @@ async def item_detail(guid: str, request: Request):
             number_of_seasons=1, can_play=1,
             media_guid=ep_media_guid(guid), video_guid=ep_video_guid(guid))
         _apply_marks(data)
-        return JSONResponse({"code": 0, "msg": "", "data": data})
+        return JSONResponse({"code": 0, "msg": "",
+                             "data": clientmod.normalize_detail(data, client)})
     from store import season_guid as _sg
     # 反查 season guid
     tv = None
@@ -1325,13 +1483,15 @@ async def item_detail(guid: str, request: Request):
             season_number=1, number_of_seasons=1,
             number_of_episodes=store.episode_count(tv), can_play=None,
             poster=inj._poster(brief.get("poster")))
-        return JSONResponse({"code": 0, "msg": "", "data": data})
+        return JSONResponse({"code": 0, "msg": "",
+                             "data": clientmod.normalize_detail(data, client)})
     brief = store.get_title_by_guid(guid)
     if not brief:
         return await forward_upstream(request)
     data = inj.detail_item(brief)
     _apply_marks(data)
-    return JSONResponse({"code": 0, "msg": "", "data": data})
+    return JSONResponse({"code": 0, "msg": "",
+                         "data": clientmod.normalize_detail(data, client)})
 
 
 @app.get("/v/api/v1/season/list/{guid}")
@@ -1339,7 +1499,9 @@ async def season_list_route(guid: str, request: Request):
     brief = store.get_title_by_guid(guid)
     if not brief or not inj.is_tv(brief):
         return await forward_upstream(request)
-    return JSONResponse({"code": 0, "msg": "", "data": inj.season_list(brief)})
+    client = _client_of(request)
+    return JSONResponse({"code": 0, "msg": "",
+                         "data": clientmod.normalize_cards(inj.season_list(brief), client)})
 
 
 @app.get("/v/api/v1/episode/list/{guid}")
@@ -1357,8 +1519,10 @@ async def episode_list_route(guid: str, request: Request):
             tv = guid
     if not tv:
         return await forward_upstream(request)
+    client = _client_of(request)
     return JSONResponse({"code": 0, "msg": "",
-                         "data": inj.episode_list(store.get_title_by_guid(tv))})
+                         "data": clientmod.normalize_cards(
+                             inj.episode_list(store.get_title_by_guid(tv)), client)})
 
 
 @app.get("/v/api/v1/stream/list/{guid}")
@@ -1580,6 +1744,7 @@ async def favorite_list(request: Request):
         cards.append(row)
 
     official = (ldata["data"].get("list") or [])
+    cards = clientmod.normalize_cards(cards, _client_of(request))
     merged = cards + list(official)
     page = max(1, int(body.get("page") or 1))
     page_size = max(1, int(body.get("page_size") or len(merged) or 50))
@@ -1591,11 +1756,46 @@ async def favorite_list(request: Request):
     return JSONResponse(ldata)
 
 
+def _online_play_info(guid: str, request: Request) -> dict | None:
+    """对已绑定的在线标题（brief）构造原生播放 info。
+
+    返回 None 表示该 guid 不属于在线标题（调用方应继续走榜单/上游分支）。
+    与资源浏览页 open 深链共用，保证 /video 用的 guid 与播放器一致。
+    """
+    # 与 play/info 路由一致：先看该 guid 是否已是某个（动态解析出的）可播集
+    ep = store.get_episode(guid)
+    if ep:
+        info = inj.episode_play_info(ep)
+        rec0 = history.get(guid)
+        if rec0:
+            info["ts"] = rec0.get("ts", 0)
+        return info
+    brief = store.get_title_by_guid(guid)
+    if not brief:
+        return None
+    rec = history.get(guid)
+    if inj.is_tv(brief):
+        ep_guids = store.tv_episode_guids(guid)
+        if ep_guids:
+            target_eg, resume_ts = history.resume_episode(ep_guids)
+            if target_eg:
+                ep = store.get_episode(target_eg)
+                if ep:
+                    info = inj.episode_play_info(ep)
+                    info["ts"] = resume_ts
+                    return info
+    info = inj.play_info(brief)
+    if rec:
+        info["ts"] = rec.get("ts", 0)
+    return info
+
+
 @app.post("/v/api/v1/play/info")
 async def play_info(request: Request):
     import json
     body = json.loads(await request.body() or b"{}")
     guid = body.get("item_guid", "")
+    client = _client_of(request)
 
     def _prewarm_from_info(info: dict):
         """点击播放即后台预热默认线路的播放列表，缩短首帧等待。"""
@@ -1616,7 +1816,8 @@ async def play_info(request: Request):
         if rec:
             info["ts"] = rec.get("ts", 0)
         _prewarm_from_info(info)
-        return JSONResponse({"code": 0, "msg": "", "data": info})
+        return JSONResponse({"code": 0, "msg": "",
+                             "data": clientmod.normalize_detail(info, client)})
     brief = store.get_title_by_guid(guid)
     if not brief and chart_cache.is_chart_guid(guid):
         # 网页端必须先拿到 play/info 才会跳转播放页。这里不能长时间等待全网搜源，
@@ -1648,33 +1849,22 @@ async def play_info(request: Request):
                     "can_play": 1, "play_error": "",
                     "season_number": 0 if typ == "Movie" else 1,
                     "episode_number": 0, "parent_guid": "",
-                    "posters": inj._poster(meta.get("cover", "")) if meta.get("cover") else [],
-                    "backdrops": inj._poster(meta.get("cover", "")) if meta.get("cover") else [],
+                    "posters": inj._poster(meta.get("cover", "")) if meta.get("cover") else "",
+                    "backdrops": inj._poster(meta.get("cover", "")) if meta.get("cover") else "",
                     "number_of_episodes": 1, "number_of_seasons": 1 if typ == "TV" else 0,
                 },
                 "direct_link_audio_index": -1,
             }
-            return JSONResponse({"code": 0, "msg": "", "data": info})
+            return JSONResponse({"code": 0, "msg": "",
+                                 "data": clientmod.normalize_detail(info, client)})
     if not brief:
         return await forward_upstream(request)
-    # 多集（TV）：标题播放键 → 智能续播（没看过=第1集；看过未看完=该集+进度；
-    # 已看完=下一集）。返回该集的 play info，后续 stream/play 都按集走。
-    if inj.is_tv(brief):
-        ep_guids = store.tv_episode_guids(guid)
-        if ep_guids:
-            target_eg, resume_ts = history.resume_episode(ep_guids)
-            if target_eg:
-                ep = store.get_episode(target_eg)
-                if ep:
-                    info = inj.episode_play_info(ep)
-                    info["ts"] = resume_ts
-                    _prewarm_from_info(info)
-                    return JSONResponse({"code": 0, "msg": "", "data": info})
-    info = inj.play_info(brief)
-    if rec:
-        info["ts"] = rec.get("ts", 0)  # 续播位置（秒），播放器据此恢复
+    info = _online_play_info(guid, request)
+    if info is None:
+        return await forward_upstream(request)
     _prewarm_from_info(info)
-    return JSONResponse({"code": 0, "msg": "", "data": info})
+    return JSONResponse({"code": 0, "msg": "",
+                         "data": clientmod.normalize_detail(info, client)})
 
 
 def _line_choices(target: dict) -> list[dict]:
@@ -1909,9 +2099,7 @@ async def direct_proxy(mg: str, request: Request):
         r = await ext_client(request).send(req, stream=True)
     except Exception as exc:
         return Response(f"direct fail {type(exc).__name__}", status_code=502)
-    drop = {"content-length", "content-encoding", "transfer-encoding",
-            "connection", "content-security-policy"}
-    h = {k: v for k, v in r.headers.items() if k.lower() not in drop}
+    h = _safe_response_headers(r.headers, {"content-security-policy"})
     h["Access-Control-Allow-Origin"] = "*"
 
     async def pump():
@@ -2003,16 +2191,16 @@ async def play_list(request: Request):
 
     # 在线历史按最近播放排序，置顶；按 guid 与官方去重
     online_items.sort(key=lambda x: x.get("_updated_at", 0), reverse=True)
-    seen = {x.get("guid") for x in local_items}
-    merged = online_items + [x for x in local_items if x.get("guid") not in
-                             {o["guid"] for o in online_items}]
+    online_guids = {x.get("guid") for x in online_items}
+    local_only = [x for x in local_items if x.get("guid") not in online_guids]
     # 剥掉私有字段
     for o in online_items:
         o.pop("_online", None)
         o.pop("_updated_at", None)
         o.pop("_year", None)
-    return JSONResponse({"code": 0, "msg": "", "data": merged},
-                        headers={"Content-Type": "application/json; charset=utf-8"})
+    online_items = clientmod.normalize_cards(online_items, _client_of(request))
+    return JSONResponse({"code": 0, "msg": "", "data": online_items + local_only},
+        headers={"Content-Type": "application/json; charset=utf-8"})
 
 
 # media/p 的 RPC（quit/checkPlayLink 等）对在线 playLink 直接回 succ
@@ -2072,6 +2260,10 @@ async def _await_pending_chart(mg: str) -> str:
 def _seg_url(mg: str, absolute: str, qs: str = "") -> str:
     suffix = f"&{qs}" if qs else ""
     return f"{ONLINE_PREFIX}/{mg}/seg?u={b64e(absolute)}{suffix}"
+
+
+
+
 
 
 
@@ -2394,11 +2586,10 @@ async def hls_seg(mg: str, request: Request):
                 unwrapped = True
         except Exception:
             pass
-    drop = ["content-length", "content-encoding", "transfer-encoding",
-            "connection", "content-security-policy"]
+    drop = {"content-security-policy"}
     if unwrapped:
-        drop.append("content-type")
-    h = {k: v for k, v in r.headers.items() if k.lower() not in drop}
+        drop.add("content-type")
+    h = _safe_response_headers(r.headers, drop)
     h["Access-Control-Allow-Origin"] = "*"
     h["Content-Length"] = str(len(body))
     if unwrapped or "content-type" not in {k.lower() for k in h}:
@@ -2485,14 +2676,87 @@ def _up_status() -> str:
 
 # ------------------------------------------------------------- 管理 API
 
+@app.get("/v/api/ext/whoami")
+async def ext_whoami(request: Request):
+    """回显当前请求被判定为哪种客户端，供在出问题的设备上打开管理台自检。"""
+    cl = _client_of(request)
+    return {"code": 0, "msg": "", "data": {
+        "kind": cl.kind, "label": cl.label, "is_tv": cl.is_tv,
+        "is_mobile": cl.is_mobile, "is_web": cl.is_web,
+        "strict_card": cl.strict_card,
+        "ua": request.headers.get("user-agent", "")}}
+
+
+@app.get("/v/api/ext/live")
+async def ext_live(request: Request):
+    """实时播放诊断：各端最近请求、当前播放会话、转发来源与错误。"""
+    return {"code": 0, "msg": "", "data": livemod.snapshot()}
+
+
+@app.post("/v/api/ext/live/clear")
+async def ext_live_clear(request: Request):
+    livemod.reset()
+    return {"code": 0, "msg": "", "data": True}
+
+
 @app.get("/v/api/ext/status")
 async def ext_status(request: Request):
+    overrides = config.get().get("source_priority") or {}
+    priorities = {s["id"]: providers.source_priority(s, overrides)
+                  for s in config.all_sources()}
     return {"ok": True,
             "config": {k: v for k, v in config.get().items() if k != "admin_token"},
+            "source_priority": priorities,
             "cached_titles": len(store._titles),
             "hot": hot_cache.status(),
             "charts": chart_cache.status(),
             "catalog": catalog.status()}
+
+
+@app.post("/v/api/ext/source/priority")
+async def ext_source_priority(request: Request):
+    body = await request.json()
+    mapping = body.get("priority") if isinstance(body.get("priority"), dict) else body
+    ok, msg = config.set_source_priority(mapping if isinstance(mapping, dict) else {})
+    if "prefer_quality_source" in body:
+        config.save({"prefer_quality_source": bool(body["prefer_quality_source"])})
+    return {"code": 0 if ok else 400, "msg": msg,
+            "data": {"source_priority": config.source_priorities()}}
+
+
+def _virtual_lib_list() -> list[dict]:
+    """供管理台展示的虚拟媒体库清单（热门四库 / 海量四库），含开关与置顶态。"""
+    out = []
+    for cat, title, _c in chartmod.CHART_CATEGORIES:
+        out.append({"guid": CHART_LIB_GUIDS[cat], "title": title,
+                    "group": "hot", "enabled": charts_enabled(),
+                    "count": len(chart_cache.items(cat))})
+    for cat, title, _c in catalogmod.CATALOG_CATEGORIES:
+        out.append({"guid": CATALOG_LIB_GUIDS[cat], "title": title,
+                    "group": "catalog", "enabled": catalog_enabled() and catalog.available(cat),
+                    "count": catalog.total(cat) if catalog.available(cat) else 0})
+    pinned = config.pinned_lib_guids()
+    for d in out:
+        d["pinned"] = d["guid"] in pinned
+    return out
+
+
+@app.get("/v/api/ext/libs")
+async def ext_libs(request: Request):
+    return {"code": 0, "msg": "", "data": {
+        "hot_enabled": charts_enabled(),
+        "catalog_enabled": catalog_enabled(),
+        "libs": _virtual_lib_list()}}
+
+
+@app.post("/v/api/ext/lib/pin")
+async def ext_lib_pin(request: Request):
+    body = await request.json()
+    guid = str(body.get("guid") or "")
+    on = bool(body.get("pinned"))
+    ok, msg = config.set_lib_pinned(guid, on)
+    return {"code": 0 if ok else 400, "msg": msg,
+            "data": {"pinned_libs": sorted(config.pinned_lib_guids())}}
 
 
 @app.post("/v/api/ext/hot/refresh")
@@ -2531,6 +2795,8 @@ async def ext_set_config(request: Request):
         "max_per_keyword", "filter_junk", "junk_keywords", "online_first",
         "hot_library_enabled", "hot_library_title", "hot_limit",
         "hot_per_source", "hot_pages_per_source", "hot_refresh_interval",
+        "catalog_library_enabled",
+        "prefer_quality_source",
     }
     patch = {k: v for k, v in body.items() if k in allowed}
     if "hot_library_title" in patch:
@@ -2782,6 +3048,11 @@ async def ext_import_tvbox(request: Request):
 async def admin_page():
     from admin_ui import ADMIN_HTML
     return Response(ADMIN_HTML, media_type="text/html; charset=utf-8")
+
+
+
+
+
 
 
 # ------------------------------------------------------------- 兜底透传

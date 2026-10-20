@@ -32,6 +32,7 @@ DEFAULT_SOURCES: list[dict] = [
     {"id": "s360", "name": "360资源", "api": "https://360zy.com/api.php/provide/vod/at/json", "enabled": False},
 ]
 
+
 HTTP_TIMEOUT = 12.0
 _DIRECT_RE = re.compile(r"^https?://", re.I)
 _MEDIA_RE = re.compile(r"\.(m3u8|mp4|flv|mkv|ts)(\?|$)", re.I)
@@ -303,6 +304,11 @@ async def probe_source(api: str, keyword: str = "庆余年",
                 "sample": "", "error": "无返回结果"}
     return {"ok": True, "status": 200, "elapsed_ms": ms,
             "count": len(lst), "direct": direct, "sample": sample, "error": ""}
+
+
+
+
+
 
 
 

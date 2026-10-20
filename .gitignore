@@ -29,3 +29,22 @@ dist/
 
 # 客户端安装包（仅本地分析，不入库）
 *.apk
+
+# catvod 私有凭证（仅完整版本地，公开剥离删除）
+/proxy/catvod.local.json
+
+# 完整版私有爬虫运行时（公开构建剥离；切勿提交到公开仓库）
+/proxy/catvod.py
+/proxy/drpy.py
+/proxy/guard.py
+/proxy/runner_client.py
+/proxy/assets/catvod/
+/proxy/assets/drpy/
+/proxy/assets/guard/
+# 用户导入的 TVBox 加固源配置（私有，含第三方 ext/凭证，绝不入库）
+/proxy/assets/guard/imported.json
+/spider-runner/
+
+# 论坛发布草稿（本地，不入库）
+/FORUM_POST*.md
+/FORUM_RELEASE_*.md

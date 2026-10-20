@@ -3,9 +3,9 @@
 
 本仓库维护一份源码，产出两种构建：
 
-* **完整构建**：含全部能力（DDUO / ADULT 两个可选特性开启）。
+* **完整构建**：含全部能力（DDUO / ADULT / CATVOD 等可选特性开启）。
 * **公开构建**：由 `tools/public_strip.py` 在打包时删除标记块与相关专有
-  文件，并把下面的开关区块改写为关闭态；产物中不含这两个特性的任何代码
+  文件，并把下面的开关区块改写为关闭态；产物中不含这些特性的任何代码
   或第三方资产。
 
 硬红线（涉未成年人性化、非自愿内容的永久屏蔽）**不属于**可剥离特性，
@@ -27,10 +27,13 @@ from __future__ import annotations
 # 可选特性在公开构建中均关闭
 DDUO = False
 ADULT = False
+CATVOD = False
+DRPY = False
+GUARD = False
 
 # 无论何种构建都恒为真的安全红线开关（仅用于语义清晰，不参与剥离）
 REDLINE = True
 
 
 def names() -> tuple[str, ...]:
-    return ("DDUO", "ADULT")
+    return ("DDUO", "ADULT", "CATVOD", "DRPY", "GUARD")

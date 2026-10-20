@@ -8,7 +8,7 @@
 - type 0（XML）的苹果CMS站点（接口地址在播放链路上可被识别）。
 
 明确不支持、直接跳过：
-- type 3 Spider（csp_*，依赖 Android jar/drpy JS 爬虫）；
+- type 3 Spider（csp_*，依赖 Android jar/JS 爬虫运行时）；
 - 网盘（夸克/阿里/115/百度/UC 等）、嗅探解析、直播/电台源；
 - 加密且无法解出 JSON 的强混淆订阅。
 
@@ -35,7 +35,7 @@ _CMS_PATH = re.compile(r"/provide/vod", re.I)
 _SKIP_NAME = re.compile(r"(直播|电台|广播|iptv|卫视|央视|体育直播)", re.I)
 _PAN_HINT = re.compile(r"(quark|uc\.cn|aliyundrive|alipan|115|baidupcs|pan\.baidu|"
                        r"weiyun|xunlei|cloud189|ctfile|c189)", re.I)
-_SPIDER_PREFIX = ("csp_", "csp_App", "drpy", "py_", "java_", "sp_")
+_SPIDER_PREFIX = ("csp_", "csp_App", "py_", "java_", "sp_")
 
 
 def _b64_try(text: str) -> str | None:

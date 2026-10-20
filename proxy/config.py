@@ -29,13 +29,22 @@ DEFAULTS = {
     "junk_keywords": JUNK_KEYWORDS,
     # 在线资源前排展示（在线片库更齐全，默认前排）
     "online_first": True,
-    # 虚拟“在线热门”分类媒体库（深度爬取：每源多页、跨源聚合去重）
+    # 虚拟“热门榜单”四库媒体库（豆瓣真实周榜/标签榜）
     "hot_library_enabled": True,
+    # 虚拟“海量分类”四库媒体库（苹果 CMS 分类深翻）。与热门榜单相互独立开关。
+    "catalog_library_enabled": True,
+    # 置顶的虚拟媒体库 guid 集合（打开=在飞牛影视媒体库列表置顶，关闭=普通顺序）。
+    "pinned_libs": [],
     "hot_library_title": "🌐在线热门",
     "hot_limit": 300,          # 四库合计保留条数上限
     "hot_per_source": 120,    # 每个资源站最多抓取的可播条目
     "hot_pages_per_source": 6,  # 每个资源站翻“最近更新”的页数（每页约20条）
     "hot_refresh_interval": 6 * 3600,
+    # 源质量优先级：source_id -> 权重（越高越优先）。未列出的源取内省默认（见
+    # providers.source_priority）。热门榜单点击搜源时按 (优先级, 直链数) 排序。
+    "source_priority": {},
+    # 热门资源解析是否优先高质量源（关闭则只按可播直链数）
+    "prefer_quality_source": True,
     "admin_token": "",
 }
 
@@ -49,6 +58,7 @@ class Config:
         self._cfg: dict = {}
         self._mtime = 0
         self.load()
+
 
     def load(self):
         with _LOCK:
@@ -181,6 +191,26 @@ class Config:
             self._persist(cfg)
             return True, sid
 
+    def source_priorities(self) -> dict:
+        with _LOCK:
+            return dict(self.get().get("source_priority") or {})
+
+    def set_source_priority(self, mapping: dict) -> tuple[bool, str]:
+        """整体保存源优先级（id -> 整数权重），忽略未知源与非法值。"""
+        with _LOCK:
+            cfg = self.get()
+            valid = {s["id"] for s in cfg["sources"]}
+            out = {}
+            for k, v in (mapping or {}).items():
+                if k in valid:
+                    try:
+                        out[k] = max(-100, min(100, int(v)))
+                    except (TypeError, ValueError):
+                        continue
+            cfg["source_priority"] = out
+            self._persist(cfg)
+            return True, "ok"
+
     def set_standalone(self, sid: str, on: bool) -> tuple[bool, str]:
         with _LOCK:
             cfg = self.get()
@@ -188,6 +218,29 @@ class Config:
             if not target:
                 return False, "源不存在"
             target["standalone"] = bool(on)
+            self._persist(cfg)
+            return True, "ok"
+
+    def pinned_lib_guids(self) -> set:
+        with _LOCK:
+            try:
+                return set(self.get().get("pinned_libs") or [])
+            except TypeError:
+                return set()
+
+    def set_lib_pinned(self, guid: str, on: bool) -> tuple[bool, str]:
+        """置顶/取消置顶某个虚拟媒体库（guid）。"""
+        if not isinstance(guid, str) or not guid:
+            return False, "guid 非法"
+        with _LOCK:
+            cfg = self.get()
+            cur = [g for g in (cfg.get("pinned_libs") or []) if isinstance(g, str)]
+            if on:
+                if guid not in cur:
+                    cur.append(guid)
+            else:
+                cur = [g for g in cur if g != guid]
+            cfg["pinned_libs"] = cur
             self._persist(cfg)
             return True, "ok"
 

@@ -29,8 +29,31 @@ rsync -a --delete \
   --exclude='.venv/' --exclude='__pycache__/' --exclude='*.pyc' \
   --exclude='.git/' --exclude='dist/' --exclude='logs/' \
   --exclude='state/' --exclude='packaging/fpk/.build/' \
-  --exclude='.release/' --exclude='*.fpk' --exclude='*.apk' --exclude='.DS_Store' \
+  --exclude='.release/' --exclude='*.fpk' --exclude='.DS_Store' \
+  --exclude='/proxy/assets/guard/guard.jar' \
+  --exclude='/proxy/assets/guard/sites.json' \
+  --exclude='/proxy/assets/guard/imported.json' \
+  --exclude='/FORUM_POST.md' \
+  --exclude='/FORUM_POST_CHANGELOG.md' \
+  --exclude='/FORUM_RELEASE_*.md' \
+  --exclude='/RELEASING.md' \
   "${REPO_ROOT}/" "${STAGE}/app/repo/"
+
+
+# 分发版不携带维护者私用的加固源目录/加固 jar/小雅凭证：由用户在管理页自行添加。
+# 保留空目录占位，避免首启写文件时缺目录。
+mkdir -p "${STAGE}/app/repo/proxy/assets/guard"
+: > "${STAGE}/app/repo/proxy/assets/guard/.gitkeep"
+# 维护者个人本地配置（含网盘账号）不进任何分发包。
+LOCAL_CFG="local.json"
+rm -f "${STAGE}/app/repo/proxy/"*"${LOCAL_CFG}"
+
+# 清洗【分发包内】CHANGELOG：去除维护者私源名、内置 jar 路径、限制级能力描述。
+# 仅改暂存副本，源码 CHANGELOG.md 保留完整开发记录。
+if [ -f "${STAGE}/app/repo/tools/sanitize_changelog.py" ]; then
+  "${PYTHON:-python3}" "${STAGE}/app/repo/tools/sanitize_changelog.py" \
+    "${STAGE}/app/repo/CHANGELOG.md"
+fi
 
 # 公开构建：从暂存副本移除可选特性（非标准源适配 / 扩展分类）。
 # 全功能源码树里有构建剥离器时执行剥离；若工作树本身已是公开树

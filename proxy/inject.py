@@ -240,7 +240,10 @@ def episode_list(b: dict) -> list[dict]:
     import store as _st
     guid = b["guid"]
     line = _st.store.best_line(guid)
-    eps = [e for e in b["lines"][line] if e.get("direct")]
+    # 必须与 store._direct_eps 的过滤完全一致（direct 或可按需解析的 resolve 页），
+    # 否则 episode/list 的第 i 张卡与 store 用同一 episode_guid(guid,"",i) 建立的
+    # 集索引错位：点第 k 集播另一集，甚至 404。
+    eps = [e for e in b["lines"][line] if e.get("direct") or e.get("resolve")]
     out = []
     for i, e in enumerate(eps):
         eg = episode_guid(guid, "", i)  # 集身份不绑定线路
@@ -419,6 +422,8 @@ def history_item(brief: dict, rec: dict, ep: dict | None = None) -> dict:
             ep_video_guid(item_guid) if is_ep else video_guid(item_guid)),
         "subtitle_guid": rec.get("subtitle_guid", "") or "_no_display_",
         "file_name": "",
+        # TV(Flutter) 列表模型要求 path，缺失会让整页“加载失败”（继续观看也是列表）
+        "path": "",
         "_online": True,
         "_updated_at": rec.get("updated_at", 0),
         "_year": year,
