@@ -581,7 +581,18 @@ async def ext_get_retry(req: Request, url: str, headers: dict | None = None,
 # 透传上游响应头时必须丢弃的 hop-by-hop / 会与本代理冲突的头。
 _HOP_HEADERS = {"connection", "content-length", "content-encoding",
                 "transfer-encoding", "keep-alive", "upgrade", "proxy-authenticate",
-                "proxy-authorization", "te", "trailers", "host"}
+                "proxy-authorization", "te", "trailers", "host",
+                # server/date 由本服务 uvicorn 自行生成；透传上游会出现重复的
+                # server/date 同名头，移动/TV 严格播放器可能判为非法响应（http error）。
+                "server", "date"}
+# 上游资源站常自带 CORS 头；若再叠加我们的 ACAO，会产生重复 Access-Control-* 头，
+# 属于非法响应（同名头出现多次且可能取值冲突）。Web 端通常容忍，但移动/TV 的严格
+# 播放器会直接判 “http error”。统一丢弃上游 CORS 头，由本服务单点签发。
+_UPSTREAM_CORS_HEADERS = {
+    "access-control-allow-origin", "access-control-allow-methods",
+    "access-control-allow-headers", "access-control-allow-credentials",
+    "access-control-max-age", "access-control-expose-headers",
+}
 
 
 def _safe_response_headers(src, drop: "set[str] | None" = None) -> "dict[str, str]":
@@ -593,7 +604,7 @@ def _safe_response_headers(src, drop: "set[str] | None" = None) -> "dict[str, st
     这里：①丢 hop-by-hop 与调用方指定头；②值无法 latin-1 编码的头一律丢弃
     （Content-Disposition 对解码无意义），绝不因一个头毁掉整个播放响应。
     """
-    blocked = _HOP_HEADERS | (drop or set())
+    blocked = _HOP_HEADERS | _UPSTREAM_CORS_HEADERS | (drop or set())
     out: dict[str, str] = {}
     for k, v in src.items():
         if k.lower() in blocked:
@@ -2750,10 +2761,50 @@ async def _build_playlist_body(mg: str, picked: dict, request: Request):
     sel_qs = ""
     if picked.get("line"):
         sel_qs = f'line={urllib.parse.quote(picked["line"])}&index={picked["index"]}'
+
+    # AES-128 加密 HLS：部分移动/TV 原生播放器拉到密钥后无法正确解密（报 http error）。
+    # 在服务端取一次密钥，改写每个分片的 IV/密钥参数，由 /seg 统一解密后回传纯 TS，
+    # 并从输出列表删除 EXT-X-KEY，彻底规避端侧 AES 兼容差异。
+    decrypt_key: bytes | None = None
+    explicit_iv: bytes | None = None
+    key_marker = next((ln for ln in text.splitlines()
+                       if ln.strip().startswith("#EXT-X-KEY")
+                       and "METHOD=AES-128" in ln), "")
+    if key_marker:
+        try:
+            import quality as _quality
+            parsed = await _quality._parse_hls_key(
+                ext_client(request), text, cur, headers)
+            if parsed:
+                decrypt_key, explicit_iv = parsed
+        except Exception:
+            decrypt_key = None
+
+    media_seq = 0
+    mm = re.search(r"#EXT-X-MEDIA-SEQUENCE:\s*(\d+)", text)
+    if mm:
+        media_seq = int(mm.group(1))
+    seg_index = 0
     out_lines = []
+
+    def seg_decrypt_qs() -> str:
+        iv = explicit_iv if explicit_iv is not None else (
+            (media_seq + seg_index).to_bytes(16, "big"))
+        return f"dec=1&k={b64e(decrypt_key.hex())}&iv={b64e(iv.hex())}"
+
     for raw in text.splitlines():
         line = raw.strip()
-        if line.startswith("#EXT-X-KEY") or line.startswith("#EXT-X-MAP"):
+        if line.startswith("#EXT-X-KEY") and decrypt_key is not None:
+            # 服务端已解密：客户端无需也不能再拿到密钥标签
+            continue
+        if line.startswith("#EXT-X-MAP") and decrypt_key is not None:
+            def repl_map(m):
+                uri = m.group(1)
+                absu = urllib.parse.urljoin(cur, uri)
+                return f'URI="{_seg_url(mg, absu, sel_qs)}"'
+            raw = re.sub(r'URI="([^"]+)"', repl_map, raw)
+            out_lines.append(raw)
+        elif line.startswith("#EXT-X-KEY") or line.startswith("#EXT-X-MAP"):
             def repl(m):
                 uri = m.group(1)
                 absu = urllib.parse.urljoin(cur, uri)
@@ -2763,7 +2814,13 @@ async def _build_playlist_body(mg: str, picked: dict, request: Request):
         elif line.startswith("#") or not line:
             out_lines.append(raw)
         else:
-            out_lines.append(_seg_url(mg, urllib.parse.urljoin(cur, line), sel_qs))
+            if decrypt_key is not None:
+                parts = [p for p in (sel_qs, seg_decrypt_qs()) if p]
+                extra = "&".join(parts)
+            else:
+                extra = sel_qs
+            out_lines.append(_seg_url(mg, urllib.parse.urljoin(cur, line), extra))
+            seg_index += 1
     return "\n".join(out_lines) + "\n", cur
 
 
@@ -2995,6 +3052,24 @@ async def hls_main(mg: str, request: Request):
                              "Access-Control-Allow-Origin": "*"})
 
 
+def _cors_preflight() -> Response:
+    """播放路径的 CORS 预检：移动/TV 等跨域客户端在拉 m3u8/seg/key 前可能先发
+    OPTIONS。必须由本服务直接应答标准 CORS 头，不能兜底透传给官方后端（后者不带
+    CORS 头，会导致客户端判定跨域失败、报 http error）。"""
+    return Response(status_code=204, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Max-Age": "3600",
+        "Content-Length": "0",
+    })
+
+
+@app.options(f"{ONLINE_PREFIX}/{{rest:path}}")
+async def hls_cors_preflight(rest: str):
+    return _cors_preflight()
+
+
 @app.get(f"{ONLINE_PREFIX}/{{mg}}/seg")
 async def hls_seg(mg: str, request: Request):
     u = request.query_params.get("u", "")
@@ -3007,7 +3082,10 @@ async def hls_seg(mg: str, request: Request):
     headers = picked["headers"] if picked else {}
     # 透传 Range（播放器 seek）
     fwd = dict(headers)
-    if "range" in request.headers:
+    # 加密 HLS 由本服务解密：不能按密文转发任意字节 Range，需完整拉取后回传纯 TS。
+    if request.query_params.get("dec") == "1":
+        fwd.pop("Range", None)
+    if "range" in request.headers and request.query_params.get("dec") != "1":
         fwd["Range"] = request.headers["range"]
     try:
         # 分片在播放中途持续拉取，对瞬时抖动必须重试，否则单次失败播放器直接报错
@@ -3017,6 +3095,22 @@ async def hls_seg(mg: str, request: Request):
                      urllib.parse.urlsplit(src_url).netloc)
         return Response(f"seg fail {type(exc).__name__}", status_code=502)
     body = r.content
+    # 服务端解密 AES-128 HLS 分片：m3u8 已移除 EXT-X-KEY，这里把密文 TS 解成纯 TS，
+    # 并强制按完整 200 内容返回（密文 206 不能直接解密/拼接）。
+    decrypt_resp_status = r.status_code
+    if request.query_params.get("dec") == "1":
+        try:
+            import quality as _quality
+            key = bytes.fromhex(b64d(request.query_params.get("k", "")))
+            ivhex = b64d(request.query_params.get("iv", ""))
+            iv = bytes.fromhex(ivhex)
+            if len(key) == 16 and len(iv) == 16:
+                dec = await _quality._aes_cbc_decrypt(body, key, iv)
+                if dec and len(dec) >= 188 and dec[0] == 0x47:
+                    body = dec
+                    decrypt_resp_status = 200
+        except Exception as exc:
+            _log.warning("seg decrypt fail: %s", type(exc).__name__)
     ctype = r.headers.get("content-type", "")
     unwrapped = False
     # 部分源把真实 TS 分片伪装成「1×1 PNG 头 + TS」。剥掉 PNG 外壳
@@ -3032,6 +3126,10 @@ async def hls_seg(mg: str, request: Request):
         except Exception:
             pass
     drop = {"content-security-policy"}
+    if request.query_params.get("dec") == "1":
+        # 已在服务端解密并返回完整纯 TS：旧的 Range/content-range 必须移除，
+        # 否则严格客户端会因 200 + Content-Range/Accept-Ranges 语义矛盾拒绝该分片。
+        drop.update({"content-range", "accept-ranges"})
     if unwrapped:
         drop.add("content-type")
     h = _safe_response_headers(r.headers, drop)
@@ -3042,7 +3140,7 @@ async def hls_seg(mg: str, request: Request):
     if r.status_code in _RETRY_STATUS:
         _log.warning("seg upstream %s %s", r.status_code,
                      urllib.parse.urlsplit(src_url).netloc)
-    return Response(content=body, status_code=r.status_code, headers=h)
+    return Response(content=body, status_code=decrypt_resp_status, headers=h)
 
 
 # ------------------------------------------------------------- 海报代理
