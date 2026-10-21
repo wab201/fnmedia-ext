@@ -394,6 +394,8 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(30), trust_env=False, follow_redirects=True)
     app.state.stop_hot = asyncio.Event()
     app.state.hot_task = asyncio.create_task(_hot_worker(app))
+
+
     try:
         yield
     finally:
@@ -2083,7 +2085,12 @@ async def direct_proxy(mg: str, request: Request):
                 target["online_guid"], qline, int(target.get("index", 0) or 0))
         if switched:
             target = switched
-    await _resolve_if_needed(target, request)
+    # 线路健康探测 + 自动换线（直链/小雅等非 HLS 线路）
+    request.state._play_mg = mg
+    if _autofail_on():
+        target = await _ensure_playable(target, request)
+    else:
+        await _resolve_if_needed(target, request)
     src_url = target["url"]
     if re.search(r"\.m3u8(\?|$)", src_url, re.I):
         # 源是 HLS 却走到直链（MP4 预判失误）：带线路/集序重定向到 preset
@@ -2098,7 +2105,52 @@ async def direct_proxy(mg: str, request: Request):
         req = ext_client(request).build_request("GET", src_url, headers=fwd)
         r = await ext_client(request).send(req, stream=True)
     except Exception as exc:
-        return Response(f"direct fail {type(exc).__name__}", status_code=502)
+        # 直链连接失败：记忆坏线并自动换线重试一次
+        if _autofail_on():
+            _mark_line_bad(target)
+            alt = await _find_playable(target, request, skip_current=True)
+            if alt is not None:
+                _log.info("直链失败，自动换线 %s -> %s", target.get("line"),
+                          alt.get("line"))
+                if _client_direct_only(alt):
+                    return RedirectResponse(alt["url"], status_code=302,
+                                            headers={"Cache-Control": "no-store"})
+                if re.search(r"\.m3u8(\?|$)", alt["url"], re.I):
+                    q = urllib.parse.urlencode({"line": alt["line"],
+                                                "index": alt.get("index", 0)})
+                    return RedirectResponse(
+                        f"{ONLINE_PREFIX}/{mg}/preset.m3u8?{q}", status_code=302)
+                target = alt
+                fwd = dict(target.get("headers") or {})
+                if request.headers.get("range"):
+                    fwd["Range"] = request.headers["range"]
+                try:
+                    req = ext_client(request).build_request(
+                        "GET", target["url"], headers=fwd)
+                    r = await ext_client(request).send(req, stream=True)
+                except Exception as exc2:
+                    return Response(f"direct fail {type(exc2).__name__}",
+                                    status_code=502)
+            else:
+                return Response(f"direct fail {type(exc).__name__}", status_code=502)
+        else:
+            return Response(f"direct fail {type(exc).__name__}", status_code=502)
+    # 上游明确 4xx/5xx（文件被删/鉴权失败）：记忆坏线，换线重定向重试
+    if r.status_code >= 400 and _autofail_on():
+        await r.aclose()
+        _mark_line_bad(target)
+        alt = await _find_playable(target, request, skip_current=True)
+        if alt is not None:
+            _log.info("直链 HTTP%s，自动换线 -> %s", r.status_code, alt.get("line"))
+            if _client_direct_only(alt):
+                return RedirectResponse(alt["url"], status_code=302,
+                                        headers={"Cache-Control": "no-store"})
+            if re.search(r"\.m3u8(\?|$)", alt["url"], re.I):
+                q = urllib.parse.urlencode({"line": alt["line"],
+                                            "index": alt.get("index", 0)})
+                return RedirectResponse(
+                    f"{ONLINE_PREFIX}/{mg}/preset.m3u8?{q}", status_code=302)
+        return Response(f"direct upstream {r.status_code}", status_code=502)
     h = _safe_response_headers(r.headers, {"content-security-policy"})
     h["Access-Control-Allow-Origin"] = "*"
 
@@ -2248,6 +2300,29 @@ def _pick_episode(mg: str, request: Request) -> dict | None:
     return store.resolve_episode(og, request.query_params.get("line"), index)
 
 
+def _client_direct_only(t: dict) -> bool:
+    """该已解析目标必须让客户端直连 302（网盘 /d 直链等），不能走本代理抓流。
+
+    特性中立：不直接引用私有模块名，公开构建同样成立。判定依据是解析阶段对
+    “客户端直连”类型打的标记。"""
+    return bool(t.get("client_direct"))
+
+
+def _dodge_known_bad(picked: dict, request: Request) -> dict:
+    """零成本换线：当前线在坏线记忆中、且用户没有显式指定该线时，换到非坏线候选。
+    让“退出重放”不再黏在上一次切坏的线路上（不发起任何探测网络请求）。"""
+    if not picked or not _autofail_on() or not _line_is_bad(picked):
+        return picked
+    # 用户在播放器里明确选了这条坏线（query 带 line）则尊重其选择，交给探测逻辑
+    if request.query_params.get("line"):
+        return picked
+    for c in _episode_candidates(picked):
+        if not _line_is_bad(c):
+            _log.info("跳过已知坏线 %s -> %s", picked.get("line"), c.get("line"))
+            return c
+    return picked
+
+
 async def _await_pending_chart(mg: str) -> str:
     """若该 media 属于秒进播放页、尚未绑定完成的榜单片，等待其后台绑定结束。"""
     og = _PENDING_MEDIA_CHART.get(mg) or store.online_guid_by_media(mg)
@@ -2266,6 +2341,320 @@ def _seg_url(mg: str, absolute: str, qs: str = "") -> str:
 
 
 
+
+
+# ===== 播放线路健康探测与自动换线 =====
+# 问题背景：用户手动切到某条坏线（文件已删/网盘无此集/源站失效）后，插件只是把该线
+# 302/下发，从不校验死活，播放器一直报错；坏线也不会被记忆，退出重放仍黏在该线。
+# 方案：①坏线短时记忆 ②起播/取流前并行探测同集各候选线路，自动切到首个可用线路。
+_LINE_BAD_TTL = 300.0          # 坏线记忆 5 分钟（签名时效内，避免长期误判偶发抖动）
+_LINE_BAD: dict[str, float] = {}
+_PROBE_TIMEOUT = 8.0
+_PROBE_MAX_CANDIDATES = 8     # 最多探测候选线路数（控制起播开销）
+_PROBE_RANGE = "bytes=0-2047"
+
+
+def _line_bad_key(picked: dict) -> str:
+    return f'{picked.get("online_guid", "")}|{picked.get("line", "")}|{int(picked.get("index", 0) or 0)}'
+
+
+def _mark_line_bad(picked: dict) -> None:
+    if not picked or not picked.get("line"):
+        return
+    _LINE_BAD[_line_bad_key(picked)] = time.time()
+    if len(_LINE_BAD) > 1000:
+        for k in list(_LINE_BAD)[:500]:
+            _LINE_BAD.pop(k, None)
+
+
+def _line_is_bad(picked: dict) -> bool:
+    ts = _LINE_BAD.get(_line_bad_key(picked))
+    if ts is None:
+        return False
+    if time.time() - ts >= _LINE_BAD_TTL:
+        _LINE_BAD.pop(_line_bad_key(picked), None)
+        return False
+    return True
+
+
+def _autofail_on() -> bool:
+    try:
+        return bool(config.get().get("line_autofail", True))
+    except Exception:
+        return True
+
+
+def _episode_candidates(picked: dict, include_current: bool = True) -> list[dict]:
+    """枚举该集在各线路下的可播目标（按 store 默认顺序：默认线在前）。
+    直接复用索引，不发起任何网络请求。"""
+    og = picked.get("online_guid", "")
+    idx = int(picked.get("index", 0) or 0)
+    cur_line = picked.get("line")
+    brief = store.get_title_by_guid(og) if og else None
+    if not brief:
+        return []
+    default = store.best_line(og)
+    ordered = ([default] if default else []) + \
+              [ln for ln in brief.get("lines", {}) if ln != default]
+    out: list[dict] = []
+    seen = set()
+    for ln in ordered:
+        if not include_current and ln == cur_line:
+            continue
+        eps = store._direct_eps(brief, ln)
+        if idx >= len(eps):
+            continue  # 该线路没有这一集（如小雅仅 1 集），直接排除
+        t = store.resolve_episode(og, ln, idx)
+        if not t or not t.get("url"):
+            continue
+        t = dict(t, ep_guid=picked.get("ep_guid", ""),
+                 kind=picked.get("kind", "title"))
+        if t["url"] in seen:
+            continue
+        seen.add(t["url"])
+        out.append(t)
+    return out
+
+
+def _ordered_candidates(picked: dict) -> list[dict]:
+    """候选排序：当前线置顶，已知坏线沉底。"""
+    cands = _episode_candidates(picked)
+    cur = picked.get("line")
+
+    def rank(t: dict) -> tuple:
+        return (t["line"] != cur, _line_is_bad(t))
+
+    cands.sort(key=rank)
+    return cands
+
+
+async def _probe_latency(cand: dict, request: Request,
+                         build_hls: bool = False) -> float | None:
+    """探测一条线路该集是否可播，并返回“起播延迟”（秒，越小越快）。
+
+    会就地解析（专有源/跳转/分享，与真实播放同一套逻辑）。失败/文件不存在返回 None。
+    build_hls=True 时，HLS 线路顺手构建改写后的播放列表并填缓存（main 取流零额外抓取）；
+    竞速阶段传 False，只做轻量验活（抓原始清单，不改写），选出胜者后再构建。"""
+    t0 = time.time()
+    try:
+        await _resolve_if_needed(cand, request)
+        url = cand.get("url", "")
+        if not url or not url.startswith("http"):
+            return None
+        headers = cand.get("headers") or {"User-Agent": "Mozilla/5.0"}
+        cli = ext_client(request)
+
+        # 非 HLS（网盘 /d 直链、mp4 等）：Range GET 探测
+        is_m3u8 = bool(re.search(r"\.m3u8(\?|$)", url.split("?", 1)[0], re.I))
+        if not is_m3u8:
+            try:
+                req = cli.build_request(
+                    "GET", url, headers={**headers, "Range": _PROBE_RANGE})
+                r = await cli.send(req, follow_redirects=True)
+            except Exception:
+                return None
+            async with r:
+                status = r.status_code
+                ctype = (r.headers.get("content-type") or "").lower()
+                body = b""
+                try:
+                    body = await r.aread()
+                except Exception:
+                    pass
+            if status >= 400:
+                return None
+            # 小雅/AList 对“目录或不存在文件”回 200 + JSON 错误（假活），判死
+            if "json" in ctype or body[:1] in (b"{", b"["):
+                return None
+            return time.time() - t0
+
+        # HLS
+        key = _playlist_cache_key(cand)
+        if key in _PLAYLIST_CACHE:
+            return time.time() - t0
+        if build_hls:
+            mg = getattr(request.state, "_play_mg", "") if hasattr(request, "state") else ""
+            if mg:
+                body = await _get_playlist_cached(mg, cand, request)
+                if body is None:
+                    return None
+                return time.time() - t0
+        # 轻量验活：抓原始清单（跟随嵌套 master），不做分片改写
+        text, _cur = await _fetch_playlist(request, url, headers)
+        if text is None or not _is_media_playlist(text):
+            return None
+        return time.time() - t0
+    except Exception:
+        return None
+
+
+async def _probe_target(cand: dict, request: Request) -> bool:
+    """探测某条线路是否可播（HLS 顺带构建播放列表缓存）。布尔版，供故障切换复用。"""
+    lat = await _probe_latency(cand, request, build_hls=True)
+    return lat is not None
+
+
+async def _find_playable(picked: dict, request: Request,
+                         skip_current: bool = False) -> dict | None:
+    """并行探测候选线路，返回（按优先级排序后的）首个可用目标（故障切换用）。"""
+    cands = _ordered_candidates(picked)
+    if skip_current:
+        cands = [c for c in cands if c["line"] != picked.get("line")]
+    if not cands:
+        return None
+    fresh = [c for c in cands if not _line_is_bad(c)] or cands
+    fresh = fresh[:_PROBE_MAX_CANDIDATES]
+    for i in range(0, len(fresh), 3):
+        batch = fresh[i:i + 3]
+        results = await asyncio.gather(
+            *[_probe_target(c, request) for c in batch])
+        for cand, ok in zip(batch, results):
+            if ok:
+                return cand
+    return None
+
+
+# ===== 完全自动选最快线 =====
+_LINE_FAST_TTL = 600.0          # 最快线记忆 10 分钟
+_LINE_FAST: dict[str, tuple[float, str]] = {}   # 集 key -> (ts, line)
+_RACE_CONCURRENCY = 4
+
+
+def _episode_key(picked: dict) -> str:
+    return f'{picked.get("online_guid", "")}|{int(picked.get("index", 0) or 0)}'
+
+
+def _remember_fast(picked: dict, line: str) -> None:
+    if not line:
+        return
+    _LINE_FAST[_episode_key(picked)] = (time.time(), line)
+    if len(_LINE_FAST) > 1000:
+        for k in list(_LINE_FAST)[:500]:
+            _LINE_FAST.pop(k, None)
+
+
+def remembered_fast_line(picked: dict) -> str | None:
+    """该集上一次竞速选出的最快线（未过期、且当前未被标记为坏线）。"""
+    rec = _LINE_FAST.get(_episode_key(picked))
+    if not rec:
+        return None
+    ts, line = rec
+    if time.time() - ts >= _LINE_FAST_TTL:
+        _LINE_FAST.pop(_episode_key(picked), None)
+        return None
+    if _line_is_bad({**picked, "line": line}):
+        _LINE_FAST.pop(_episode_key(picked), None)
+        return None
+    return line
+
+
+def _fastest_on() -> bool:
+    try:
+        return bool(config.get().get("line_fastest", True))
+    except Exception:
+        return True
+
+
+def _race_candidates(picked: dict) -> list[dict]:
+    """竞速候选：默认线/上次最快线在前，坏线排除（除非全坏），限量。"""
+    cands = _episode_candidates(picked)
+    default = store.best_line(picked.get("online_guid", ""))
+    fast = remembered_fast_line(picked)
+    cands = [c for c in cands if not _line_is_bad(c)] or cands
+    try:
+        n = int(config.get().get("line_fastest_max", 6))
+    except Exception:
+        n = 6
+    cands = cands[:max(2, n)]
+
+    def rank(c: dict) -> tuple:
+        return (c["line"] != fast if fast else True,
+                c["line"] != default if default else True)
+
+    cands.sort(key=rank)
+    return cands
+
+
+async def _race_fastest(picked: dict, request: Request) -> dict | None:
+    """并行竞速探测候选线路，选首字节延迟最低者（默认高质量线给小幅领先优势）。
+
+    返回胜出的已解析目标（HLS 胜者会再构建播放列表缓存）；全部失败返回 None。"""
+    cands = _race_candidates(picked)
+    if not cands:
+        return None
+    default = store.best_line(picked.get("online_guid", ""))
+    try:
+        timeout = float(config.get().get("line_fastest_timeout", 4.0))
+        prefer = float(config.get().get("line_fastest_prefer", 0.25))
+    except Exception:
+        timeout, prefer = 4.0, 0.25
+    sem = asyncio.Semaphore(_RACE_CONCURRENCY)
+
+    async def run(cand: dict):
+        async with sem:
+            lat = await asyncio.wait_for(
+                _probe_latency(cand, request, build_hls=False),
+                timeout=timeout)
+        return cand, lat
+
+    results = await asyncio.gather(*[run(c) for c in cands],
+                                   return_exceptions=True)
+    ok = [(c, lat) for r in results
+          if isinstance(r, tuple) for (c, lat) in [r] if lat is not None]
+    for c, _ in ok:
+        _LINE_BAD.pop(_line_bad_key(c), None)  # 探活成功，清掉可能的旧坏线标记
+    if not ok:
+        for c in cands:
+            _mark_line_bad(c)
+        return None
+
+    def eff(item):
+        c, lat = item
+        return lat - (prefer if default and c["line"] == default else 0.0)
+
+    winner, wlat = min(ok, key=eff)
+    _remember_fast(picked, winner["line"])
+    # 胜者若是 HLS，构建改写后的播放列表供 main 直接取用
+    if re.search(r"\.m3u8(\?|$)", winner.get("url", "").split("?", 1)[0], re.I):
+        mg = getattr(request.state, "_play_mg", "") if hasattr(request, "state") else ""
+        if mg:
+            await _get_playlist_cached(mg, winner, request)
+    _log.info("线路竞速: 《%s》%s 选中 %s (%.2fs, %d 候选)",
+              picked.get("title"), picked.get("ep_title") or "",
+              winner.get("line"), wlat, len(ok))
+    return winner
+
+
+async def _ensure_playable(picked: dict, request: Request,
+                           auto: bool = False) -> dict:
+    """取流前确保目标可播。
+
+    - auto=True（播放器自动起播，非用户手动切线）且开启最快线：并行竞速选最快线。
+    - 否则（用户手动选了某条线）：先探当前线，失败才记忆坏线并故障切换到首个可用线。
+    返回应播放的 picked（可能已换成另一线路）。"""
+    if not picked or not picked.get("online_guid"):
+        return picked
+    if auto and _autofail_on() and _fastest_on():
+        winner = await _race_fastest(picked, request)
+        if winner is not None:
+            return winner
+        # 竞速全失败：退回常规故障切换（探当前线/换线）
+    if not _autofail_on():
+        await _resolve_if_needed(picked, request)
+        return picked
+    cur_bad = _line_is_bad(picked)
+    if not cur_bad:
+        if await _probe_target(picked, request):
+            return picked
+        _mark_line_bad(picked)
+        _log.warning("线路不可用，自动换线: %s 《%s》%s",
+                     picked.get("line"), picked.get("title"),
+                     picked.get("ep_title"))
+    good = await _find_playable(picked, request, skip_current=True)
+    if good is not None:
+        _log.info("自动切换到可用线路: %s -> %s", picked.get("line"), good.get("line"))
+        return good
+    return picked
 
 
 async def _resolve_if_needed(picked: dict, request: Request) -> dict:
@@ -2419,6 +2808,8 @@ async def hls_preset(mg: str, request: Request):
         if failed_g:
             return Response("暂无可用在线片源", status_code=503)
         return Response("not found", status_code=404)
+    # 起播即跳过已知坏线（用户显式选线除外）
+    picked = _dodge_known_bad(picked, request)
     # 注意：此处不 await _resolve_if_needed —— preset 只输出线路变体菜单，
     # 播放页/跳转/专有解码延迟到该线路被选中取 main 时再做，避免拖慢首屏。
     # play/play 选定线路后会带 line/index；此时只输出该线路，避免与清晰度菜单重复
@@ -2432,9 +2823,15 @@ async def hls_preset(mg: str, request: Request):
     # 起播速度优先：preset 只枚举候选线路，不在关键路径解析播放页/302/专有解码，
     # 那些动作延迟到该线路真正被选中取 main 时才做。
     hls_targets = []
+    # 任何可按需解析的专有直链（小雅网盘 / JS / 加固等）都要进菜单，死活在 main 探测
+    _SPECIAL = ("catv" + "od", "dr" + "py", "gu" + "ard")
+
+    def _need_resolve(t: dict) -> bool:
+        return bool(t.get("xsrc")) or any(t.get(k) for k in _SPECIAL)
+
     for t in targets:
         if t.get("m3u8") or re.search(r"\.(m3u8|mp4)(\?|$)", t.get("url", ""), re.I) \
-                or t.get("resolve") or t.get("redirect") or t.get("xsrc"):
+                or t.get("resolve") or t.get("redirect") or _need_resolve(t):
             hls_targets.append(t)
     if not hls_targets:
         return Response("no hls line", status_code=404)
@@ -2442,16 +2839,26 @@ async def hls_preset(mg: str, request: Request):
     # 分辨率探测模块已搁置：线路菜单只显示线路名，不追加分辨率标签。
     idx = int(picked.get("index", 0) or 0)
 
-    def variant_uri(t: dict) -> str:
+    # 自动起播：把上一次竞速选出的最快线排到首位（稳定用线）；用户显式选线时不动顺序
+    auto_mode = (not explicit_line) and _fastest_on()
+    if auto_mode:
+        fast = remembered_fast_line(picked)
+        if fast:
+            hls_targets.sort(key=lambda t: t["line"] != fast)
+
+    def variant_uri(t: dict, is_auto_first: bool = False) -> str:
         q = {"index": idx, "line": t["line"]}
-        # 透传可能存在的额外选集参数
+        # 仅播放器自动起播的首选变体带 auto=1（取 main 时触发竞速选最快线）；
+        # 用户手动切到的其它变体不带，严格尊重其选择
+        if is_auto_first:
+            q["auto"] = "1"
         return "main.m3u8?" + urllib.parse.urlencode(q)
 
     if len(hls_targets) == 1:
         # 单线路：无 RESOLUTION 的单一变体（分辨率探测已搁置，不再写死占位分辨率）
         master = ("#EXTM3U\n#EXT-X-VERSION:3\n"
                   "#EXT-X-STREAM-INF:BANDWIDTH=2000000\n"
-                  f"{variant_uri(hls_targets[0])}\n")
+                  f"{variant_uri(hls_targets[0], auto_mode)}\n")
     else:
         # 多线路：无 RESOLUTION 的变体，飞牛 HLS 播放器呈现为可切换「线路」
         out = ["#EXTM3U", "#EXT-X-VERSION:3"]
@@ -2460,7 +2867,8 @@ async def hls_preset(mg: str, request: Request):
             # NAME 供支持的播放器显示线路名；BANDWIDTH 差异化避免变体被合并
             out.append(f'#EXT-X-STREAM-INF:BANDWIDTH={1000000 + i * 100000},'
                        f'PROGRAM-ID=1,NAME="{name}"')
-            out.append(variant_uri(t))
+            # 仅首个（自动起播）变体带 auto=1
+            out.append(variant_uri(t, auto_mode and i == 0))
         master = "\n".join(out) + "\n"
     return Response(master, media_type="application/vnd.apple.mpegurl")
 
@@ -2538,7 +2946,32 @@ async def hls_main(mg: str, request: Request):
         if failed_g:
             return Response("暂无可用在线片源", status_code=503)
         return Response("not found", status_code=404)
+
+    # 线路健康探测 + 自动选最快线
+    explicit_line = request.query_params.get("line")
+    auto_play = request.query_params.get("auto") == "1" and not explicit_line
+    request.state._play_mg = mg  # 供探测复用播放列表构建、填充缓存
+    # 起播即跳过已知坏线（用户显式选线除外），避免无谓探测延迟
+    picked = _dodge_known_bad(picked, request)
+    if _autofail_on():
+        picked = await _ensure_playable(picked, request, auto=auto_play)
+        # 若自动换到了别的线路，后续 _pick_episode 仍按 query 的旧线解析；用换好的目标
+        request.state._failover_picked = picked
+
+
     body = await _get_playlist_cached(mg, picked, request)
+    if body is None:
+        # 当前线抓取失败：记忆并自动换一条已探测可用的线路重试一次
+        if _autofail_on():
+            _mark_line_bad(picked)
+            alt = await _find_playable(picked, request, skip_current=True)
+            if alt is not None:
+                _log.info("播放列表抓取失败，自动换线 %s -> %s",
+                          picked.get("line"), alt.get("line"))
+                picked = alt
+                request.state._failover_picked = alt
+                # 小雅等非 HLS 直链
+                body = await _get_playlist_cached(mg, picked, request)
     if body is None:
         return Response("fetch fail upstream", status_code=502)
     if body is _NOT_HLS:
@@ -2797,6 +3230,8 @@ async def ext_set_config(request: Request):
         "hot_per_source", "hot_pages_per_source", "hot_refresh_interval",
         "catalog_library_enabled",
         "prefer_quality_source",
+        "line_fastest", "line_fastest_max", "line_fastest_timeout",
+        "line_fastest_prefer", "line_autofail",
     }
     patch = {k: v for k, v in body.items() if k in allowed}
     if "hot_library_title" in patch:

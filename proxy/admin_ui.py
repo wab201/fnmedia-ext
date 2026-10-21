@@ -371,6 +371,19 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
       </div>
 
       <div class="card">
+        <div class="card-title">播放线路</div>
+        <label class="switch-row"><input type="checkbox" id="lineFastest"/>
+          <span>自动选最快线路<span class="sub">起播时并行测速、自动选首字节最快的线路；同一集短时间内固定用它</span></span></label>
+        <label class="field" style="max-width:260px"><span>参与测速的线路数</span>
+          <input type="number" id="fastestMax" min="2" max="12" style="width:100%"/></label>
+        <label class="field" style="max-width:260px"><span>测速超时（秒）</span>
+          <input type="number" id="fastestTimeout" min="1" max="10" step="0.5" style="width:100%"/></label>
+        <label class="switch-row"><input type="checkbox" id="lineAutofail"/>
+          <span>坏线自动切换<span class="sub">当前线路失效/文件不存在时自动换到可用线路，并短时跳过坏线（关闭则纯手动切线）</span></span></label>
+        <div class="btn-row"><button class="primary small" onclick="saveLines()">保存播放设置</button></div>
+      </div>
+
+      <div class="card">
         <div class="card-title">已缓存在线条目 <span class="badge" id="cacheN"></span></div>
         <div class="row"><input type="text" id="kw" placeholder="按标题过滤（在飞牛搜索过的会出现在这里）" style="flex:1"/>
           <button class="small" onclick="loadOnline()">刷新</button></div>
@@ -849,6 +862,14 @@ async function saveCfg(){
   const r=await jpost("/v/api/ext/config",body);
   if(r.code===0){toast("已保存");Object.assign(CFG,body);}else toast("保存失败 "+r.msg,"fail");
 }
+async function saveLines(){
+  const body={line_fastest:$("lineFastest").checked,
+    line_fastest_max:Math.max(2,Math.min(12,parseInt($("fastestMax").value)||6)),
+    line_fastest_timeout:Math.max(1,Math.min(10,parseFloat($("fastestTimeout").value)||4)),
+    line_autofail:$("lineAutofail").checked};
+  const r=await jpost("/v/api/ext/config",body);
+  if(r.code===0){toast("已保存");Object.assign(CFG,body);}else toast("保存失败 "+r.msg,"fail");
+}
 async function loadOnline(){
   const kw=$("kw").value.trim();
   const r=await jget("/v/api/ext/online?limit=500"+(kw?("&q="+encodeURIComponent(kw)):""));
@@ -874,6 +895,10 @@ async function init(){
   $("maxn").value=CFG.max_per_keyword;
   $("junk").checked=CFG.filter_junk;
   $("onlineFirst").checked=CFG.online_first!==false;
+  $("lineFastest").checked=CFG.line_fastest!==false;
+  $("lineAutofail").checked=CFG.line_autofail!==false;
+  $("fastestMax").value=CFG.line_fastest_max||6;
+  $("fastestTimeout").value=CFG.line_fastest_timeout||4;
   renderKw();renderSources();
   const gs=$("globalState");gs.textContent="接管运行中 · 已缓存 "+STATUS.cached_titles;gs.className="dot ok";
   const ed=$("aboutEdition");if(ed)ed.textContent=(FEAT_DDUO?"完整版（本地全功能）":"公开版")+" · 在飞牛原生搜索与媒体库中注入在线影视";
