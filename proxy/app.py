@@ -128,6 +128,8 @@ def standalone_lib_name(src: dict) -> str:
 
 
 
+
+
 def charts_enabled() -> bool:
     return bool(config.get().get("hot_library_enabled", True))
 
@@ -1034,6 +1036,8 @@ async def mediadb_list(request: Request):
             })
         # 4) TVBox 加固源专区（每个启用且运行时在线的加固源一张库卡片）。
         # 海报只读缓存（后台预热），绝不在此联网——该接口对超时极敏感。
+
+        # 5) 小雅分类媒体库（电影/剧集/综艺/动漫/纪录片/短剧 各一张卡片）
         # —— 置顶控制 ——
         # 置顶库（pinned_libs）插到列表最前并给较大 sort_num；未置顶的虚拟库仍排在
         # 官方本地库之前，但置于置顶组之后。客户端按返回顺序/ sort_num 展示。
@@ -1153,6 +1157,8 @@ async def mdb_detail(guid: str, request: Request):
 
     # TVBox 加固源专区库
 
+    # 小雅分类媒体库
+
     # 兼容旧热门库 guid
     if is_hot_guid(guid):
         cat = HOT_GUID_CAT.get(guid) or ("tv" if guid == HOT_LEGACY_GUID else "movie")
@@ -1208,6 +1214,8 @@ async def mediadb_sum(request: Request):
 
 
 
+
+
 @app.post("/v/api/v1/item/list")
 async def item_list(request: Request):
     raw = await request.body()
@@ -1219,6 +1227,8 @@ async def item_list(request: Request):
     client = _client_of(request)
 
     # —— TVBox 加固源专区库 ——
+
+    # —— 小雅分类媒体库 ——
 
     # —— 单源独立媒体库：该源四类交错成一条最近更新流 ——
     sscope = standalone_source_of(aguid) if aguid else None
@@ -1377,6 +1387,7 @@ async def item_detail(guid: str, request: Request):
         data["play_error"] = ""
         return JSONResponse({"code": 0, "msg": "", "data": data})
     # TVBox 加固源专区库根节点
+    # 小雅分类库：库根节点 + 影片详情
     # 海量库根节点
     if guid in CATALOG_GUID_CAT:
         ccat = CATALOG_GUID_CAT[guid]
@@ -1798,6 +1809,7 @@ async def play_info(request: Request):
     body = json.loads(await request.body() or b"{}")
     guid = body.get("item_guid", "")
     client = _client_of(request)
+
 
     def _prewarm_from_info(info: dict):
         """点击播放即后台预热默认线路的播放列表，缩短首帧等待。"""
