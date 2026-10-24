@@ -39,6 +39,8 @@ dist/
 /proxy/guard.py
 /proxy/runner_client.py
 /proxy/xlib.py
+/proxy/spiders.py
+/proxy/assets/spiders/
 /proxy/assets/catvod/
 /proxy/assets/drpy/
 /proxy/assets/guard/

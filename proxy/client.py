@@ -21,6 +21,8 @@
 """
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass
 
 # 端类别常量
@@ -103,11 +105,24 @@ TV_CARD_KEEP = (
 
 
 def _strict_date(v) -> str:
-    """TV 端严格日期解析：'2026' 纯年份会抛异常导致整页空白，补成 yyyy-MM-dd。"""
-    s = str(v or "").strip()
-    if len(s) == 4 and s.isdigit():
-        return f"{s}-01-01"
-    return s
+    """规整成 TV 严格模型能解析的 yyyy-MM-dd；无法识别一律返回空串。
+
+    资源站常见脏值 '0'/''/'null'/纯年份/'yyyy-MM'，此前只补 4 位年份，'0' 原样
+    下发会让 TV(Flutter) DateTime 解析抛异常，导致整页卡片空白。
+    """
+    s = str(v if v is not None else "").strip()
+    if not s or s.lower() in ("0", "none", "null", "-", "nan"):
+        return ""
+    m = re.match(r"^(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?", s)
+    if not m:
+        return ""
+    try:
+        y, mo, d = int(m.group(1)), int(m.group(2) or 1), int(m.group(3) or 1)
+        if not (1 <= mo <= 12 and 1 <= d <= 31):
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    return f"{y:04d}-{mo:02d}-{d:02d}"
 
 
 def normalize_card(row: dict, client: Client) -> dict:

@@ -92,6 +92,13 @@ label.field>span{display:block;color:var(--muted);font-size:12px;margin-bottom:4
 .tag{display:inline-block;font-size:10px;color:var(--accent);background:var(--accent-soft);
   border-radius:5px;padding:0 5px;margin-left:6px}
 .tag.amber{color:#b45309;background:#fef3e2}
+.tag.warn{color:#b45309;background:#fef3e2}
+/* 统一订阅导入结果 */
+.subgrp{border:1px solid var(--line);border-radius:9px;padding:8px 10px;margin:10px 0;background:#fbfcfe}
+.subgrp-t{font-size:13px;font-weight:600;margin-bottom:6px}
+.subrow{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:13px;padding:3px 0}
+.subrow.ok span:first-child{color:var(--ok,#1a8d3a)}
+.subrow.muted{color:var(--muted)}
 
 /* ---------- 实时播放诊断 ---------- */
 .live-dev{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:8px 0;background:#fbfcfe}
@@ -170,6 +177,7 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
       <button class="nav-item" data-page="library">虚拟媒体库</button>
       <button class="nav-item" data-page="quality">片源质量</button>
       <button class="nav-item" data-page="sources">资源站</button>
+      <button class="nav-item" data-page="importsub">导入订阅</button>
       <button class="nav-item" data-page="search">搜索</button>
       <button class="nav-item" data-page="about">关于</button>
     </nav>
@@ -322,24 +330,44 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
           <button class="primary small" style="justify-content:center" onclick="addSource()">添加</button>
         </div>
         <div class="hint">「独立库」= 该站单独生成一张媒体库卡片；「非过滤」= 不按标题/备注过滤解说/预告/花絮；
-          删除内置源仅隐藏，可恢复。</div>
+          删除内置源仅隐藏，可恢复。批量导入 TVBox 订阅请用左侧「导入订阅」。</div>
       </div>
+    </section>
 
+    <!-- ============ 导入 TVBox 订阅（独立页） ============ -->
+    <section class="page" id="page-importsub">
+      <h2 class="page-title">导入订阅</h2>
+      <p class="page-desc">粘贴一个 TVBox / 影视仓 / OK影视 订阅 URL 或整段配置，自动识别并分类导入，<strong>导入即可在搜索与播放源中使用</strong>。支持 base64 与多订阅聚合。</p>
       <div class="card">
-        <div class="card-title">导入 TVBox / 影视仓 / OK影视 配置</div>
-        <p class="card-sub">自动识别并导入其中<strong>标准苹果CMS（type 0/1，JSON/XML）</strong>影视站；
-          Spider 爬虫、网盘、嗅探、直播源自动跳过。</p>
-        <div class="row"><input type="text" id="tvboxUrl" placeholder="配置订阅 URL（支持 base64 与多订阅聚合）" style="flex:2"/>
-          <button class="primary small" onclick="importTvbox('url')">按 URL 导入</button></div>
-        <label class="field"><textarea id="tvboxText" rows="5" placeholder="或直接粘贴配置 JSON（含 sites 数组）…"></textarea></label>
+        <div class="card-title">订阅抓取代理（可选）
+          <label style="float:right;display:flex;align-items:center;gap:6px;font-size:12px;font-weight:400;cursor:pointer">
+            <input type="checkbox" id="subProxyEnable" style="width:14px;height:14px;accent-color:var(--accent)" onchange="onSubProxyToggle()"/> 启用代理</label></div>
+        <p class="card-sub">仅用于<strong>拉取订阅配置、爬虫 jar、DRPY 脚本</strong>（GitHub 等被墙/解析失败时可走 Clash）。<strong>播放、搜索、CMS 探测一律不走此代理</strong>。形如 <code>http://用户:密码@主机:端口</code>，清空=直连。</p>
+        <div class="row">
+          <input type="text" id="subProxyUrl" placeholder="http://Clash:密码@192.168.x.x:7890" style="flex:2" disabled/>
+          <button class="small" id="subProxySaveBtn" onclick="saveSubProxy(true)" disabled>保存并测试</button>
+          <button class="small" id="subProxyClearBtn" onclick="clearSubProxy()" disabled>清空(直连)</button>
+        </div>
+        <div id="subProxyMsg" class="muted sm" style="margin-top:6px"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">TVBox / 影视仓 / OK影视 订阅</div>
+        <p class="card-sub">自动识别并分类：标准苹果CMS影视站（type 0/1）
+          能直接播放的<strong>自动启用</strong>；P2P/磁力/云盘等慢源与 jar/脚本暂未就绪的源导入后默认关闭，可在结果里开启或补传；
+          网盘/直播/无法识别的源跳过并说明原因。</p>
+        <div class="row"><input type="text" id="subUrl" placeholder="配置订阅 URL（支持 base64 与多订阅聚合）" style="flex:2"/>
+          <button class="primary small" onclick="importSubscription('url')">按 URL 导入</button></div>
+        <label class="field"><textarea id="subText" rows="7" placeholder="或直接粘贴配置 JSON（含 sites 数组）…"></textarea></label>
         <div class="btn-row">
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
-            <input type="checkbox" id="tvboxStandalone" style="width:15px;height:15px;accent-color:var(--accent)"/>
-            导入的源同时「作为独立媒体库」</label>
-          <button class="primary small" onclick="importTvbox('text')">解析并导入</button>
+            <input type="checkbox" id="subStandalone" style="width:15px;height:15px;accent-color:var(--accent)"/>
+            苹果CMS源同时「作为独立媒体库」</label>
+          <button class="primary small" onclick="importSubscription('text')">解析并导入</button>
         </div>
-        <div id="tvboxResult" class="muted sm" style="white-space:pre-wrap"></div>
+        <div id="subResult"></div>
       </div>
+
+
     </section>
 
 
@@ -446,13 +474,14 @@ async function jpost(p,b){const r=await fetch(p,{method:"POST",headers:{"Content
   body:JSON.stringify(b||{})});return r.json();}
 
 /* ---------- 页面切换 ---------- */
-function switchPage(page){
+async function switchPage(page){
   $$(".page").forEach(el=>el.classList.toggle("active",el.id==="page-"+page));
   $$("[data-page]").forEach(el=>el.classList.toggle("active",el.dataset.page===page));
   window.scrollTo(0,0);
   if(page==="overview"){renderOverview();startLivePoll();}
   if(page==="library"){loadLibs().then(renderLibrary);}
   if(page==="quality")renderQuality();
+  if(page==="importsub"){try{if(!CFG)await loadStatus();}catch(e){}try{if(typeof initSubProxy==="function")initSubProxy();}catch(e){}try{if(typeof loadSpiderMgmt==="function")loadSpiderMgmt();}catch(e){}try{if(typeof loadDrpyMgmt==="function")loadDrpyMgmt();}catch(e){}}
 }
 $$("[data-page]").forEach(b=>b.addEventListener("click",()=>switchPage(b.dataset.page)));
 
@@ -805,20 +834,164 @@ async function addSource(){
     await loadStatus();const tr=$("srcRows").querySelector(`tr[data-id="${r.data.id}"]`);if(tr&&!standalone)testOne(r.data.id,tr);}
   else toast(r.msg||"添加失败","fail");
 }
-async function importTvbox(kind){
-  const standalone=$("tvboxStandalone").checked,payload={standalone};
-  if(kind==="url"){payload.url=$("tvboxUrl").value.trim();if(!payload.url){toast("请填写订阅 URL","fail");return;}}
-  else{payload.text=$("tvboxText").value.trim();if(!payload.text){toast("请粘贴配置 JSON","fail");return;}}
-  const out=$("tvboxResult");out.textContent="正在解析并探测，请稍候…";
-  try{const r=await jpost("/v/api/ext/source/import-tvbox",payload);
-    if(r.code!==0){out.textContent="导入失败："+(r.msg||"");return;}
-    const d=r.data||{},lines=[];
-    lines.push(`共识别 ${d.scanned||0} 个站点，可导入苹果CMS源 ${d.added||0} 个，已存在 ${d.duplicate||0} 个，跳过不支持 ${d.skipped||0} 个。`);
-    (d.added_names||[]).forEach(n=>lines.push("  + "+n));
-    if((d.skipped_detail||[]).length)lines.push("跳过（爬虫/网盘/直播等）："+d.skipped_detail.slice(0,12).join("、")+(d.skipped_detail.length>12?" 等":""));
-    out.textContent=lines.join("\n");toast("导入完成");await loadStatus();
-  }catch(e){out.textContent="导入出错："+e;}
+// ---------- 订阅抓取代理（仅拉订阅/jar/脚本，不影响播放） ----------
+function initSubProxy(){
+  const p=(CFG&&CFG.subscription_proxy)||"";
+  const en=$("subProxyEnable"),inp=$("subProxyUrl"),sb=$("subProxySaveBtn"),cb=$("subProxyClearBtn"),msg=$("subProxyMsg");
+  if(!en)return;
+  inp.value=p;en.checked=!!p;
+  inp.disabled=!en.checked;sb.disabled=!en.checked;cb.disabled=!p;
+  msg.textContent=p?"当前经代理拉取订阅资源":"当前直连（未设代理）";
+  msg.style.color="";
 }
+function onSubProxyToggle(){
+  const en=$("subProxyEnable"),inp=$("subProxyUrl"),sb=$("subProxySaveBtn");
+  inp.disabled=!en.checked;sb.disabled=!en.checked;
+  if(en.checked)inp.focus();
+}
+async function saveSubProxy(test){
+  const inp=$("subProxyUrl"),msg=$("subProxyMsg");
+  const proxy=inp.value.trim();
+  if(!proxy){toast("请填写代理地址，或点清空直连","fail");return;}
+  msg.textContent="保存并测试连通性…";msg.style.color="";
+  try{
+    const r=await jpost("/v/api/ext/subscription-proxy",{proxy});
+    if(r.code!==0){msg.textContent="未保存："+(r.msg||"格式错误");msg.style.color="var(--danger)";return;}
+    const d=r.data||{};
+    if(test){
+      msg.textContent=d.test_ok?("✓ 已保存，代理连通（"+(d.test_msg||"")+"），仅作用于订阅资源抓取")
+                               :("已保存，但代理测试失败："+(d.test_msg||""));
+      msg.style.color=d.test_ok?"var(--ok,#3a9)":"var(--warn,#d59a2b)";
+    }else{msg.textContent="已保存";}
+    $("subProxyClearBtn").disabled=false;
+    toast("代理已保存");
+  }catch(e){msg.textContent="请求失败："+String(e);msg.style.color="var(--danger)";}
+}
+async function clearSubProxy(){
+  if(!confirm("清空订阅代理、改为直连？"))return;
+  const r=await jpost("/v/api/ext/subscription-proxy",{proxy:""});
+  if(r.code===0){$("subProxyUrl").value="";$("subProxyEnable").checked=false;
+    $("subProxyUrl").disabled=true;$("subProxySaveBtn").disabled=true;$("subProxyClearBtn").disabled=true;
+    $("subProxyMsg").textContent="已清空，当前直连";$("subProxyMsg").style.color="";toast("已切回直连");}
+  else toast(r.msg||"失败","fail");
+}
+async function importSubscription(kind){
+  const standalone=$("subStandalone").checked;
+  if(kind==="url"){payload.url=$("subUrl").value.trim();if(!payload.url){toast("请填写订阅 URL","fail");return;}}
+  else{payload.text=$("subText").value.trim();if(!payload.text){toast("请粘贴配置 JSON","fail");return;}}
+  const out=$("subResult");out.innerHTML='<div class="muted sm">正在解析订阅并探测源，请稍候…</div>';
+  try{
+    const r=await jpost("/v/api/ext/source/import-subscription",payload);
+    if(r.code!==0){out.innerHTML='<div class="hint" style="color:var(--danger)">导入失败：'+esc(r.msg||"")+'</div>';return;}
+    renderSubResult(r.data||{});
+    toast("导入完成");
+    try{await loadStatus();}catch(e){}
+    try{await loadGuard();}catch(e){}
+    try{await loadSpiderMgmt();}catch(e){}
+    try{await loadDrpyMgmt();}catch(e){}
+  }catch(e){out.innerHTML='<div class="hint" style="color:var(--danger)">导入出错：'+esc(String(e))+'</div>';}
+}
+async function subToggleGuard(key,on){
+  try{
+    const r=await jpost("/v/api/ext/guard/toggle",{key,enabled:!!on});
+    if(r.code===0){toast(on?"已启用":"已停用");try{await loadStatus();}catch(e){}}
+    else toast(r.msg||"操作失败","fail");
+  }catch(e){toast(String(e),"fail");}
+}
+function goDeploy(){switchPage("tvbox");setTimeout(()=>{const b=$("scInstallAll");if(b)b.click();},80);}
+function renderSubResult(d){
+  const cms=d.cms||{},g=d.guard||{},rt=d.runtime,skips=d.skipped_detail||[];
+  let h="";
+  // 运行时引导（加固源已登记但运行时未就绪 / 公开构建）
+  if(g && !g.skipped_build && g.items && g.items.length && rt && !rt.ready){
+    h+='<div style="margin:10px 0;padding:10px 12px;border:1px solid var(--warn,#d59a2b);border-radius:8px;background:rgba(213,154,43,.08)">'
+     + '<div style="font-weight:600;margin-bottom:4px">已导入 '+g.items.length+' 个加固秒播源，但本地安卓运行时未就绪</div>'
+     + '<div class="muted sm" style="margin-bottom:8px">'+esc(rt.reason||"运行时未连接")+'。源已保存，部署运行时后立即可播，无需重新导入。</div>'
+     + '<button class="primary small" onclick="goDeploy()">一键部署外挂运行时</button></div>';
+  }
+  if(g && g.skipped_build){
+    h+='<div class="hint" style="margin:10px 0">订阅中含加固源，但当前为公开构建（无安卓运行时），已仅导入苹果CMS源。</div>';
+  }
+  // 汇总
+  const cmsOk=cms.added||0, gOk=(g.items||[]).filter(x=>x.enabled).length;
+  const csp=d.csp||{}, dr=d.drpy||{};
+  const cspOk=(csp.items||[]).filter(x=>x.enabled).length;
+  const drOk=(dr.items||[]).filter(x=>x.enabled).length;
+  const totalOk=cmsOk+gOk+cspOk+drOk;
+  h+='<div style="margin:8px 0;font-weight:600">共扫描 '+(d.scanned||0)+' 个站点'
+    +(d.subscriptions?('（含 '+d.subscriptions+' 个子订阅）'):'')+'，新增可直接使用 <b style="color:var(--ok,#3a9)">'+totalOk+'</b> 个。</div>';
+  // 苹果CMS
+  if(cms.candidates||cms.added||cms.duplicate){
+    h+='<div class="subgrp"><div class="subgrp-t">🍿 苹果CMS影视站　新增 '+cmsOk+' · 已存在 '+(cms.duplicate||0)+'</div>';
+    (cms.added_names||[]).forEach(n=>{h+='<div class="subrow ok"><span>＋ '+esc(n)+'</span><span class="tag">已启用</span></div>';});
+    h+='</div>';
+  }
+  // 加固
+  if(g && g.items && g.items.length){
+    h+='<div class="subgrp"><div class="subgrp-t">🛡️ Guard 加固秒播源　自动启用 '+gOk+' · 风险默认关 '+(g.risk_names||[]).length+'</div>';
+    g.items.forEach(it=>{
+      const tag=it.enabled?'<span class="tag">已启用</span>'
+        : ('<span class="tag warn">'+(it.risk?esc(it.risk_reason||"风险源"):"默认关")+'</span>');
+      const cb='<label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer">'
+        +'<input type="checkbox" '+(it.enabled?"checked":"")
+        +' onchange="subToggleGuard(\''+esc(it.key)+'\',this.checked)" style="width:14px;height:14px;accent-color:var(--accent)"/>启用</label>';
+      h+='<div class="subrow"><span>'+esc(it.name||it.key)+'</span><span style="display:flex;align-items:center;gap:8px">'+tag+cb+'</span></div>';
+    });
+    h+='</div>';
+  }
+  if(g && g.error){h+='<div class="hint" style="color:var(--danger)">加固源写入失败：'+esc(g.error)+'</div>';}
+  // 普通 csp_ 爬虫
+  if(csp && csp.skipped_build){
+    h+='<div class="hint" style="margin:10px 0">订阅中含普通爬虫源，但当前为公开构建（无安卓运行时），已跳过。</div>';
+  } else if(csp && (csp.items||[]).length){
+    const jar=csp.jar||{};
+    const jarBad=jar && jar.ok===false;
+    h+='<div class="subgrp"><div class="subgrp-t">🕷️ 普通爬虫源（csp_）　自动启用 '+cspOk+' / '+(csp.items||[]).length
+      +(jarBad?' <span class="tag warn">jar 未就绪</span>':'')+'</div>';
+    if(jarBad){
+      h+='<div style="margin:6px 0;padding:8px 10px;border:1px solid var(--warn,#d59a2b);border-radius:8px;background:rgba(213,154,43,.08)">'
+       + '<div class="muted sm">爬虫 jar 自动下载失败：'+esc(jar.error||"源站不可达")+'</div>'
+       + '<div class="muted sm" style="margin:3px 0 6px;word-break:break-all">'+esc(jar.url||"")+'</div>'
+       + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+       + '<button class="small" onclick="retryJar(this,\''+esc(jar.url||"")+'\')">重试下载</button>'
+       + '<label class="small" style="border:1px solid var(--line,#ccc);border-radius:6px;padding:4px 10px;cursor:pointer">手动补传 jar'
+       + '<input type="file" accept=".jar,.zip" style="display:none" onchange="uploadJar(this,\''+esc(jar.url||"")+'\')"></label></div></div>';
+    }
+    csp.items.forEach(it=>{
+      const state=it.enabled?'<span class="tag">已启用</span>'
+        : (it.risk?'<span class="tag warn">风险源·默认关</span>'
+           : (it.has_jar?'<span class="tag warn">默认关</span>':'<span class="tag warn">缺 jar</span>'));
+      const cb='<label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer">'
+        +'<input type="checkbox" '+(it.enabled?"checked":"")
+        +' onchange="spToggle(this,\''+esc(it.key)+'\')" style="width:14px;height:14px;accent-color:var(--accent)"/>启用</label>';
+      h+='<div class="subrow"><span>'+esc(it.name||it.key)+'</span><span style="display:flex;align-items:center;gap:8px">'+state+cb+'</span></div>';
+    });
+    h+='</div>';
+  }
+  if(csp && csp.error){h+='<div class="hint" style="color:var(--danger)">普通爬虫写入失败：'+esc(csp.error)+'</div>';}
+  // 远程 DRPY
+  if(dr && dr.skipped_build){
+    h+='<div class="hint" style="margin:10px 0">订阅中含远程 JS 爬虫，但当前为公开构建（无 Node 运行时），已跳过。</div>';
+  } else if(dr && (dr.items||[]).length){
+    h+='<div class="subgrp"><div class="subgrp-t">🧩 远程 JS 爬虫（DRPY）　就绪并启用 '+drOk+' / '+dr.items.length+'</div>';
+    dr.items.forEach(it=>{
+      const state=it.enabled?'<span class="tag">已启用</span>'
+        :'<span class="tag warn">脚本未就绪</span>';
+      h+='<div class="subrow"><span>'+esc(it.name||it.key)+'</span>'+state+'</div>';
+    });
+    h+='<div class="muted sm" style="padding:4px 2px">脚本若 401/下载失败，可在下方「已导入的远程 JS 爬虫」处重试。</div></div>';
+  }
+  if(dr && dr.error){h+='<div class="hint" style="color:var(--danger)">远程JS导入失败：'+esc(dr.error)+'</div>';}
+  // 跳过
+  if(skips.length){
+    h+='<details class="subgrp" style="margin-top:8px"><summary class="subgrp-t" style="cursor:pointer">⏭️ 跳过 '+ (d.skipped||skips.length) +' 个（网盘/直播/无法识别/探测失败）</summary>';
+    const by={};skips.forEach(s=>{const r=s.reason||"其他";(by[r]=by[r]||[]).push(s.name);});
+    Object.keys(by).forEach(r=>{h+='<div class="subrow muted"><span>'+esc(by[r].slice(0,10).join("、"))+(by[r].length>10?" 等":"")+'</span><span class="tag">'+esc(r)+'</span></div>';});
+    h+='</details>';
+  }
+  $("subResult").innerHTML=h;
+}
+// ---------- 已导入普通爬虫源管理 ----------
 async function delSource(id,name){
   if(!confirm("确定删除资源站「"+name+"」？"))return;
   const r=await jpost("/v/api/ext/source/delete",{id});

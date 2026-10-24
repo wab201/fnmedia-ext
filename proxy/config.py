@@ -58,6 +58,10 @@ DEFAULTS = {
     # 热门资源解析是否优先高质量源（关闭则只按可播直链数）
     "prefer_quality_source": True,
     "admin_token": "",
+    # 仅用于「拉取订阅资源」的可选 HTTP(S) 代理（订阅配置 / spider jar / DRPY 脚本）。
+    # 播放、聚合搜索、CMS 探测等一律不走此代理（产品客户端保持 trust_env=False 直连）。
+    # 形如 http://user:pass@host:port ；留空表示直连。
+    "subscription_proxy": "",
 }
 
 # 已废弃、需从旧配置里清除的键
@@ -220,6 +224,21 @@ class Config:
                     except (TypeError, ValueError):
                         continue
             cfg["source_priority"] = out
+            self._persist(cfg)
+            return True, "ok"
+
+    def set_subscription_proxy(self, proxy_url: str) -> tuple[bool, str]:
+        """保存「订阅资源抓取」专用代理（空串=直连）。仅用于订阅配置/jar/DRPY脚本，
+        不影响播放与搜索。仅接受 http(s)/socks5 URL 形态。"""
+        from urllib.parse import urlparse
+        p = (proxy_url or "").strip()
+        if p:
+            u = urlparse(p)
+            if u.scheme not in ("http", "https", "socks5", "socks5h") or not u.hostname:
+                return False, "代理地址格式应为 http://user:pass@host:port"
+        with _LOCK:
+            cfg = self.get()
+            cfg["subscription_proxy"] = p
             self._persist(cfg)
             return True, "ok"
 

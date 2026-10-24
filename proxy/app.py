@@ -445,6 +445,11 @@ app = FastAPI(lifespan=lifespan)
 import logging
 _log = logging.getLogger("fnmedia")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+# 关闭 httpx/httpcore 每条请求一行的 INFO 噪音（建库/资源站轮询会刷爆日志）；
+# 保留我们自己在 uvicorn/fnmedia logger 中打印的访问日志。
+for _noisy in ("httpx", "httpcore", "httpcore.http11", "httpcore.connection",
+               "httpcore._sync.connection", "httpcore._async.connection"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 @app.middleware("http")
@@ -2366,6 +2371,7 @@ def _seg_url(mg: str, absolute: str, qs: str = "") -> str:
 
 
 
+
 # ===== 播放线路健康探测与自动换线 =====
 # 问题背景：用户手动切到某条坏线（文件已删/网盘无此集/源站失效）后，插件只是把该线
 # 302/下发，从不校验死活，播放器一直报错；坏线也不会被记忆，退出重放仍黏在该线。
@@ -3381,6 +3387,37 @@ async def ext_set_config(request: Request):
     return {"code": 0, "msg": "saved"}
 
 
+@app.post("/v/api/ext/subscription-proxy")
+async def ext_set_subscription_proxy(request: Request):
+    """设置/清空「仅拉取订阅资源」的代理（订阅配置/spider jar/DRPY脚本）。
+
+    播放、搜索、CMS 探测不走此代理。body: {"proxy":"http://user:pass@host:port"或""}
+    会即时保存并用该代理探测一次（拉一个轻量 URL），返回连通结果。
+    """
+    body = await request.json()
+    px = str(body.get("proxy", "") or "").strip()
+    ok, msg = config.set_subscription_proxy(px)
+    if not ok:
+        return JSONResponse({"code": 400, "msg": msg}, status_code=400)
+    # 实测连通：经该代理拉一个小资源（默认 GitHub generate_204），失败也保存但提示
+    test_ok, test_msg = False, ""
+    import subfetch
+    if px:
+        try:
+            import httpx as _httpx
+            with _httpx.Client(trust_env=False, verify=False, timeout=12,
+                               proxy=px) as cli:
+                rr = cli.get("https://www.gstatic.com/generate_204")
+                test_ok = rr.status_code in (200, 204)
+                test_msg = f"HTTP {rr.status_code}"
+        except Exception as exc:  # noqa: BLE001
+            test_msg = f"{type(exc).__name__}: {str(exc)[:100]}"
+    return {"code": 0, "msg": "",
+            "data": {"proxy": subfetch.subscription_proxy(),
+                     "test_ok": (True if not px else test_ok),
+                     "test_msg": ("直连（未设置代理）" if not px else test_msg)}}
+
+
 @app.post("/v/api/ext/junk-keywords")
 async def ext_junk_keywords(request: Request):
     body = await request.json()
@@ -3586,6 +3623,120 @@ async def ext_import_tvbox(request: Request):
         "duplicate": dup,
         "skipped": len(skipped),
         "skipped_detail": skipped[:40],
+    }}
+
+
+@app.post("/v/api/ext/source/import-subscription")
+async def ext_import_subscription(request: Request):
+    """统一导入 TVBox / 影视仓 / OK影视 订阅（一个入口，自动分类、导入即可用）。
+
+    入参：{url?} 或 {text?}，可选 standalone（CMS 源是否同时作独立媒体库）、
+    enable_guard（True/False/"smart"，默认 "smart"：安全加固源自动启用、
+    P2P/磁力/云盘/需外部配置的风险源导入但默认关）。
+
+    一份订阅一次解析，按运行时分流：
+      - 标准苹果CMS（type 0/1）：轻量探测通过后加入自定义源，立即可搜可播；
+      - csp_*Guard 加固源：写入私有 imported.json 并同步进源底表（仅完整版）；
+      - 其余爬虫 / 网盘 / 直播：跳过并给出原因。
+    返回分类报告 + 加固运行时就绪状态（未就绪时引导一键部署，源仍已登记）。
+    """
+    import tvbox as tvboxmod
+    body = await request.json()
+    standalone = bool(body.get("standalone"))
+    enable_guard = body.get("enable_guard", "smart")
+    if enable_guard not in (True, False, "smart"):
+        enable_guard = "smart"
+
+    try:
+        if body.get("url"):
+            raw_sites, _subs, _spider, _base = await tvboxmod.load_subscription(
+                url=str(body["url"]).strip())
+        elif body.get("text"):
+            raw_sites, _subs, _spider, _base = await tvboxmod.load_subscription(
+                text=str(body["text"]))
+        else:
+            return JSONResponse({"code": 400, "msg": "缺少 url 或 text"},
+                                status_code=400)
+    except Exception as exc:
+        return JSONResponse({"code": 502,
+                             "msg": f"获取/解析订阅失败：{type(exc).__name__}"},
+                            status_code=502)
+
+    groups = tvboxmod.classify_subscription(raw_sites, _spider, _base)
+    cms_cands = groups["cms"]
+    guard_sites = groups["guard"]
+    csp_items = groups.get("csp", [])
+    drpy_items = groups.get("drpy", [])
+    jar_url_global = groups.get("jar_url", "")
+    skipped = list(groups["skipped"])
+
+    # ---------- 苹果 CMS：并发探测，通过即加入并启用 ----------
+    existing = {s.get("api", "").rstrip("/").lower() for s in config.all_sources()}
+    cms_added, cms_dup = [], 0
+    cms_failed: list[str] = []
+    sem = asyncio.Semaphore(8)
+
+    async def _probe(c):
+        async with sem:
+            try:
+                pr = await asyncio.wait_for(
+                    providers.probe_source(c["api"], timeout=8.0), timeout=10)
+            except Exception:
+                pr = {"ok": False}
+            return c, pr
+
+    checked = await asyncio.gather(*[_probe(c) for c in cms_cands[:80]])
+    for c, pr in checked:
+        key = c["api"].rstrip("/").lower()
+        if key in existing:
+            cms_dup += 1
+            continue
+        if not pr.get("ok"):
+            cms_failed.append(c["name"][:20])
+            continue
+        ok, _info = config.add_source(c["name"], c["api"], True, standalone)
+        if ok:
+            cms_added.append(c["name"])
+            existing.add(key)
+        else:
+            cms_dup += 1
+        if len(cms_added) >= 60:
+            break
+    for nm in cms_failed:
+        tag = nm + "|探测不可达"
+        if not any(x.get("name") == nm and x.get("reason") == "探测不可达"
+                   for x in skipped):
+            skipped.append({"name": nm, "reason": "探测不可达"})
+
+    # ---------- csp_*Guard 加固源（仅完整私有构建） ----------
+    guard_report = None
+    runtime = None
+
+    # ---------- 普通 csp_ 爬虫 与 远程 drpyS（仅完整私有构建） ----------
+    csp_report = None
+    drpy_report = None
+
+    if cms_added or (guard_report and guard_report.get("enabled_count")) \
+            or (csp_report and csp_report.get("added")) \
+            or (drpy_report and drpy_report.get("added")):
+        _search_cache.clear()
+        _schedule_routes_refresh()
+
+    return {"code": 0, "msg": "", "data": {
+        "scanned": len(raw_sites),
+        "subscriptions": _subs,
+        "cms": {
+            "candidates": len(cms_cands),
+            "added": len(cms_added),
+            "added_names": cms_added,
+            "duplicate": cms_dup,
+        },
+        "guard": guard_report,
+        "csp": csp_report,
+        "drpy": drpy_report,
+        "runtime": runtime,
+        "skipped": len(skipped),
+        "skipped_detail": skipped[:60],
     }}
 
 
