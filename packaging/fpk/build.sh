@@ -33,10 +33,14 @@ rsync -a --delete \
   --exclude='/proxy/assets/guard/guard.jar' \
   --exclude='/proxy/assets/guard/sites.json' \
   --exclude='/proxy/assets/guard/imported.json' \
+  --exclude='/proxy/assets/spiders/jars/' \
+  --exclude='/proxy/assets/spiders/jars.json' \
+  --exclude='/proxy/assets/spiders/spider_sites.json' \
   --exclude='/FORUM_POST.md' \
   --exclude='/FORUM_POST_CHANGELOG.md' \
   --exclude='/FORUM_RELEASE_*.md' \
   --exclude='/RELEASING.md' \
+  --exclude='*.apk' \
   "${REPO_ROOT}/" "${STAGE}/app/repo/"
 
 
@@ -44,6 +48,10 @@ rsync -a --delete \
 # 保留空目录占位，避免首启写文件时缺目录。
 mkdir -p "${STAGE}/app/repo/proxy/assets/guard"
 : > "${STAGE}/app/repo/proxy/assets/guard/.gitkeep"
+# 用户从自己订阅下载的普通 csp spider jar 缓存与来源清单属于个人添加源，
+# 不分发；运行时缺目录会自动重建并按需下载。
+mkdir -p "${STAGE}/app/repo/proxy/assets/spiders/jars"
+: > "${STAGE}/app/repo/proxy/assets/spiders/jars/.gitkeep"
 # 维护者个人本地配置（含网盘账号）不进任何分发包。
 LOCAL_CFG="local.json"
 rm -f "${STAGE}/app/repo/proxy/"*"${LOCAL_CFG}"

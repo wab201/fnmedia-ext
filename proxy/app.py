@@ -45,6 +45,7 @@ import history as histmod
 from history import history
 import marks as marksmod
 from marks import marks
+import updater
 from store import (store, make_guid, media_guid, video_guid, is_online_guid,
                    season_guid, episode_guid, ep_media_guid, ep_video_guid)
 
@@ -397,6 +398,11 @@ async def lifespan(app: FastAPI):
     app.state.stop_hot = asyncio.Event()
     app.state.hot_task = asyncio.create_task(_hot_worker(app))
 
+    # 后台只读检查 GitHub 更新（仅提示，绝不自动安装）
+    app.state.stop_update = asyncio.Event()
+    app.state.update_task = asyncio.create_task(
+        updater.periodic_loop(app.state.stop_update))
+
 
     try:
         yield
@@ -405,6 +411,12 @@ async def lifespan(app: FastAPI):
         app.state.hot_task.cancel()
         try:
             await app.state.hot_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        try:
+            app.state.stop_update.set()
+            app.state.update_task.cancel()
+            await app.state.update_task
         except (asyncio.CancelledError, Exception):
             pass
         await app.state.up.aclose()
@@ -3260,6 +3272,34 @@ async def ext_status(request: Request):
             "hot": hot_cache.status(),
             "charts": chart_cache.status(),
             "catalog": catalog.status()}
+
+
+# --------------------------------------------------------------- 版本更新
+@app.get("/v/api/ext/update/check")
+async def ext_update_check(request: Request):
+    force = request.query_params.get("force") in ("1", "true", "yes")
+    return await updater.check(force=force)
+
+
+@app.get("/v/api/ext/update/status")
+async def ext_update_status(request: Request):
+    return updater.status()
+
+
+@app.post("/v/api/ext/update/now")
+async def ext_update_now(request: Request):
+    # 仅管理台显式触发；下载校验后交给 fnOS 应用中心正规升级（会短暂重启服务）。
+    # 该动作具备系统级副作用，要求显式确认 + 自定义头（跨站简单请求无法携带，
+    # 起到 CSRF 防护作用）；只读的检查/状态接口不加此限制。
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if request.headers.get("x-fnmedia-admin") != "1" or body.get("confirm") is not True:
+        return JSONResponse({"code": 403,
+                             "msg": "需要在管理页显式确认后才能执行更新"},
+                            status_code=403)
+    return await updater.start_update()
 
 
 @app.post("/v/api/ext/source/priority")

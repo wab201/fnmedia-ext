@@ -435,6 +435,20 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div class="hint" id="aboutEdition"></div>
       </div>
 
+      <div class="card" id="updCard">
+        <div class="card-title">🔄 版本更新</div>
+        <div class="stack sm">
+          <div class="muted">当前版本：<b id="updCur">…</b><span id="updEdition" class="muted"></span></div>
+          <div id="updBody" class="muted">正在检查更新…</div>
+          <div id="updActions" style="display:none;gap:8px;flex-wrap:wrap;align-items:center">
+            <button class="btn primary" id="updBtn">立即更新</button>
+            <button class="btn" id="updRefresh">重新检查</button>
+            <a class="btn" id="updLink" target="_blank" rel="noopener" style="text-decoration:none">查看 Release</a>
+          </div>
+          <div id="updProgress" class="hint" style="display:none"></div>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-title">⚖️ 免责声明与版权声明</div>
         <div class="stack sm muted" style="line-height:1.7">
@@ -482,8 +496,84 @@ async function switchPage(page){
   if(page==="library"){loadLibs().then(renderLibrary);}
   if(page==="quality")renderQuality();
   if(page==="importsub"){try{if(!CFG)await loadStatus();}catch(e){}try{if(typeof initSubProxy==="function")initSubProxy();}catch(e){}try{if(typeof loadSpiderMgmt==="function")loadSpiderMgmt();}catch(e){}try{if(typeof loadDrpyMgmt==="function")loadDrpyMgmt();}catch(e){}}
+  if(page==="about"){loadUpdate(false);}
 }
 $$("[data-page]").forEach(b=>b.addEventListener("click",()=>switchPage(b.dataset.page)));
+
+/* ---------- 版本更新 ---------- */
+let UPD_TIMER=null;
+function $u(id){return document.getElementById(id);}
+function updEdLabel(ed){return ed==="full"?"全功能版":"轻量版";}
+async function loadUpdate(force){
+  try{
+    const r=await jget("/v/api/ext/update/check"+(force?"?force=1":""));
+    renderUpdate(r);
+  }catch(e){
+    $u("updCur").textContent="—";
+    $u("updBody").innerHTML='<span style="color:var(--warn,#b45309)">检查更新失败：'+esc(e.message)+'（可能无法访问 GitHub）</span>';
+    $u("updActions").style.display="flex";$u("updBtn").style.display="none";
+  }
+}
+function renderUpdate(r){
+  $u("updCur").textContent=r.current_version||"—";
+  $u("updEdition").textContent=" · "+updEdLabel(r.edition);
+  const u=r.update;
+  const busy=["checking","downloading","installing"].includes(r.status);
+  const body=$u("updBody"),actions=$u("updActions"),btn=$u("updBtn"),
+        prog=$u("updProgress"),link=$u("updLink");
+  if(link){if(u&&u.html_url){link.href=u.html_url;link.style.display="";}else{link.style.display="none";}}
+  if(busy){
+    body.innerHTML='<span style="color:var(--ok,#16a34a)">'+esc(r.progress||"处理中…")+'</span>';
+    actions.style.display="flex";btn.style.display="none";
+    prog.style.display="";prog.textContent="请稍候，安装完成后服务会自动重启，管理页稍后刷新即可。";
+    return;
+  }
+  if(r.status==="done"){
+    body.innerHTML='<span style="color:var(--ok,#16a34a)">✅ 已更新到 v'+esc(r.updated_version||"")+'，服务正在重启…请稍后刷新页面。</span>';
+    actions.style.display="flex";btn.style.display="none";prog.style.display="none";return;
+  }
+  if(r.status==="error" && (!u || !u.update_available)){
+    body.innerHTML='<span style="color:var(--warn,#b45309)">'+esc(r.last_error||"检查更新失败")+'</span>';
+    actions.style.display="flex";btn.style.display="none";prog.style.display="none";return;
+  }
+  if(u && u.update_available){
+    const edTip=u.edition==="full"?"（全功能版）":"（轻量版）";
+    const size=u.asset_size?` · ${(u.asset_size/1048576).toFixed(1)}MB`:"";
+    body.innerHTML='<div><span style="color:var(--ok,#16a34a);font-weight:600">发现新版本 v'+esc(u.version)+edTip+'</span>'+size+'</div>'
+      +'<div class="muted sm" style="white-space:pre-wrap;margin-top:6px;max-height:180px;overflow:auto">'+esc((u.notes||"").slice(0,1200))+'</div>';
+    actions.style.display="flex";btn.style.display="";btn.disabled=false;btn.textContent="立即更新到 v"+u.version;
+    prog.style.display="none";
+  }else{
+    const v=u&&u.version?("v"+u.version):"";
+    body.innerHTML='<span style="color:var(--muted,#666)">已是最新版本'+(v?"（GitHub 最新 "+v+"）":"")+'。</span>';
+    actions.style.display="flex";btn.style.display="none";prog.style.display="none";
+  }
+}
+async function pollUpdate(){
+  try{
+    const r=await jget("/v/api/ext/update/status");
+    renderUpdate(r);
+    if(["downloading","installing"].includes(r.status)){
+      UPD_TIMER=setTimeout(pollUpdate,1500);
+    }else{UPD_TIMER=null;}
+  }catch(e){}
+}
+document.addEventListener("DOMContentLoaded",()=>{
+  const btn=document.getElementById("updBtn"),rf=document.getElementById("updRefresh");
+  if(btn)btn.addEventListener("click",async()=>{
+    if(!confirm("将从 GitHub 下载与当前版本类型一致的安装包（自动校验 sha256），并通过飞牛应用中心覆盖安装。\n\n安装期间本服务会短暂停止并自动重启（约十几秒），播放记录与已导入源会保留。\n\n确定立即更新？"))return;
+    btn.disabled=true;btn.textContent="开始更新…";
+    try{
+      const rr=await fetch("/v/api/ext/update/now",{method:"POST",
+        headers:{"Content-Type":"application/json","x-fnmedia-admin":"1"},
+        body:JSON.stringify({confirm:true})});
+      const r=await rr.json();
+      if(r.code!==0){alert(r.msg||"更新启动失败");btn.disabled=false;loadUpdate(true);return;}
+      pollUpdate();
+    }catch(e){alert("更新启动失败："+e.message);btn.disabled=false;}
+  });
+  if(rf)rf.addEventListener("click",()=>loadUpdate(true));
+});
 
 /* ---------- 概览 ---------- */
 /* ---------- 本设备识别（自检） ---------- */
