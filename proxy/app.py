@@ -3955,7 +3955,11 @@ async def ext_adfilter_replace_rules(request: Request):
 @app.get("/v/online-admin")
 async def admin_page():
     from admin_ui import ADMIN_HTML
-    return Response(ADMIN_HTML, media_type="text/html; charset=utf-8")
+    return Response(
+        ADMIN_HTML,
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                 "Pragma": "no-cache", "Expires": "0"})
 
 
 

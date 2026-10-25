@@ -527,13 +527,27 @@ let UPD_TIMER=null;
 function $u(id){return document.getElementById(id);}
 function updEdLabel(ed){return ed==="full"?"全功能版":"轻量版";}
 async function loadUpdate(force){
+  const rf=$u("updRefresh"),body=$u("updBody");
+  if(force){
+    if(rf){rf.disabled=true;rf.textContent="检查中…";}
+    if(body)body.innerHTML='<span style="color:var(--ok,#16a34a)">正在向 GitHub 检查更新…</span>';
+  }
   try{
     const r=await jget("/v/api/ext/update/check"+(force?"?force=1":""));
     renderUpdate(r);
+    if(force){
+      const u=r.update;
+      if(r.status==="error")toast("检查失败："+(r.last_error||"无法访问 GitHub"),"fail");
+      else if(u&&u.update_available)toast("发现新版本 v"+u.version);
+      else toast("检查完成：已是最新版本"+(u&&u.version?" v"+u.version:""));
+    }
   }catch(e){
     $u("updCur").textContent="—";
-    $u("updBody").innerHTML='<span style="color:var(--warn,#b45309)">检查更新失败：'+esc(e.message)+'（可能无法访问 GitHub）</span>';
+    body.innerHTML='<span style="color:var(--warn,#b45309)">检查更新失败：'+esc(e.message)+'（可能无法访问 GitHub）</span>';
     $u("updActions").style.display="flex";$u("updBtn").style.display="none";
+    if(force)toast("检查更新失败："+e.message,"fail");
+  }finally{
+    if(rf){rf.disabled=false;rf.textContent="重新检查";}
   }
 }
 function renderUpdate(r){
@@ -567,7 +581,9 @@ function renderUpdate(r){
     prog.style.display="none";
   }else{
     const v=u&&u.version?("v"+u.version):"";
-    body.innerHTML='<span style="color:var(--muted,#666)">已是最新版本'+(v?"（GitHub 最新 "+v+"）":"")+'。</span>';
+    const lc=r.last_check?(' · 上次检查 ' + new Date(r.last_check*1000).toLocaleString()):"";
+    body.innerHTML='<span style="color:var(--muted,#666)">已是最新版本'+(v?"（GitHub 最新 "+v+"）":"")+'。</span>'
+      +'<div class="hint sm" style="margin-top:4px">'+lc+'</div>';
     actions.style.display="flex";btn.style.display="none";prog.style.display="none";
   }
 }
