@@ -1,12 +1,13 @@
-"""应用自更新：后台检查 GitHub Release、下载 fpk、调用 fnOS appcenter-cli 升级。
+"""应用自更新：后台检查 GitHub Release、下载 fpk 校验后热替换升级。
 
 设计要点（安全/可逆优先）：
 - 只读 GitHub 官方 API（releases/latest 与 releases/tags），不接受第三方地址；
 - 资产仅在本仓库自己的 Release 附件中按文件名规则挑选（轻量版/全功能版）；
 - 下载后强制 sha256 校验（Release 必须带同名 .sha256 附件），不符则拒绝安装；
-- 安装走系统原生 `appcenter-cli install-fpk`（fnOS 应用中心正规升级通道，
-  自动执行包内 upgrade_init/upgrade_callback：停服务→备份 state→落盘→恢复→重启）；
-- 升级动作是“下载新版本并交给系统安装覆盖”，并非先卸载（避免清空 state）。
+- 安装走 systemd-run 瞬态系统单元做自包含热替换（独立于本服务 cgroup，
+  停 fnmedia-ext 不会杀掉它）：停服→备份 state→解包 rsync 覆盖代码（保留 .venv）
+  →恢复 state→install.sh 渲染单元并重启；与 fpk 的 upgrade 生命周期等价；
+- 升级是覆盖安装而非先卸载（保留 state/.venv）；不依赖应用中心 wizard RPC。
 - 全程只在管理页显式点击“立即更新”时触发；后台只做只读检查与提示，绝不自动安装。
 """
 from __future__ import annotations
@@ -25,6 +26,11 @@ from pathlib import Path
 import httpx
 
 try:
+    import config as _config
+except Exception:  # pragma: no cover
+    _config = None
+
+try:
     import features
 except Exception:  # pragma: no cover
     features = None
@@ -36,9 +42,8 @@ CHECK_TTL = 30 * 60
 # 后台启动后首次检查延迟 + 周期间隔。
 BOOT_DELAY = 20
 PERIOD = 6 * 3600
-# 下载/安装总时长上限。
+# 下载总时长上限（秒）。
 DOWNLOAD_TIMEOUT = 180
-INSTALL_TIMEOUT = 600
 
 _LOCK = threading.Lock()
 _STATE: dict = {
@@ -247,14 +252,6 @@ def status() -> dict:
 
 # --------------------------------------------------------------- 下载 / 安装
 
-def _appcenter_bin() -> str | None:
-    for name in ("appcenter-cli", "/usr/local/bin/appcenter-cli"):
-        p = shutil.which(name) if "/" not in name else (name if os.path.exists(name) else None)
-        if p:
-            return p
-    return None
-
-
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -273,17 +270,209 @@ async def start_update() -> dict:
             return {"code": 400, "msg": "当前没有可安装的更新", "data": _snapshot()}
         if not info.get("asset"):
             return {"code": 400, "msg": "该版本未提供对应安装包", "data": _snapshot()}
-        binp = _appcenter_bin()
-        if not binp:
-            return {"code": 500, "msg": "未找到 fnOS appcenter-cli，无法自动安装",
+        # 自更新走 systemd-run 瞬态单元热替换，无需应用中心 CLI。
+        if os.geteuid() != 0:
+            return {"code": 500, "msg": "自更新需要以 root 运行（应用特权未就绪）",
                     "data": _snapshot()}
         _STATE["status"] = "downloading"
         _STATE["progress"] = "正在下载安装包…"
     _persist()
 
     asyncio.get_event_loop().run_in_executor(
-        None, lambda: _blocking_install(info, binp))
+        None, lambda: _blocking_install(info, None))
     return {"code": 0, "msg": "已开始下载并安装更新", "data": _view()}
+
+
+def _proxy_candidates() -> list[str | None]:
+    """更新下载的通道候选，按优先级：update_proxy、subscription_proxy、直连。
+
+    服务以干净 systemd 环境运行（无 *_proxy），国内直连 GitHub Release 附件
+    CDN 常握手超时，因此允许用户在管理页为“更新”单独配置代理。
+    """
+    cands: list[str | None] = []
+    if _config is not None:
+        try:
+            cfg = _config.config.get()
+            for key in ("update_proxy", "subscription_proxy"):
+                v = (cfg.get(key) or "").strip()
+                if v and v not in cands:
+                    cands.append(v)
+        except Exception:  # noqa: BLE001
+            pass
+    cands.append(None)  # 直连兜底
+    return cands
+
+
+def _download_with_fallbacks(url: str, dest: Path, total_hint: int = 0) -> None:
+    """依次尝试各代理通道流式下载到 dest；任一通道完整成功即返回。"""
+    last_err = ""
+    for i, proxy in enumerate(_proxy_candidates()):
+        tag = "代理" if proxy else "直连"
+        try:
+            kwargs = dict(timeout=httpx.Timeout(DOWNLOAD_TIMEOUT, connect=15),
+                          follow_redirects=True, trust_env=False,
+                          headers={"User-Agent": "fnmedia-ext-updater"})
+            if proxy:
+                kwargs["proxy"] = proxy
+            with httpx.Client(**kwargs) as cli:
+                with cli.stream("GET", url) as resp:
+                    if resp.status_code != 200:
+                        raise RuntimeError(f"HTTP {resp.status_code}")
+                    total = int(resp.headers.get("content-length") or total_hint or 0)
+                    got = 0
+                    tmp = dest.with_suffix(dest.suffix + ".part")
+                    with tmp.open("wb") as f:
+                        for chunk in resp.iter_bytes(1 << 20):
+                            f.write(chunk)
+                            got += len(chunk)
+                            if total:
+                                pct = got * 100 // total
+                                with _LOCK:
+                                    _STATE["progress"] = f"下载中 {pct}%（{tag}）"
+                    # 大小校验（有 content-length 时）
+                    if total and got != total:
+                        raise RuntimeError(f"下载不完整 {got}/{total}")
+                    tmp.replace(dest)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"{tag}：{type(exc).__name__} {str(exc)[:80]}"
+            try:
+                dest.with_suffix(dest.suffix + ".part").unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+            continue
+    raise RuntimeError("所有下载通道均失败：" + last_err)
+
+
+def _get_text_with_fallbacks(url: str) -> str:
+    last_err = ""
+    for proxy in _proxy_candidates():
+        try:
+            kwargs = dict(timeout=httpx.Timeout(30, connect=12),
+                          follow_redirects=True, trust_env=False,
+                          headers={"User-Agent": "fnmedia-ext-updater"})
+            if proxy:
+                kwargs["proxy"] = proxy
+            with httpx.Client(**kwargs) as cli:
+                r = cli.get(url)
+                r.raise_for_status()
+                return r.text
+        except Exception as exc:  # noqa: BLE001
+            last_err = str(exc)
+            continue
+    raise RuntimeError("下载校验文件失败：" + last_err)
+
+
+def _live_root() -> Path:
+    """当前运行的应用根目录（repo/）。"""
+    return Path(__file__).resolve().parent.parent
+
+
+def _write_upgrade_script(pkg: Path, target_version: str) -> Path:
+    """生成独立热替换脚本。由 systemd-run 瞬态单元以 root 执行。"""
+    root = _live_root()
+    work = Path("/tmp/fnmedia-update")
+    script = work / "apply-update.sh"
+    marker = work / "apply-result"
+    extract = work / ("extract-" + target_version.replace(".", "_"))
+    pkg_q = str(pkg)
+    extract_q = str(extract)
+    root_q = str(root)
+    marker_q = str(marker)
+    body = f"""#!/usr/bin/env bash
+# fnmedia-ext 自更新热替换（瞬态系统单元执行，与 fpk upgrade 生命周期等价）。
+set -uo pipefail
+exec >/tmp/fnmedia-update/apply.log 2>&1
+echo "[upd] start $(date -Is) target={target_version}"
+PKG={pkg_q!r}; EXTRACT={extract_q!r}; ROOT={root_q!r}; MARK={marker_q!r}
+fail(){{ echo "[upd] FAIL: $*"; echo "FAIL $*" > "$MARK"; exit 1; }}
+rm -rf "$EXTRACT"; mkdir -p "$EXTRACT"
+# fpk 外层为 tar.gz，内层 app.tgz 内是 repo/
+tar xzf "$PKG" -C "$EXTRACT" app.tgz || fail "解开 fpk 失败"
+tar xzf "$EXTRACT/app.tgz" -C "$EXTRACT" || fail "解开 app.tgz 失败"
+[ -f "$EXTRACT/repo/deploy/install.sh" ] || fail "包内缺少 repo/deploy/install.sh"
+[ -f "$EXTRACT/repo/VERSION" ] || fail "包内缺少 VERSION"
+NEWVER="$(cat "$EXTRACT/repo/VERSION" 2>/dev/null | tr -d '[:space:]')"
+echo "[upd] new version=$NEWVER"
+# 备份运行态：state + 用户自行导入/产生的本地资产（guard 源、spider jar、
+# 本地配置等）。这些不随安装包分发，但热替换必须原样保留。
+BK=/tmp/fnmedia-update/state-backup.tar.gz
+rm -f "$BK" /tmp/fnmedia-update/localjson-backup.tar.gz
+TARARGS=()
+[ -d "$ROOT/state" ] && TARARGS+=(state)
+[ -d "$ROOT/proxy/assets/guard" ] && TARARGS+=(proxy/assets/guard)
+[ -d "$ROOT/proxy/assets/spiders" ] && TARARGS+=(proxy/assets/spiders)
+[ -d "$ROOT/proxy/assets/catvod" ] && TARARGS+=(proxy/assets/catvod)
+[ -d "$ROOT/proxy/assets/drpy" ] && TARARGS+=(proxy/assets/drpy)
+if [ "${{#TARARGS[@]}}" -gt 0 ]; then
+  tar --ignore-failed-read -czf "$BK" -C "$ROOT" "${{TARARGS[@]}}" || true
+fi
+( cd "$ROOT" 2>/dev/null && find proxy -name '*local.json' -type f 2>/dev/null \
+  | tar --ignore-failed-read -czf /tmp/fnmedia-update/localjson-backup.tar.gz -T - ) || true
+# 停服（supervise 自动还原官方 socket）
+systemctl stop fnmedia-ext.service || true
+sleep 2
+# 覆盖代码：绝不使用 --delete（避免删掉用户自导入源/jar）。仅把包内文件叠加
+# 覆盖到 ROOT，并显式排除全部用户运行数据；这些目录 live 上有用户文件、包里
+# 只有 .gitkeep 占位，叠加不会触碰它们。
+RSYNC_EX=(
+  --exclude='.venv/' --exclude='state/' --exclude='__pycache__/'
+  --exclude='*.pyc' --exclude='proxy/assets/guard/'
+  --exclude='proxy/assets/spiders/' --exclude='proxy/assets/catvod/'
+  --exclude='proxy/assets/drpy/' --exclude='*local.json'
+)
+if command -v rsync >/dev/null 2>&1; then
+  rsync -a "${{RSYNC_EX[@]}}" "$EXTRACT/repo/" "$ROOT/" || fail "rsync 覆盖代码失败"
+else
+  ( cd "$EXTRACT/repo" && tar --exclude='.venv' --exclude='state' \
+      --exclude='__pycache__' --exclude='*.pyc' \
+      --exclude='proxy/assets/guard' --exclude='proxy/assets/spiders' \
+      --exclude='proxy/assets/catvod' --exclude='proxy/assets/drpy' \
+      --exclude='*local.json' -cf - . ) | ( cd "$ROOT" && tar -xf - ) \
+      || fail "tar 覆盖代码失败"
+fi
+# 恢复运行态（state / 本地资产 / local.json）
+[ -f "$BK" ] && tar xzf "$BK" -C "$ROOT" || true
+[ -f /tmp/fnmedia-update/localjson-backup.tar.gz ] && tar xzf /tmp/fnmedia-update/localjson-backup.tar.gz -C "$ROOT" || true
+# 仅清理字节码缓存（不碰任何数据文件）
+find "$ROOT/proxy" -name '__pycache__' -type d -prune -exec rm -rf {{}} + 2>/dev/null || true
+echo "[upd] code replaced; installed VERSION=$(cat "$ROOT/VERSION" 2>/dev/null)"
+# 渲染 systemd 单元并重启（install.sh 内部会 daemon-reload/enable/restart）
+bash "$ROOT/deploy/install.sh" || fail "install.sh 启动失败"
+sleep 3
+if systemctl is-active --quiet fnmedia-ext.service; then
+  echo "[upd] OK service active; VERSION=$(cat "$ROOT/VERSION")"
+  echo "OK $NEWVER" > "$MARK"
+else
+  fail "服务未正常启动"
+fi
+"""
+    script.write_text(body, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def _launch_transient_updater(pkg: Path, target_version: str) -> None:
+    """用 systemd-run 启动独立瞬态单元执行热替换；单元独立于本服务 cgroup。"""
+    script = _write_upgrade_script(pkg, target_version)
+    # 先清结果标记
+    try:
+        (Path("/tmp/fnmedia-update") / "apply-result").unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    unit = "fnmedia-ext-auto-update.service"
+    if shutil.which("systemd-run"):
+        cmd = ["systemd-run", "--unit", unit, "--collect",
+               "--description", "fnmedia-ext self update",
+               "/bin/bash", str(script)]
+    else:
+        # 兜底：setsid 完全脱离（无 systemd-run 的环境）
+        cmd = ["setsid", "/bin/bash", str(script)]
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    # 给瞬态单元一点启动时间
+    time.sleep(1.5)
 
 
 def _blocking_install(info: dict, binp: str) -> None:
@@ -298,31 +487,13 @@ def _blocking_install(info: dict, binp: str) -> None:
             _STATE["progress"] = "正在下载安装包…"
         _persist()
 
-        with httpx.Client(timeout=DOWNLOAD_TIMEOUT, follow_redirects=True,
-                          trust_env=False,
-                          headers={"User-Agent": "fnmedia-ext-updater"}) as cli:
-            with cli.stream("GET", info["asset"]) as resp:
-                if resp.status_code != 200:
-                    raise RuntimeError(f"下载失败 HTTP {resp.status_code}")
-                total = int(resp.headers.get("content-length") or info.get("asset_size") or 0)
-                got = 0
-                with pkg_path.open("wb") as f:
-                    for chunk in resp.iter_bytes(1 << 20):
-                        f.write(chunk)
-                        got += len(chunk)
-                        if total:
-                            pct = got * 100 // total
-                            with _LOCK:
-                                _STATE["progress"] = f"下载中 {pct}%"
+        # 多通道下载（更新代理 → 订阅代理 → 直连），自动回退。
+        _download_with_fallbacks(
+            info["asset"], pkg_path, int(info.get("asset_size") or 0))
 
         # sha256 强制校验：Release 必须带 .sha256 附件。
         if info.get("sum_url"):
-            with httpx.Client(timeout=30, follow_redirects=True,
-                              trust_env=False,
-                              headers={"User-Agent": "fnmedia-ext-updater"}) as cli:
-                sr = cli.get(info["sum_url"])
-                sr.raise_for_status()
-            expect = (sr.text or "").strip().split()[0].lower()
+            expect = _get_text_with_fallbacks(info["sum_url"]).strip().split()[0].lower()
             actual = _sha256(pkg_path)
             if not expect or not re.fullmatch(r"[0-9a-f]{64}", expect):
                 raise RuntimeError("校验文件格式异常，已中止")
@@ -333,23 +504,15 @@ def _blocking_install(info: dict, binp: str) -> None:
 
         with _LOCK:
             _STATE["status"] = "installing"
-            _STATE["progress"] = "正在通过应用中心安装（服务将短暂重启）…"
+            _STATE["progress"] = "正在应用更新（服务将短暂重启）…"
             _STATE["installed_path"] = str(pkg_path)
         _persist()
 
-        # 免责声明同意：升级等价于再次确认安装条款（用户在管理页已主动点更新）。
-        env_file = tmp_dir / "fpk-env"
-        env_file.write_text("wizard_agree_terms=agree\n", encoding="utf-8")
-
-        # appcenter-cli install-fpk <file> -e <env>
-        # 安装器会执行包内 upgrade_init/upgrade_callback：停服务→备份 state→
-        # 落盘新代码→恢复 state→重启服务。当前进程随后会被系统停止，属预期。
-        proc = subprocess.run(
-            [binp, "install-fpk", str(pkg_path), "-e", str(env_file)],
-            capture_output=True, text=True, timeout=INSTALL_TIMEOUT)
-        tail = (proc.stdout or "")[-400:] + (proc.stderr or "")[-400:]
-        if proc.returncode != 0:
-            raise RuntimeError(f"应用中心安装失败(rc={proc.returncode})：{tail.strip()}")
+        # 走自包含的瞬态系统单元完成热替换（systemd-run，独立于本服务的 cgroup，
+        # 停 fnmedia-ext 不会连带杀掉它）。它与 fpk 的 upgrade_init/callback 等价：
+        # 停服→备份 state→解包校验→rsync 覆盖 repo 代码（保留 .venv/state）→
+        # 恢复 state→install.sh 渲染并重启服务。不依赖应用中心 wizard RPC。
+        _launch_transient_updater(pkg_path, info["version"])
 
         with _LOCK:
             _STATE.update(status="done",

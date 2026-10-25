@@ -53,23 +53,112 @@ def _b64_try(text: str) -> str | None:
     return None
 
 
+def _strip_jsonc(text: str) -> str:
+    """字符串感知地去掉 // 与 /* */ 注释（不破坏 URL 里的 //）。"""
+    out: list[str] = []
+    i, n = 0, len(text)
+    instr = False
+    esc = False
+    quote = ""
+    while i < n:
+        c = text[i]
+        if instr:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == quote:
+                instr = False
+            i += 1
+            continue
+        if c in ('"', "'"):
+            instr = True
+            quote = c
+            out.append(c)
+            i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] not in "\r\n":
+                i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _json_loads_dict(text: str) -> dict | None:
+    """json.loads，失败再按 JSONC（去 // 与 /* */ 注释）解析。"""
+    if not text or not text.lstrip().startswith(("{", "[")):
+        return None
+    for candidate in (text, _strip_jsonc(text)):
+        try:
+            j = json.loads(candidate)
+            return j if isinstance(j, dict) else None
+        except Exception:
+            continue
+    return None
+
+
+# 伪装成图片（.bmp/.jpg）的订阅：图片字节之后追加 base64 配置。
+_B64_ALPHA = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+_B64_WS = set(b"\r\n\t ")
+
+
+def _image_embedded_text(data: bytes) -> str | None:
+    """从图片伪装订阅中取出真正的配置文本（已 base64 解码，可能仍含注释）。
+
+    常见结构：JPEG(以 FFD9 结束) / PNG(IEND) 之后，先一小段无意义杂凑（常以
+    `**` 之类非 base64 字符收尾），随后是 base64(JSON)。
+    """
+    tails: list[bytes] = []
+    for marker in (b"\xff\xd9", b"IEND\xaeB`\x82"):
+        k = data.find(marker)
+        if k >= 0:
+            tails.append(data[k + len(marker):])
+    for tail in tails:
+        n = len(tail)
+        # 找到第一个“非 base64 且非空白”字符（杂凑与正文的分隔符，如 **）。
+        j = 0
+        while j < n and (tail[j] in _B64_ALPHA or tail[j] in _B64_WS):
+            j += 1
+        if j < n:
+            k = j
+            while k < n and tail[k] not in _B64_ALPHA:
+                k += 1
+            payload = tail[k:]
+        else:
+            payload = tail
+        s = payload.decode("ascii", "ignore").strip()
+        if len(s) < 16:
+            continue
+        for cand in (s, s + "=" * (-len(s) % 4)):
+            try:
+                dec = base64.b64decode(cand, validate=False).decode("utf-8", "replace")
+            except (binascii.Error, ValueError):
+                continue
+            if '"sites"' in dec or '"urls"' in dec or dec.lstrip().startswith("{"):
+                return dec
+    return None
+
+
 def parse_config_text(text: str) -> dict | None:
-    """把文本解析成配置 dict；支持裸 JSON 与 base64 包裹。"""
+    """把文本解析成配置 dict；支持裸 JSON、JSONC(//注释) 与 base64 包裹。"""
     text = (text or "").strip()
     if not text:
         return None
-    try:
-        j = json.loads(text)
-        return j if isinstance(j, dict) else None
-    except Exception:
-        pass
+    cfg = _json_loads_dict(text)
+    if cfg is not None:
+        return cfg
     decoded = _b64_try(text)
     if decoded:
-        try:
-            j = json.loads(decoded)
-            return j if isinstance(j, dict) else None
-        except Exception:
-            return None
+        cfg = _json_loads_dict(decoded)
+        if cfg is not None:
+            return cfg
     return None
 
 
@@ -135,10 +224,31 @@ def sub_urls(config: dict, base: str = "") -> list[str]:
 
 
 async def fetch_text(client: httpx.AsyncClient, url: str) -> str:
-    r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"},
-                         timeout=HTTP_TIMEOUT, follow_redirects=True)
-    r.raise_for_status()
-    return r.text
+    """拉取订阅正文。
+
+    - 多个 UA 回退：部分源（如饭太硬）只对 App 端 UA(okhttp) 返回真正的伪装
+      配置，对浏览器 UA 返回落地网页；
+    - 支持图片伪装订阅（.bmp/.jpg，正文是 JPEG 字节后追加的 base64 配置）。
+    """
+    last_text = ""
+    for ua in ("okhttp/3.15", "Mozilla/5.0"):
+        try:
+            r = await client.get(url, headers={"User-Agent": ua},
+                                 timeout=HTTP_TIMEOUT, follow_redirects=True)
+            r.raise_for_status()
+        except Exception:
+            continue
+        data = r.content or b""
+        # 图片伪装：JPEG/PNG 头
+        if data[:2] == b"\xff\xd8" or data[:8] == b"\x89PNG\r\n\x1a\n":
+            embedded = _image_embedded_text(data)
+            if embedded and parse_config_text(embedded):
+                return embedded
+        text = r.text
+        if parse_config_text(text):
+            return text
+        last_text = text
+    return last_text
 
 
 async def load_remote(url: str) -> tuple[list[dict], int]:
@@ -328,19 +438,14 @@ def classify_subscription(sites: list[dict], spider: str = "",
             "skipped": skipped, "jar_url": jar_url}
 
 
-async def load_subscription(url: str | None = None,
-                            text: str | None = None) -> tuple[list, int, str, str]:
-    """拉取/解析订阅，支持裸 JSON、base64、多订阅聚合。
-
-    返回 (sites, 子订阅数, spider, base)。spider 取顶层首个非空（TVBox 全局
-    spider jar 声明），base 为订阅根 URL（解析相对 jar 用；纯文本导入时为 ""）。
-    多订阅聚合时，每个 site 额外标注 `_spider_jar`（用其所在子订阅的 spider +
-    基址解析出的绝对 jar URL），分类时优先采用。
-    """
+async def load_subscription_full(url: str | None = None,
+                                 text: str | None = None):
+    """同 load_subscription，额外返回第 5 项 rules（顶层去广告规则列表）。"""
     seen: set[str] = set()
     all_sites: list[dict] = []
     spider = ""
     root_base = (url or "").strip() if url else ""
+    rules: list = []
 
     async def walk(u: str | None, raw: str | None, depth: int):
         nonlocal spider
@@ -360,6 +465,8 @@ async def load_subscription(url: str | None = None,
         sub_spider = cfg.get("spider") if isinstance(cfg.get("spider"), str) else ""
         if not spider and (depth == 0) and sub_spider:
             spider = sub_spider
+        if depth == 0 and isinstance(cfg.get("rules"), list):
+            rules.extend(cfg["rules"])
         sub_base = u or ""
         sub_jar = _spider_jar_url(sub_spider, sub_base)
         for st in extract_sites(cfg):
@@ -372,4 +479,12 @@ async def load_subscription(url: str | None = None,
                 await walk(sub, None, depth + 1)
 
     await walk(root_base or None, text, 0)
-    return all_sites, max(0, len(seen) - 1), spider, root_base
+    return all_sites, max(0, len(seen) - 1), spider, root_base, rules
+
+
+async def load_subscription(url: str | None = None,
+                            text: str | None = None) -> tuple[list, int, str, str]:
+    """拉取/解析订阅，支持裸 JSON、base64、多订阅聚合（向后兼容 4 元组）。"""
+    sites, subs, spider, base, _rules = await load_subscription_full(url=url,
+                                                                     text=text)
+    return sites, subs, spider, base

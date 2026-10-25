@@ -45,6 +45,10 @@ DEFAULTS = {
     "hot_library_enabled": True,
     # 虚拟“海量分类”四库媒体库（苹果 CMS 分类深翻）。与热门榜单相互独立开关。
     "catalog_library_enabled": True,
+    # 是否把每个启用的 TVBox 加固源（csp_*Guard，如比特/糯米/花花）生成为一张
+    # 独立“专区媒体库”卡片。默认关闭：加固源只作为播放时可切换的线路/搜索源，
+    # 不在媒体库列表里产生空库。需要专区墙时可在管理页打开。
+    "guard_zone_enabled": False,
     # 置顶的虚拟媒体库 guid 集合（打开=在飞牛影视媒体库列表置顶，关闭=普通顺序）。
     "pinned_libs": [],
     "hot_library_title": "🌐在线热门",
@@ -62,6 +66,13 @@ DEFAULTS = {
     # 播放、聚合搜索、CMS 探测等一律不走此代理（产品客户端保持 trust_env=False 直连）。
     # 形如 http://user:pass@host:port ；留空表示直连。
     "subscription_proxy": "",
+    # 检查/下载插件更新安装包时可选的 HTTP(S) 代理（仅更新用途）。
+    # 留空则回退 subscription_proxy，再不行直连。仅存于本机 state，不随包分发。
+    "update_proxy": "",
+    # m3u8 流层去广告总开关（TVBox/OK影视 Pro rules 引擎 + 通用启发式）。
+    "ad_filter_enabled": True,
+    # 播放时动态检测（无订阅 rules 时，按 DISCONTINUITY 分段+时长/CDN/位置识别广告段）。
+    "ad_filter_dynamic": True,
 }
 
 # 已废弃、需从旧配置里清除的键

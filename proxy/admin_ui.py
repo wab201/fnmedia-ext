@@ -351,6 +351,18 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         <div id="subProxyMsg" class="muted sm" style="margin-top:6px"></div>
       </div>
       <div class="card">
+        <div class="card-title">🛡 播放去广告（m3u8 流层）
+          <label style="float:right;display:flex;align-items:center;gap:6px;font-size:12px;font-weight:400;cursor:pointer">
+            <input type="checkbox" id="adfEnable" style="width:14px;height:14px;accent-color:var(--accent)" onchange="toggleAdfilter(this.checked)"/> 启用去广告</label></div>
+        <p class="card-sub">播放时实时检测当前线路并去除广告，兼容 TVBox / OK影视 Pro：<strong>① 动态检测</strong>——按分片间断边界、切片时长模式、CDN 切换、片头/片中位置实时识别广告段（无需订阅自带规则）；<strong>② 订阅 rules</strong>——导入订阅时自动收录其去广告正则，按线路域名精准剥除；<strong>③ 选集过滤</strong>——剔除“关注公众号/加微信/下载APP”假选集。识别不确定或可能误伤时自动保留，不影响播放。</p>
+        <div style="margin:6px 0">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+            <input type="checkbox" id="adfDynamic" style="width:14px;height:14px;accent-color:var(--accent)" onchange="toggleAdfilterDynamic(this.checked)"/>
+            播放时动态检测（识别订阅未提供规则的广告段）</label>
+        </div>
+        <div id="adfStatus" class="muted sm" style="margin-top:6px">正在加载去广告规则…</div>
+      </div>
+      <div class="card">
         <div class="card-title">TVBox / 影视仓 / OK影视 订阅</div>
         <p class="card-sub">自动识别并分类：标准苹果CMS影视站（type 0/1）
           能直接播放的<strong>自动启用</strong>；P2P/磁力/云盘等慢源与 jar/脚本暂未就绪的源导入后默认关闭，可在结果里开启或补传；
@@ -446,6 +458,15 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
             <a class="btn" id="updLink" target="_blank" rel="noopener" style="text-decoration:none">查看 Release</a>
           </div>
           <div id="updProgress" class="hint" style="display:none"></div>
+          <details style="margin-top:4px">
+            <summary class="muted sm" style="cursor:pointer">下载慢 / 直连失败？点此设置更新代理（可选）</summary>
+            <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
+              <input id="updProxy" type="text" class="input" placeholder="http://用户:密码@代理IP:端口（仅用于下载更新，留空直连）"
+                     style="flex:1;min-width:240px">
+              <button class="btn" id="updProxySave">保存代理</button>
+            </div>
+            <div class="hint">仅本机保存、不随安装包分发；保存后点“重新检查/立即更新”生效。</div>
+          </details>
         </div>
       </div>
 
@@ -495,7 +516,8 @@ async function switchPage(page){
   if(page==="overview"){renderOverview();startLivePoll();}
   if(page==="library"){loadLibs().then(renderLibrary);}
   if(page==="quality")renderQuality();
-  if(page==="importsub"){try{if(!CFG)await loadStatus();}catch(e){}try{if(typeof initSubProxy==="function")initSubProxy();}catch(e){}try{if(typeof loadSpiderMgmt==="function")loadSpiderMgmt();}catch(e){}try{if(typeof loadDrpyMgmt==="function")loadDrpyMgmt();}catch(e){}}
+  if(page==="tvbox"){try{loadGuardZone();}catch(e){}}
+  if(page==="importsub"){try{if(!CFG)await loadStatus();}catch(e){}try{if(typeof initSubProxy==="function")initSubProxy();}catch(e){}try{loadAdfilter();}catch(e){}try{if(typeof loadSpiderMgmt==="function")loadSpiderMgmt();}catch(e){}try{if(typeof loadDrpyMgmt==="function")loadDrpyMgmt();}catch(e){}}
   if(page==="about"){loadUpdate(false);}
 }
 $$("[data-page]").forEach(b=>b.addEventListener("click",()=>switchPage(b.dataset.page)));
@@ -573,6 +595,22 @@ document.addEventListener("DOMContentLoaded",()=>{
     }catch(e){alert("更新启动失败："+e.message);btn.disabled=false;}
   });
   if(rf)rf.addEventListener("click",()=>loadUpdate(true));
+  const ps=document.getElementById("updProxySave");
+  if(ps)ps.addEventListener("click",async()=>{
+    const v=(document.getElementById("updProxy").value||"").trim();
+    if(v && !/^(https?|socks5h?):\/\//.test(v)){alert("代理地址需以 http:// 或 https:// 或 socks5:// 开头");return;}
+    try{
+      const r=await jpost("/v/api/ext/config",{update_proxy:v});
+      if(r&&r.ok!==false){ps.textContent="已保存 ✓";setTimeout(()=>ps.textContent="保存代理",1500);loadUpdate(true);}
+      else{alert("保存失败");}
+    }catch(e){alert("保存失败："+e.message);}
+  });
+  // 回填已保存的更新代理
+  (async()=>{try{
+    const r=await jget("/v/api/ext/status");
+    const inp=document.getElementById("updProxy");
+    if(inp&&r.config&&r.config.update_proxy)inp.value=r.config.update_proxy;
+  }catch(e){}})();
 });
 
 /* ---------- 概览 ---------- */
@@ -965,8 +1003,46 @@ async function clearSubProxy(){
     $("subProxyMsg").textContent="已清空，当前直连";$("subProxyMsg").style.color="";toast("已切回直连");}
   else toast(r.msg||"失败","fail");
 }
+async function loadAdfilter(){
+  const box=$("adfStatus"), cb=$("adfEnable");
+  try{
+    const r=await jget("/v/api/ext/adfilter/status");
+    if(r.code!==0){box.textContent="去广告状态读取失败";return;}
+    const d=r.data||{};
+    if(cb)cb.checked=!!d.enabled;
+    const dyn=$("adfDynamic"); if(dyn)dyn.checked=d.dynamic!==false;
+    let h="";
+    if(d.enabled) h+='<span style="color:var(--ok,#3a9)">● 已启用</span>　';
+    else h+='<span class="muted">○ 已关闭</span>　';
+    h+="已收录订阅规则 <b>"+(d.rule_groups||0)+"</b> 组 / 域名 "+(d.hosts||[]).length
+       +" 个 / 规则 "+(d.regex_count||0)+" 条";
+    if((d.groups||[]).length){
+      h+='<div class="muted sm" style="margin-top:6px">覆盖域名：'
+        +d.groups.map(g=>esc((g.name||"")+"("+(g.hosts||[]).join(",")+")")).slice(0,12).join("、")
+        +(d.groups.length>12?" 等":"")+'</div>';
+    }else{
+      h+='<div class="muted sm" style="margin-top:6px">尚无订阅自带规则；仍会通用清理标准广告标记。导入带 rules 的订阅后自动收录。</div>';
+    }
+    box.innerHTML=h;
+  }catch(e){box.textContent="去广告状态读取失败："+esc(String(e));}
+}
+async function toggleAdfilter(on){
+  try{
+    const r=await jpost("/v/api/ext/adfilter/toggle",{enabled:!!on});
+    if(r.code===0){toast(on?"已开启播放去广告":"已关闭播放去广告");loadAdfilter();}
+    else{toast(r.msg||"操作失败","fail");}
+  }catch(e){toast(String(e),"fail");}
+}
+async function toggleAdfilterDynamic(on){
+  try{
+    const r=await jpost("/v/api/ext/adfilter/toggle",{dynamic:!!on});
+    if(r.code===0){toast(on?"已开启播放时动态检测":"已关闭动态检测");loadAdfilter();}
+    else toast(r.msg||"操作失败","fail");
+  }catch(e){toast(String(e),"fail");}
+}
 async function importSubscription(kind){
   const standalone=$("subStandalone").checked;
+  const payload={standalone:standalone,enable_guard:"smart"};
   if(kind==="url"){payload.url=$("subUrl").value.trim();if(!payload.url){toast("请填写订阅 URL","fail");return;}}
   else{payload.text=$("subText").value.trim();if(!payload.text){toast("请粘贴配置 JSON","fail");return;}}
   const out=$("subResult");out.innerHTML='<div class="muted sm">正在解析订阅并探测源，请稍候…</div>';
@@ -975,6 +1051,7 @@ async function importSubscription(kind){
     if(r.code!==0){out.innerHTML='<div class="hint" style="color:var(--danger)">导入失败：'+esc(r.msg||"")+'</div>';return;}
     renderSubResult(r.data||{});
     toast("导入完成");
+    try{loadAdfilter();}catch(e){}
     try{await loadStatus();}catch(e){}
     try{await loadGuard();}catch(e){}
     try{await loadSpiderMgmt();}catch(e){}

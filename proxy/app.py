@@ -660,6 +660,97 @@ async def forward_upstream(request: Request) -> Response:
                     media_type=r.headers.get("content-type"))
 
 
+# 需要逐块流式转发的响应类型（视频/文件/媒体流）。这些绝不能整包缓冲，
+# 否则本地播放几 GB 的影片会被一次性读进内存，打满 RAM+swap 拖死整机。
+_STREAM_CONTENT_TYPE = (
+    "video/", "audio/", "application/octet-stream", "application/x-mpegurl",
+    "application/vnd.apple.mpegurl", "image/", "multipart/", "binary",
+)
+
+
+def _is_stream_response(headers) -> bool:
+    ct = (headers.get("content-type") or "").lower()
+    return any(t in ct for t in _STREAM_CONTENT_TYPE)
+
+
+async def forward_upstream_streaming(request: Request) -> Response:
+    """流式原样透传官方后端：逐块转发、不缓冲整文件，支持 Range 拖动。
+
+    本地库视频/下载等大响应必须走这里。仅在判定为大文件/媒体流时流式，
+    普通 JSON 仍走缓冲版 forward_upstream（具名 JSON 路由直接调它，不受影响）。
+    """
+    try:
+        request.state.live_upstream = True
+    except Exception:
+        pass
+    client = up_client(request)
+    url = "http://localhost" + request.url.path
+    if request.url.query:
+        url += "?" + request.url.query
+    body = await request.body()
+    headers = {k: v for k, v in request.headers.items()
+               if k.lower() not in ("connection", "content-length", "host")}
+    headers["Host"] = "localhost"
+    # 大文件读取不能受普通 120s 总超时限制：用极宽 read 超时，连接阶段保持短超时。
+    stream_timeout = httpx.Timeout(connect=10.0, read=None, write=120.0, pool=10.0)
+    req = client.build_request(request.method, url, headers=headers, content=body,
+                               timeout=stream_timeout)
+    try:
+        up = await client.send(req, stream=True)
+    except Exception as exc:
+        return JSONResponse({"code": -1, "msg": f"upstream {type(exc).__name__}",
+                             "data": None}, status_code=502)
+
+    # 仅当能确定是“小响应”时才整包缓冲（普通 JSON API）；媒体/文件、超大响应、
+    # 或大小未知（分块）一律流式，绝不把大文件读进内存。
+    _SMALL_MAX = 4 * 1024 * 1024
+    ct = (up.headers.get("content-type") or "").lower()
+    looks_json = ("json" in ct) or ct.startswith("text/") or ct == ""
+    try:
+        clen = int(up.headers.get("content-length", "-1"))
+    except (TypeError, ValueError):
+        clen = -1
+    buffer_small = (request.method != "HEAD" and looks_json
+                    and 0 <= clen <= _SMALL_MAX)
+    if buffer_small:
+        try:
+            data = await up.aread()
+            resp_headers = _safe_response_headers(up.headers)
+            return Response(content=data, status_code=up.status_code,
+                            headers=resp_headers,
+                            media_type=up.headers.get("content-type"))
+        finally:
+            await up.aclose()
+
+    resp_headers = _safe_response_headers(up.headers)
+    # 流式透传需保留 length/range/encoding（aiter_raw 是原始字节，与 encoding 一致），
+    # 这几个被默认安全过滤丢弃，这里显式补回；播放器拖动(Range)依赖它们。
+    for _k in ("content-length", "content-range", "content-encoding",
+               "accept-ranges"):
+        _v = up.headers.get(_k)
+        if _v is not None:
+            try:
+                _v.encode("latin-1")
+                resp_headers[_k] = _v
+            except Exception:
+                pass
+
+    async def gen():
+        try:
+            async for chunk in up.aiter_raw(chunk_size=256 * 1024):
+                if chunk:
+                    yield chunk
+        except Exception:
+            # 客户端拖动/中断会触发取消：静默结束，连接由 finally 归还
+            pass
+        finally:
+            await up.aclose()
+
+    return StreamingResponse(gen(), status_code=up.status_code,
+                             headers=resp_headers,
+                             media_type=up.headers.get("content-type"))
+
+
 # ------------------------------------------------------------- 在线搜索
 
 async def _aggregate_briefs(keyword: str, maxn: int | None = None) -> list[dict]:
@@ -674,8 +765,13 @@ async def _aggregate_briefs(keyword: str, maxn: int | None = None) -> list[dict]
     # 播放线路（供播放器「切换线路」）；过滤解说/预告/无直链。
     loose_ids = {s["id"] for s in sources if s.get("loose_filter")}
     groups: dict[tuple, dict] = {}
+
+    # 预筛可分组标题，并统计每个规范片名的年份（加固/爬虫源常缺年份）。
+    # 归并规则：年份缺失的结果并入同规范片名“有年份且出现最多”的组，
+    # 避免加固源因缺年份单独成组、导致无法作为该影片的可切换线路。
+    cand: list = []
+    year_votes: dict[str, dict[str, int]] = {}
     for t in titles:
-        # 硬红线（涉未成年/非自愿）：任何情况下不注入搜索结果
         try:
             if catalogmod.is_redline(t.title, t.remarks):
                 continue
@@ -687,7 +783,23 @@ async def _aggregate_briefs(keyword: str, maxn: int | None = None) -> list[dict]
                     if e.direct or e.resolve]
         if not playable:
             continue
-        key = (_norm_title(t.title), t.year)
+        nt = _norm_title(t.title)
+        cand.append((t, nt, playable))
+        if t.year:
+            year_votes.setdefault(nt, {})
+            year_votes[nt][t.year] = year_votes[nt].get(t.year, 0) + 1
+
+    def _group_key_for(ntitle: str, year: str) -> tuple:
+        if year:
+            return (ntitle, year)
+        votes = year_votes.get(ntitle)
+        if votes:
+            best_year = max(votes, key=votes.get)
+            return (ntitle, best_year)
+        return (ntitle, year)
+
+    for t, nt, playable in cand:
+        key = _group_key_for(nt, t.year)
         g = groups.get(key)
         if g is None:
             g = {"rep": t, "lines": {}}
@@ -2024,7 +2136,9 @@ async def media_range(mg: str, request: Request):
         return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/preset.m3u8?index=0",
                                 status_code=302)
     if not target:
-        return await forward_upstream(request)
+        # 本地真实媒体字节（Flutter 原生播放器 Range 请求）：必须流式透传，
+        # 不能整包缓冲几 GB 的影片，否则打满内存/swap 拖死整机。
+        return await forward_upstream_streaming(request)
     # 同样【不在此同步解析】（会卡 App 起播、像点了没反应）：先瞬时 302 到对应代理，
     # 由 preset/main、direct 内部在播放加载阶段解析，并有双向 302 兜底。
     _wrapper, is_hls = _guess_wrapper(target)
@@ -2776,6 +2890,14 @@ async def _build_playlist_body(mg: str, picked: dict, request: Request):
     if text is None:
         return None, None
 
+    # m3u8 流层去广告（TVBox/OK影视 Pro rules 引擎 + 通用启发式），在改写分片前执行
+    try:
+        import adfilter as _adfilter
+        if _adfilter.enabled():
+            text, _ad_removed = _adfilter.filter_hls(text, src_url)
+    except Exception:
+        _log.info("hls adfilter failed", exc_info=True)
+
     sel_qs = ""
     if picked.get("line"):
         sel_qs = f'line={urllib.parse.quote(picked["line"])}&index={picked["index"]}'
@@ -3388,6 +3510,7 @@ async def ext_set_config(request: Request):
         "prefer_quality_source",
         "line_fastest", "line_fastest_max", "line_fastest_timeout",
         "line_fastest_prefer", "line_autofail",
+        "update_proxy",
     }
     patch = {k: v for k, v in body.items() if k in allowed}
     if "hot_library_title" in patch:
@@ -3401,6 +3524,9 @@ async def ext_set_config(request: Request):
     if "hot_refresh_interval" in patch:
         patch["hot_refresh_interval"] = max(1 * 3600, min(24 * 3600,
                                                           int(patch["hot_refresh_interval"])))
+    if "update_proxy" in patch:
+        pu = str(patch["update_proxy"]).strip()[:300]
+        patch["update_proxy"] = pu if re.match(r"^(https?|socks5h?)://", pu) else ""
     sources_changed = False
     if "sources" in body and isinstance(body["sources"], list):
         cur = {s["id"]: s for s in config.all_sources()}
@@ -3689,10 +3815,10 @@ async def ext_import_subscription(request: Request):
 
     try:
         if body.get("url"):
-            raw_sites, _subs, _spider, _base = await tvboxmod.load_subscription(
+            raw_sites, _subs, _spider, _base, _rules = await tvboxmod.load_subscription_full(
                 url=str(body["url"]).strip())
         elif body.get("text"):
-            raw_sites, _subs, _spider, _base = await tvboxmod.load_subscription(
+            raw_sites, _subs, _spider, _base, _rules = await tvboxmod.load_subscription_full(
                 text=str(body["text"]))
         else:
             return JSONResponse({"code": 400, "msg": "缺少 url 或 text"},
@@ -3701,6 +3827,14 @@ async def ext_import_subscription(request: Request):
         return JSONResponse({"code": 502,
                              "msg": f"获取/解析订阅失败：{type(exc).__name__}"},
                             status_code=502)
+
+    # 合并订阅自带的 m3u8 去广告规则（TVBox/OK影视 Pro rules），去重持久化
+    ad_rules_added = 0
+    try:
+        import adfilter as _adfilter
+        ad_rules_added = _adfilter.merge_subscription_rules(_rules or [])
+    except Exception:
+        _log.info("merge ad rules failed", exc_info=True)
 
     groups = tvboxmod.classify_subscription(raw_sites, _spider, _base)
     cms_cands = groups["cms"]
@@ -3777,7 +3911,45 @@ async def ext_import_subscription(request: Request):
         "runtime": runtime,
         "skipped": len(skipped),
         "skipped_detail": skipped[:60],
+        "ad_rules_added": ad_rules_added,
     }}
+
+
+@app.get("/v/api/ext/adfilter/status")
+async def ext_adfilter_status():
+    """m3u8 去广告状态：总开关 + 动态检测 + 已合并的订阅规则组数/域名数。"""
+    import adfilter as _adf
+    st = _adf.stats()
+    st["dynamic"] = _adf._dynamic_enabled()
+    # 附带各规则组的名称/域名，便于管理页展示
+    st["groups"] = [{"name": g.get("name", ""),
+                     "hosts": g.get("hosts", []),
+                     "regex": len(g.get("regex", []))}
+                    for g in _adf._load_rules()]
+    return {"code": 0, "msg": "", "data": st}
+
+
+@app.post("/v/api/ext/adfilter/toggle")
+async def ext_adfilter_toggle(request: Request):
+    """开关 m3u8 去广告。body: {"enabled":bool} 或 {"enabled":bool,"dynamic":bool}"""
+    import adfilter as _adf
+    body = await request.json()
+    if "dynamic" in body:
+        config.save({"ad_filter_dynamic": bool(body.get("dynamic"))})
+    if "enabled" in body:
+        _adf.set_enabled(bool(body.get("enabled")))
+    return {"code": 0, "msg": "",
+            "data": {"enabled": _adf.enabled(),
+                     "dynamic": _adf._dynamic_enabled()}}
+
+
+@app.post("/v/api/ext/adfilter/rules")
+async def ext_adfilter_replace_rules(request: Request):
+    """整体替换去广告规则（高级）。body: {"rules":[{name,hosts[],regex[]}]}"""
+    import adfilter as _adf
+    body = await request.json()
+    n = _adf.replace_rules(body.get("rules") or [])
+    return {"code": 0, "msg": "", "data": {"groups": n}}
 
 
 @app.get("/v/online-admin")
@@ -3796,4 +3968,6 @@ async def admin_page():
 @app.api_route("/{full_path:path}",
                methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def catch_all(request: Request, full_path: str):
-    return await forward_upstream(request)
+    # 本地视频/文件等大响应必须流式透传（不缓冲整文件），避免打满内存拖死系统；
+    # 该函数内部对普通 JSON 自动回落到缓冲透传。
+    return await forward_upstream_streaming(request)

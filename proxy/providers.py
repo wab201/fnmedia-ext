@@ -93,6 +93,14 @@ def _parse_play(vod_play_from: str, vod_play_note: str, vod_play_url: str,
             url = url.strip()
             if not _DIRECT_RE.match(url):
                 continue
+            ep_name = name.strip() or f"第{len(eps)+1}集"
+            # 选集层去广告：跳过“关注公众号/加微信/加群/下载APP”等引流假选集
+            try:
+                import adfilter as _adf
+                if _adf.is_ad_episode(ep_name):
+                    continue
+            except Exception:
+                pass
             direct = bool(_MEDIA_RE.search(url))
             # /share/<id> 等播放页：非直链但可按需解析出媒体地址
             resolvable = (not direct) and bool(
@@ -100,7 +108,7 @@ def _parse_play(vod_play_from: str, vod_play_note: str, vod_play_url: str,
             # ac=videodiag 等：请求该地址会 302 到真实 m3u8/mp4
             redirect_ep = bool(re.search(r"[?&]ac=videodiag\b", url, re.I))
             eps.append(Episode(
-                title=name.strip() or f"第{len(eps)+1}集",
+                title=ep_name,
                 url=url,
                 direct=direct or redirect_ep,  # 视为可播，播放时跟随 302
                 resolve=resolvable,
