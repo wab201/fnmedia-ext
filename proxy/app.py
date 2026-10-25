@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 import urllib.parse
 from contextlib import asynccontextmanager
@@ -141,7 +142,9 @@ def catalog_enabled() -> bool:
 
 
 def any_virtual_lib_enabled() -> bool:
-    return charts_enabled() or catalog_enabled()
+    if charts_enabled() or catalog_enabled():
+        return True
+    return False
 
 
 def _tv_compat_date(v) -> str:
@@ -397,6 +400,7 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(30), trust_env=False, follow_redirects=True)
     app.state.stop_hot = asyncio.Event()
     app.state.hot_task = asyncio.create_task(_hot_worker(app))
+
 
     # 后台只读检查 GitHub 更新（仅提示，绝不自动安装）
     app.state.stop_update = asyncio.Event()
@@ -1367,6 +1371,8 @@ async def item_list(request: Request):
     client = _client_of(request)
 
     # —— TVBox 加固源专区库 ——
+
+    # —— 🛡加固影视 聚合库：扁平海报墙，只读后台缓存，即时返回 ——
 
     # —— 小雅分类媒体库 ——
 

@@ -49,6 +49,9 @@ DEFAULTS = {
     # 独立“专区媒体库”卡片。默认关闭：加固源只作为播放时可切换的线路/搜索源，
     # 不在媒体库列表里产生空库。需要专区墙时可在管理页打开。
     "guard_zone_enabled": False,
+    # 是否在飞牛原生媒体库注入单张「🛡加固影视」聚合库（源→分类片单，后台预取
+    # 缓存、请求即时返回）。与 guard_zone_enabled（每源一张专区墙）相互独立。
+    "guard_native_enabled": True,
     # 置顶的虚拟媒体库 guid 集合（打开=在飞牛影视媒体库列表置顶，关闭=普通顺序）。
     "pinned_libs": [],
     "hot_library_title": "🌐在线热门",
