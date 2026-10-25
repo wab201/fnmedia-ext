@@ -3328,8 +3328,22 @@ async def _serve_online_poster(tok_path: str, request: Request) -> Response:
     try:
         r = await ext_client(request).get(u, headers=headers)
         ctype = (r.headers.get("content-type") or "").lower()
-        if r.status_code != 200 or not r.content or not ctype.startswith("image/"):
+        if r.status_code != 200 or not r.content:
             return _poster_fallback()
+        # 部分图床给 webp/jpg 标成 application/octet-stream，按魔数嗅探真实类型
+        sniff = ""
+        head = r.content[:12]
+        if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+            sniff = "image/webp"
+        elif head[:8] == b"\x89PNG\r\n\x1a\n":
+            sniff = "image/png"
+        elif head[:3] == b"\xff\xd8\xff":
+            sniff = "image/jpeg"
+        elif head[:6] in (b"GIF87a", b"GIF89a"):
+            sniff = "image/gif"
+        if not (ctype.startswith("image/") or sniff):
+            return _poster_fallback()
+        ctype = ctype if ctype.startswith("image/") else sniff
     except Exception:
         return _poster_fallback()
     return Response(content=r.content, status_code=200,
