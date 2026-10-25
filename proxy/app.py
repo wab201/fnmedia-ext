@@ -22,6 +22,7 @@ import re
 import threading
 import time
 import urllib.parse
+import zlib
 from contextlib import asynccontextmanager
 
 import httpx
