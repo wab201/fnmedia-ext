@@ -140,6 +140,28 @@ async def search(client: httpx.AsyncClient, source: dict, keyword: str):
     return [title for row in rows if (title := map_title(row, source)) is not None]
 
 
+async def home(client: httpx.AsyncClient, source: dict) -> dict:
+    result = await request(client, source, {"filter": "true"})
+    if not isinstance(result.get("class"), list) and not isinstance(result.get("list"), list):
+        raise T4Error("T4 首页缺少 class/list 列表")
+    if any(result.get(key) is not None and not isinstance(result[key], list)
+           for key in ("class", "list")):
+        raise T4Error("T4 首页 class/list 格式错误")
+    return result
+
+
+async def category(client: httpx.AsyncClient, source: dict, tid: str,
+                   page: int = 1, filters: dict | None = None) -> dict:
+    # Plugin initialization ext and category extend are independent contracts.
+    result = await request(client, source, {
+        "ac": "detail", "t": tid, "pg": page, "filter": "true",
+        "extend": json.dumps(filters or {}, ensure_ascii=False, separators=(",", ":")),
+    })
+    if not isinstance(result.get("list"), list):
+        raise T4Error("T4 分类缺少 list 列表")
+    return result
+
+
 async def detail(client: httpx.AsyncClient, source: dict, locator: dict,
                  fallback: dict | None = None):
     vod_id = locator["vod_id"]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 from collections import OrderedDict
 
@@ -15,6 +16,7 @@ class T4Service:
         self._fresh = OrderedDict()
         self._playbacks = OrderedDict()
         self._play_locks = {}
+        self._sessions = OrderedDict()
 
     def source(self, source_id: str) -> dict:
         source = next((s for s in self.config.all_sources()
@@ -92,6 +94,44 @@ class T4Service:
         key = (target["online_guid"], target.get("episode_key") or
                str(target.get("index", 0)), target.get("line", ""))
         self._playbacks.pop(key, None)
+
+    def cached_line_for_url(self, target: dict, url: str) -> str | None:
+        episode = target.get("episode_key") or str(target.get("index", 0))
+        lines = {key[2] for key, (_, result) in self._playbacks.items()
+                 if key[:2] == (target["online_guid"], episode) and result.url == url}
+        # The URL selects a line only; resolve() still enforces freshness.
+        return next(iter(lines)) if len(lines) == 1 else None
+
+    def owns_playback_url(self, url: str) -> bool:
+        return any(result.url == url for _, result in self._playbacks.values())
+
+    def create_session(self, media_guid: str, target: dict) -> str:
+        now = time.monotonic()
+        while self._sessions and (len(self._sessions) >= 128 or
+                                 next(iter(self._sessions.values()))[0] <= now):
+            self._sessions.popitem(last=False)
+        key = secrets.token_urlsafe(18)
+        self._sessions[key] = now + 6 * 3600, media_guid, dict(target)
+        return key
+
+    def session_target(self, media_guid: str, key: str) -> dict | None:
+        hit = self._sessions.get(key)
+        if not hit or hit[0] <= time.monotonic():
+            self._sessions.pop(key, None)
+            return None
+        if hit[1] != media_guid:
+            return None
+        self._sessions.move_to_end(key)
+        self._sessions[key] = time.monotonic() + 6 * 3600, media_guid, hit[2]
+        return dict(hit[2])
+
+    def set_session_target(self, media_guid: str, key: str, target: dict):
+        if self.session_target(media_guid, key) is not None:
+            self._sessions[key] = time.monotonic() + 6 * 3600, media_guid, dict(target)
+
+    def close_session(self, media_guid: str, key: str):
+        if self.session_target(media_guid, key) is not None:
+            self._sessions.pop(key, None)
 
     async def _player(self, client, source: dict, target: dict) -> t4.Playback:
         guid = target["online_guid"]

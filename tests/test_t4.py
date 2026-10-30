@@ -214,7 +214,7 @@ class T4StateTests(unittest.IsolatedAsyncioTestCase):
     def test_classification_and_import_persistence(self):
         sites = [
             {"type": 4, "key": "pan", "name": "115云盘", "api": SOURCE["api"],
-             "searchable": 0, "filterable": 1},
+             "searchable": 0, "filterable": 1, "indexs": 0},
             {"type": 4, "key": "off", "name": "Disabled", "api": SOURCE["api"] + "&v=2",
              "enabled": False},
             {"type": 3, "key": "push", "name": "Push", "api": "csp_Push"},
@@ -231,6 +231,7 @@ class T4StateTests(unittest.IsolatedAsyncioTestCase):
         imported = [s for s in reloaded.all_sources() if s.get("kind") == "t4"]
         self.assertEqual(len(imported), 3)
         self.assertTrue(next(s for s in imported if s.get("site_key") == "pan")["filterable"])
+        self.assertFalse(next(s for s in imported if s.get("site_key") == "pan")["indexs"])
 
     async def test_lazy_singleflight_refresh_restart_and_episode_identity(self):
         guid = self.remember_card()
@@ -433,6 +434,21 @@ class T4StateTests(unittest.IsolatedAsyncioTestCase):
         self.store.remember_merged([inject.brief_of(title)])
         self.assertEqual(self.store.tv_episode_guids(guid), [])
 
+    def test_playback_sessions_are_bounded_expiring_and_media_scoped(self):
+        target = {"online_guid": "title", "line": "A"}
+        with patch("t4_service.time.monotonic", return_value=0):
+            first = self.service.create_session("media-a", target)
+            self.assertIsNone(self.service.session_target("media-b", first))
+            self.assertEqual(self.service.session_target("media-a", first), target)
+            self.service.set_session_target("media-a", first, dict(target, line="B"))
+            self.assertEqual(self.service.session_target("media-a", first)["line"], "B")
+            for _ in range(128):
+                latest = self.service.create_session("media-a", target)
+        self.assertEqual(len(self.service._sessions), 128)
+        self.assertNotIn(first, self.service._sessions)
+        with patch("t4_service.time.monotonic", return_value=21601):
+            self.assertIsNone(self.service.session_target("media-a", latest))
+
 
 class MediaTests(unittest.IsolatedAsyncioTestCase):
     def test_private_media_stays_server_side(self):
@@ -578,13 +594,60 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
                              b"synthetic-media")
         self.assertEqual(len(calls), 4)
 
+    async def test_hls_repeated_byterange_uri_keeps_one_resource_identity(self):
+        media = t4_media.T4Media()
+        playback = t4.Playback("https://media.test/video.m3u8",
+                               {"Referer": "needed"}, "HLS")
+        manifest = ('#EXTM3U\n#EXT-X-TARGETDURATION:6\n'
+                    '#EXT-X-MAP:URI="video.mp4",BYTERANGE="16@0"\n'
+                    '#EXTINF:6,\n#EXT-X-BYTERANGE:16@16\nvideo.mp4\n'
+                    '#EXTINF:6,\n#EXT-X-BYTERANGE:16\nvideo.mp4\n#EXT-X-ENDLIST\n')
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, text=manifest))) as client:
+            first = await media.deliver(client, playback.url, playback,
+                                        SimpleNamespace(method="GET", headers={}))
+            second = await media.deliver(client, playback.url, playback,
+                                         SimpleNamespace(method="GET", headers={}))
+        uris = [line for line in first.body.decode().splitlines()
+                if line and not line.startswith("#")]
+        self.assertEqual(uris[0], uris[1])
+        self.assertIn(f'URI="{uris[0]}"', first.body.decode())
+        self.assertIn("#EXT-X-BYTERANGE:16\n", first.body.decode())
+        self.assertEqual(first.body, second.body)
+        self.assertEqual(len(media._resources), 1)
+
+    def test_hls_resource_identity_includes_headers_and_role(self):
+        media = t4_media.T4Media()
+        url = "https://media.test/resource"
+        first = t4.Playback(url, {"Cookie": "session-a"}, "HLS")
+        second = t4.Playback(url, {"Cookie": "session-b"}, "HLS")
+        self.assertEqual(media.resource(url, first), media.resource(url, first))
+        self.assertNotEqual(media.resource(url, first), media.resource(url, second))
+        self.assertNotEqual(media.resource(url, first),
+                            media.resource(url, first, manifest=True))
+
+    async def test_hls_head_exposes_playlist_mime_for_native_players(self):
+        media = t4_media.T4Media()
+        playback = t4.Playback("https://media.test/manifest",
+                               {"Referer": "needed"}, "HLS")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": "100"}))) as client:
+            response = await media.deliver(client, playback.url, playback,
+                                          SimpleNamespace(method="HEAD", headers={}))
+        self.assertTrue(response.headers["content-type"].startswith(
+            "application/vnd.apple.mpegurl"))
+        self.assertNotIn("content-length", response.headers)
+        self.assertEqual(response.body, b"")
+
     async def test_resource_expiration_and_limit(self):
         media = t4_media.T4Media()
         playback = t4.Playback("http://media.test/v.mp4", {}, "MP4")
         with patch("t4_media.time.monotonic", return_value=0):
             first = media.resource(playback.url, playback)
-            for _ in range(4100):
-                media.resource(playback.url, playback)
+            for i in range(4100):
+                media.resource(f"http://media.test/{i}.mp4", playback)
         self.assertEqual(len(media._resources), 4096)
         with patch("t4_media.time.monotonic", return_value=21601):
             response = await media.resource_response(None, first.rsplit("/", 1)[-1], None)

@@ -45,6 +45,7 @@ DEFAULTS = {
     "hot_library_enabled": True,
     # 虚拟“海量分类”四库媒体库（苹果 CMS 分类深翻）。与热门榜单相互独立开关。
     "catalog_library_enabled": True,
+    "t4_library_enabled": True,
     # 是否把每个启用的 TVBox 加固源（csp_*Guard，如比特/糯米/花花）生成为一张
     # 独立“专区媒体库”卡片。默认关闭：加固源只作为播放时可切换的线路/搜索源，
     # 不在媒体库列表里产生空库。需要专区墙时可在管理页打开。
@@ -126,7 +127,7 @@ class Config:
                 m["standalone"] = bool(s.get("standalone", False))
                 m["loose_filter"] = bool(s.get("loose_filter", False))
                 m["builtin"] = bool(s.get("builtin", False))
-                for key in ("kind", "site_key", "ext", "searchable", "filterable", "method"):
+                for key in ("kind", "site_key", "ext", "searchable", "filterable", "indexs", "method"):
                     if key in s:
                         m[key] = s[key]
                 merged.append(m)
@@ -286,7 +287,7 @@ class Config:
             if not target:
                 return False, "源不存在"
             if target.get("kind") == "t4" and on:
-                return False, "T4 分类库尚未接入，当前请使用原生搜索"
+                return False, "T4 来源统一显示在「T4 选片」，无需逐插件建立独立库"
             target["standalone"] = bool(on)
             self._persist(cfg)
             return True, "ok"

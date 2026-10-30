@@ -182,6 +182,7 @@ def classify_site(site: dict) -> tuple[str, dict | None]:
             "enabled": t4.switch(site.get("enabled")),
             "searchable": t4.switch(searchable),
             "filterable": t4.switch(site.get("filterable"), False),
+            "indexs": t4.switch(site.get("indexs")),
             "method": "POST" if str(site.get("method", "")).upper() == "POST" else "GET",
             "raw_type": t,
         }
