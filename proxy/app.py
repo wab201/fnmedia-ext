@@ -32,6 +32,9 @@ from fastapi.responses import (JSONResponse, RedirectResponse,
 
 import features
 import providers
+import t4
+from t4_service import T4Service
+from t4_media import T4Media
 import client as clientmod
 import live as livemod
 import inject as inj
@@ -51,6 +54,8 @@ import updater
 from store import (store, make_guid, media_guid, video_guid, is_online_guid,
                    season_guid, episode_guid, ep_media_guid, ep_video_guid)
 
+t4_service = T4Service(store, config)
+t4_media = T4Media()
 UPSTREAM_SOCK = os.environ.get("FNMEDIA_UPSTREAM_SOCK",
                                "/var/run/trim_media_upstream.sock")
 ONLINE_PREFIX = "/v/media/online"
@@ -243,7 +248,7 @@ def start_resolve_chart(guid: str) -> asyncio.Future | None:
                 fut.set_result(None)
                 return
             briefs = await asyncio.wait_for(
-                _aggregate_briefs(item["title"], 12), timeout=25)
+                _aggregate_briefs(item["title"], 12, include_t4=False), timeout=25)
             # 相关性：归一化片名必须包含完整榜单片名（分词全部命中），否则视为无源
             want = _norm_title(item["title"])
             want_tokens = [_norm_title(t) for t in re.split(r"[\s]+", item["title"]) if _norm_title(t)]
@@ -758,17 +763,25 @@ async def forward_upstream_streaming(request: Request) -> Response:
 
 # ------------------------------------------------------------- 在线搜索
 
-async def _aggregate_briefs(keyword: str, maxn: int | None = None) -> list[dict]:
+async def _aggregate_briefs(keyword: str, maxn: int | None = None,
+                            *, include_t4: bool = True) -> list[dict]:
     """聚合搜索所有启用源 → 跨源合并 → 去噪/去无直链 → brief 列表（已入库）。"""
     # 可选特性源不进入全局搜索（公开构建下该开关恒关，等价于不过滤）。
     sources = [s for s in config.enabled_sources()
-               if not (features.ADULT and s.get("adult"))]
-    titles = await providers.search_all(keyword, sources)
+               if not (features.ADULT and s.get("adult"))
+               and (include_t4 or s.get("kind") != "t4")]
+    titles = await providers.search_all(
+        keyword, sources, budget=5.0 if any(s.get("kind") == "t4" for s in sources) else None)
     if maxn is None:
         maxn = int(config.get().get("max_per_keyword", 12))
     # 跨源同名合并：同 规范化片名+年份 聚成一个条目，每个来源各成一条
     # 播放线路（供播放器「切换线路」）；过滤解说/预告/无直链。
     loose_ids = {s["id"] for s in sources if s.get("loose_filter")}
+    # T4 search cards intentionally have no episode list. Never merge them by name.
+    remote = [inj.brief_of(t) for t in titles if t.locator.get("kind") == "t4"
+              and not catalogmod.is_redline(t.title, t.remarks)
+              and (t.provider in loose_ids or not config.is_junk(t.title, t.remarks))]
+    titles = [t for t in titles if t.locator.get("kind") != "t4"]
     groups: dict[tuple, dict] = {}
 
     # 预筛可分组标题，并统计每个规范片名的年份（加固/爬虫源常缺年份）。
@@ -838,7 +851,7 @@ async def _aggregate_briefs(keyword: str, maxn: int | None = None) -> list[dict]
         brief = inj.brief_of(g["rep"])
         brief["lines"] = g["lines"]
         briefs.append(brief)
-    return store.remember_merged(briefs)
+    return store.remember_merged((remote + briefs)[:maxn])
 
 
 async def online_search(keyword: str, client: httpx.AsyncClient) -> list:
@@ -1515,8 +1528,73 @@ async def search_list(request: Request):
 
 # ------------------------------------------------------------- 详情 / 播放
 
+async def _load_t4_detail(guid: str, request: Request):
+    ep = store.get_episode(guid)
+    if ep:
+        guid = ep["online_guid"]
+    if not store.get_title_by_guid(guid):
+        guid = next((og for og in store._titles if season_guid(og) == guid), guid)
+    try:
+        await t4_service.ensure_detail(ext_client(request), guid)
+    except t4.T4Error as exc:
+        _log.warning("T4 detail %s: %s", guid, exc)
+        return JSONResponse({"code": -1, "msg": str(exc), "data": None},
+                            status_code=502)
+    return None
+
+
+async def _t4_play_response(mg: str, target: dict, body: dict, request: Request):
+    try:
+        result = await t4_service.resolve(ext_client(request), target)
+        await t4_media.identify(ext_client(request), result)
+        if result.wrapper == "DASH":
+            raise t4.T4Error("当前飞牛适配尚未验证 DASH/双轨播放，未改写为 HLS")
+    except t4.T4Error as exc:
+        _log.warning("T4 play %s: %s", mg, exc)
+        return JSONResponse({"code": -1, "msg": str(exc), "data": None},
+                            status_code=502)
+    # Headers stay server-side; unsigned public results need no extra media hop.
+    link = f"{ONLINE_PREFIX}/{mg}/t4?" + urllib.parse.urlencode(
+        {"line": target["line"]}) if result.needs_proxy else result.url
+    return JSONResponse({"code": 0, "msg": "", "data": {
+        "audio_guid": "", "audio_index": -1, "hls_time": 6,
+        "is_subtitle_external": 0, "media_guid": mg, "play_link": link,
+        "subtitle_guid": "", "subtitle_index": -1, "subtitle_link": "",
+        "video_guid": body.get("video_guid", vg_for(mg)), "video_index": 0,
+        "wrapper": result.wrapper, "non_fatal_errno": None, "video_encoder": "",
+        "not_supported_resolution": "", "supported_highest_resolution": ""}})
+
+
+@app.api_route(f"{ONLINE_PREFIX}/{{mg}}/t4", methods=["GET", "HEAD"])
+async def t4_range(mg: str, request: Request):
+    target = store.resolve_media_guid(mg)
+    if not target or not target.get("t4"):
+        return Response("not found", status_code=404)
+    if request.query_params.get("line"):
+        target = dict(target, line=request.query_params["line"])
+    try:
+        result = await t4_service.resolve(ext_client(request), target)
+        await t4_media.identify(ext_client(request), result)
+        if result.wrapper == "DASH":
+            raise t4.T4Error("当前飞牛适配尚未验证 DASH/双轨播放")
+    except t4.T4Error as exc:
+        return Response(str(exc), status_code=502)
+    response = await t4_media.deliver(ext_client(request), result.url, result, request)
+    if response.status_code >= 400:
+        t4_service.invalidate_playback(target)
+    return response
+
+
+@app.api_route("/v/media/t4-resource/{token}", methods=["GET", "HEAD"])
+async def t4_resource(token: str, request: Request):
+    return await t4_media.resource_response(ext_client(request), token, request)
+
+
 @app.get("/v/api/v1/item/{guid}")
 async def item_detail(guid: str, request: Request):
+    error = await _load_t4_detail(guid, request)
+    if error is not None:
+        return error
     client = _client_of(request)
     # 单源独立媒体库根节点
     sscope = standalone_source_of(guid)
@@ -1658,6 +1736,9 @@ async def item_detail(guid: str, request: Request):
 
 @app.get("/v/api/v1/season/list/{guid}")
 async def season_list_route(guid: str, request: Request):
+    error = await _load_t4_detail(guid, request)
+    if error is not None:
+        return error
     brief = store.get_title_by_guid(guid)
     if not brief or not inj.is_tv(brief):
         return await forward_upstream(request)
@@ -1681,6 +1762,9 @@ async def episode_list_route(guid: str, request: Request):
             tv = guid
     if not tv:
         return await forward_upstream(request)
+    error = await _load_t4_detail(tv, request)
+    if error is not None:
+        return error
     client = _client_of(request)
     return JSONResponse({"code": 0, "msg": "",
                          "data": clientmod.normalize_cards(
@@ -1689,6 +1773,9 @@ async def episode_list_route(guid: str, request: Request):
 
 @app.get("/v/api/v1/stream/list/{guid}")
 async def stream_list(guid: str, request: Request):
+    error = await _load_t4_detail(guid, request)
+    if error is not None:
+        return error
     ep = store.get_episode(guid)
     target = None
     if ep:
@@ -1958,6 +2045,9 @@ async def play_info(request: Request):
     body = json.loads(await request.body() or b"{}")
     guid = body.get("item_guid", "")
     client = _client_of(request)
+    error = await _load_t4_detail(guid, request)
+    if error is not None:
+        return error
 
 
     def _prewarm_from_info(info: dict):
@@ -2041,6 +2131,9 @@ def _line_choices(target: dict) -> list[dict]:
                             t.get("resolve", False)))
     out, seen_provider, seen_name = [], set(), set()
     for t in raw:
+        if target.get("t4"):
+            out.append({**t, "label": t["line"]})
+            continue
         provider = t["line"].split("::", 1)[0]
         name = _PROVIDER_CN.get(provider, provider)
         if provider in seen_provider:
@@ -2127,7 +2220,7 @@ async def stream_post(request: Request):
         "qualities": quals, "cloud_storage_info": None}})
 
 
-@app.get("/v/api/v1/media/range/{mg}")
+@app.api_route("/v/api/v1/media/range/{mg}", methods=["GET", "HEAD"])
 async def media_range(mg: str, request: Request):
     """App（Flutter 原生播放器）不走 /play/play，而是直接 GET /media/range/<mg>。
 
@@ -2148,6 +2241,8 @@ async def media_range(mg: str, request: Request):
         # 本地真实媒体字节（Flutter 原生播放器 Range 请求）：必须流式透传，
         # 不能整包缓冲几 GB 的影片，否则打满内存/swap 拖死整机。
         return await forward_upstream_streaming(request)
+    if target.get("t4"):
+        return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/t4", status_code=302)
     # 同样【不在此同步解析】（会卡 App 起播、像点了没反应）：先瞬时 302 到对应代理，
     # 由 preset/main、direct 内部在播放加载阶段解析，并有双向 302 兜底。
     _wrapper, is_hls = _guess_wrapper(target)
@@ -2204,6 +2299,8 @@ async def play_play(request: Request):
                 target = base_target
     else:
         target = base_target
+    if target.get("t4"):
+        return await _t4_play_response(mg, target, body, request)
     # 起播体验：此处【不再同步解析】播放页/302/专有解码（慢源要 1~3 秒，会把用户
     # 卡在海报墙像“点了没反应”）。先瞬时返回播放地址让播放器立刻进入加载页转圈，
     # 真正的解析延迟到播放器内部取 main.m3u8 / direct 时再做（那里本就有加载指示）。
@@ -3009,6 +3106,8 @@ async def _get_playlist_cached(mg: str, picked: dict, request: Request):
 
 def _warm_playlist(mg: str, picked: dict, request: Request) -> None:
     """点击播放时后台预热默认线路播放列表（单飞，真正取 main 时并入同一任务）。"""
+    if picked.get("t4"):
+        return
     key = _playlist_cache_key(picked)
     hit = _PLAYLIST_CACHE.get(key)
     if hit and time.time() - hit[0] < _PLAYLIST_TTL:
@@ -3562,7 +3661,7 @@ async def ext_set_config(request: Request):
                     sources_changed = True
                 if isinstance(ch.get("standalone"), bool) and \
                         bool(cur[sid].get("standalone")) != ch["standalone"]:
-                    cur[sid]["standalone"] = ch["standalone"]
+                    cur[sid]["standalone"] = ch["standalone"] and cur[sid].get("kind") != "t4"
                     sources_changed = True
                 if isinstance(ch.get("loose_filter"), bool):
                     cur[sid]["loose_filter"] = ch["loose_filter"]
@@ -3701,13 +3800,13 @@ async def ext_source_test(request: Request):
     body = await request.json()
     api = (body.get("api") or "").strip()
     sid = body.get("id")
+    src = next((s for s in config.all_sources() if s["id"] == sid), None)
     if not api and sid:
-        src = next((s for s in config.all_sources() if s["id"] == sid), None)
         if not src:
             return JSONResponse({"code": 404, "msg": "源不存在"}, status_code=404)
         api = src["api"]
     keyword = (body.get("keyword") or "庆余年").strip()
-    result = await providers.probe_source(api, keyword=keyword)
+    result = await providers.probe_source(api, keyword=keyword, source=src)
     return {"code": 0, "msg": "", "data": result}
 
 
@@ -3715,7 +3814,7 @@ async def ext_source_test(request: Request):
 async def ext_source_test_all(request: Request):
     """并发探测全部源，返回 [{id,name,...result}]。"""
     async def one(s):
-        r = await providers.probe_source(s["api"])
+        r = await providers.probe_source(s["api"], source=s)
         r.update(id=s["id"], name=s["name"], enabled=bool(s.get("enabled")),
                  builtin=bool(s.get("builtin")))
         return r
@@ -3727,10 +3826,10 @@ async def ext_source_test_all(request: Request):
 
 @app.post("/v/api/ext/source/import-tvbox")
 async def ext_import_tvbox(request: Request):
-    """导入 TVBox/影视仓/OK影视配置中的标准苹果CMS JSON/XML 源。
+    """导入 TVBox 配置中的 CMS 与远程 T4 源。
 
     入参：{url?} 或 {text?}，外加 standalone（可选）。对候选源做轻量探测，
-    通过者加入自定义源；爬虫 jar / 网盘 / 直播源跳过。
+    CMS 探测通过后导入；T4 只登记来源，不预运行插件。
     """
     import tvbox as tvboxmod
     body = await request.json()
@@ -3751,10 +3850,14 @@ async def ext_import_tvbox(request: Request):
                             status_code=502)
 
     candidates: list[dict] = []
+    t4_candidates: list[dict] = []
     seen_api: set[str] = set()
     skipped: list[str] = []
     for s in sites:
         status, norm = tvboxmod.classify_site(s)
+        if status == "add_t4":
+            t4_candidates.append(norm)
+            continue
         if not norm:
             nm = str(s.get("name") or s.get("key") or s.get("api") or "未命名")
             if nm not in skipped:
@@ -3797,7 +3900,8 @@ async def ext_import_tvbox(request: Request):
             dup += 1
         if len(added_names) >= 40:
             break
-    if added_names:
+    t4_report = config.import_t4_sources(t4_candidates)
+    if added_names or t4_report["added"]:
         _search_cache.clear()
         if standalone:
             _schedule_routes_refresh()
@@ -3807,8 +3911,9 @@ async def ext_import_tvbox(request: Request):
     return {"code": 0, "msg": "", "data": {
         "scanned": len(sites),
         "candidates": len(candidates),
-        "added": len(added_names),
-        "added_names": added_names,
+        "added": len(added_names) + t4_report["added"],
+        "added_names": added_names + t4_report["added_names"],
+        "t4": t4_report,
         "duplicate": dup,
         "skipped": len(skipped),
         "skipped_detail": skipped[:40],
@@ -3860,6 +3965,7 @@ async def ext_import_subscription(request: Request):
         _log.info("merge ad rules failed", exc_info=True)
 
     groups = tvboxmod.classify_subscription(raw_sites, _spider, _base)
+    t4_report = config.import_t4_sources(groups.get("t4", []))
     cms_cands = groups["cms"]
     guard_sites = groups["guard"]
     csp_items = groups.get("csp", [])
@@ -3913,7 +4019,7 @@ async def ext_import_subscription(request: Request):
     csp_report = None
     drpy_report = None
 
-    if cms_added or (guard_report and guard_report.get("enabled_count")) \
+    if cms_added or t4_report["added"] or (guard_report and guard_report.get("enabled_count")) \
             or (csp_report and csp_report.get("added")) \
             or (drpy_report and drpy_report.get("added")):
         _search_cache.clear()
@@ -3922,6 +4028,7 @@ async def ext_import_subscription(request: Request):
     return {"code": 0, "msg": "", "data": {
         "scanned": len(raw_sites),
         "subscriptions": _subs,
+        "t4": t4_report,
         "cms": {
             "candidates": len(cms_cands),
             "added": len(cms_added),

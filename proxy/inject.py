@@ -37,6 +37,8 @@ def is_tv(b: dict) -> bool:
     if "综艺" in typ and _ep_count(b) <= 1:
         return False
     if any(w in typ for w in _TV_TYPE_WORDS):
+        if b.get("locator", {}).get("kind") == "t4" and not b.get("lines"):
+            return True
         return _ep_count(b) > 0
     return _ep_count(b) > 1
 
@@ -83,6 +85,7 @@ def brief_of(t: providers.OnlineTitle) -> dict:
         "director": t.director,
         "area": t.area,
         "lines": {name: [e.__dict__ for e in eps] for name, eps in t.sources.items()},
+        "locator": t.locator,
     }
 
 
@@ -91,6 +94,9 @@ def _f(b: dict, k, d=""):
 
 
 def _ep_count(b: dict) -> int:
+    if b.get("locator", {}).get("kind") == "t4":
+        return len({e.get("episode_key") for eps in b.get("lines", {}).values()
+                    for e in eps if e.get("episode_key")})
     return sum(len(e) for e in b.get("lines", {}).values())
 
 
@@ -140,7 +146,8 @@ def search_item(b: dict) -> dict:
         "status": "在线",
         "overview": _f(b, "overview")[:500],
         "ancestor_guid": "",
-        "ancestor_name": f"🌐在线·{year}·{area}" if area else "🌐在线资源",
+        "ancestor_name": b.get("locator", {}).get("source_name") or
+        (f"🌐在线·{year}·{area}" if area else "🌐在线资源"),
         "ancestor_category": typ,
         "ts": 0,
         "duration": 0,
@@ -243,10 +250,15 @@ def episode_list(b: dict) -> list[dict]:
     # 必须与 store._direct_eps 的过滤完全一致（direct 或可按需解析的 resolve 页），
     # 否则 episode/list 的第 i 张卡与 store 用同一 episode_guid(guid,"",i) 建立的
     # 集索引错位：点第 k 集播另一集，甚至 404。
-    eps = [e for e in b["lines"][line] if e.get("direct") or e.get("resolve")]
+    if b.get("locator", {}).get("kind") == "t4":
+        eps = [{"title": _st.store.get_episode(eg)["ep_title"]}
+               for eg in _st.store.tv_episode_guids(guid)]
+    else:
+        eps = [e for e in b["lines"].get(line, [])
+               if e.get("direct") or e.get("resolve")]
     out = []
     for i, e in enumerate(eps):
-        eg = episode_guid(guid, "", i)  # 集身份不绑定线路
+        eg = _st.store.episode_guid_at(guid, i)
         out.append(_base_item(
             guid=eg, type="Episode",
             title=e.get("title") or f"第{i+1}集",

@@ -75,7 +75,7 @@ class Store:
 
     def _load(self):
         try:
-            j = json.loads(_STATE.read_text())
+            j = json.loads(_STATE.read_text(encoding="utf-8"))
             self._titles = j.get("titles", {})
             self._orig = j.get("orig", {})
         except Exception:
@@ -85,16 +85,82 @@ class Store:
     def _direct_eps(self, brief: dict, line: str) -> list[dict]:
         # 可直接播放，或可按需解析的播放页（/share/<id>）
         return [e for e in brief.get("lines", {}).get(line, [])
-                if e.get("direct") or e.get("resolve")]
+                if e.get("direct") or e.get("resolve") or e.get("t4")]
+
+    def _t4_rows(self, brief: dict) -> list[dict]:
+        rows = {}
+        default = self.best_line(brief["guid"])
+        lines = ([default] if default else []) + [
+            ln for ln in brief.get("lines", {}) if ln != default]
+        for line in lines:
+            eps = self._direct_eps(brief, line)
+            counts = {}
+            for ep in eps:
+                key = ep.get("episode_key", "")
+                counts[key] = counts.get(key, 0) + 1
+            for ep in eps:
+                key = ep.get("episode_key", "")
+                # Duplicate labels have no unambiguous identity; do not guess by index.
+                if not key or counts[key] != 1:
+                    continue
+                row = rows.setdefault(key, {"key": key, "title": ep["title"], "per": {}})
+                row["per"][line] = ep
+        def order(row):
+            key = row["key"]
+            parts = key.split(":")
+            if key.startswith("episode:"):
+                return 0, 1, int(parts[1])
+            if key.startswith("season:"):
+                return 0, int(parts[1]), int(parts[3])
+            return 1, 0, 0
+        return sorted(rows.values(), key=order)
+
+    def episode_guid_at(self, og: str, index: int) -> str:
+        brief = self.get_title_by_guid(og) or {}
+        if brief.get("locator", {}).get("kind") == "t4":
+            guids = self._t4_episode_guids.get(og, [])
+            if not 0 <= index < len(guids):
+                return ""
+            return guids[index]
+        return episode_guid(og, "", index)
+
+    @staticmethod
+    def t4_episode_guid(og: str, key: str) -> str:
+        return _h(f"t4ep:{og}:{key}")
+
+    def _index_t4(self, g: str, brief: dict):
+        rows = self._t4_rows(brief)
+        self._t4_episode_guids[g] = []
+        for index, row in enumerate(rows):
+            eg = _h(f"t4ep:{g}:{row['key']}")
+            self._t4_episode_guids[g].append(eg)
+            per = row["per"]
+            default = next(iter(per))
+            self._ep_index[eg] = {
+                "ep_guid": eg, "online_guid": g, "index": index, "season": 1,
+                "season_guid": season_guid(g), "title": brief["title"],
+                "default_line": default, "lines": list(per), "_per": {
+                    ln: dict(e, ep_title=e["title"]) for ln, e in per.items()},
+                "ep_title": row["title"], "line": default, "t4": True,
+                "episode_key": row["key"],
+            }
+            for line in [""] + list(per):
+                meta = "e:" + json.dumps({"ep": eg, "line": line or default})
+                self._media_index[ep_media_guid(eg, line)] = meta
+                self._media_index[ep_video_guid(eg, line)] = meta
 
     def _rebuild_index(self):
         """重建 ep / media 反查索引（集身份与线路解耦，media guid 携带线路）。"""
         self._ep_index = {}
         self._media_index = {}
+        self._t4_episode_guids = {}
         for g, brief in self._titles.items():
             # 标题（电影=整段；剧集默认线路第一集）
             self._media_index[media_guid(g)] = "t:" + json.dumps({"og": g, "line": ""})
             self._media_index[video_guid(g)] = "t:" + json.dumps({"og": g, "line": ""})
+            if brief.get("locator", {}).get("kind") == "t4":
+                self._index_t4(g, brief)
+                continue
             default = self.best_line(g)
             if not default:
                 continue
@@ -160,6 +226,8 @@ class Store:
         if not ep:
             return None
         ln = line if line in ep["_per"] else ep["default_line"]
+        if ep.get("t4") and line and line not in ep["_per"]:
+            return None
         one = ep["_per"][ln]
         return {
             "ep_guid": ep_g, "online_guid": ep["online_guid"], "line": ln,
@@ -169,8 +237,10 @@ class Store:
             "redirect": one.get("redirect", False),
             "xsrc": one.get("xsrc", False),
             "play_from": one.get("play_from", ""),
-            "total": len(self._direct_eps(self._titles[ep["online_guid"]],
-                                          ep["default_line"])),
+            "t4": bool(one.get("t4")),
+            "episode_key": one.get("episode_key", ""),
+            "total": self.episode_count(ep["online_guid"]) if ep.get("t4") else
+            len(self._direct_eps(self._titles[ep["online_guid"]], ep["default_line"])),
             "season_guid": ep["season_guid"], "season": 1, "kind": "episode",
         }
 
@@ -187,6 +257,8 @@ class Store:
         line = self.best_line(og)
         if not line:
             return []
+        if self._titles[og].get("locator", {}).get("kind") == "t4":
+            return list(self._t4_episode_guids.get(og, []))
         n = len(self._direct_eps(self._titles[og], line))
         return [episode_guid(og, "", i) for i in range(n)]
 
@@ -201,6 +273,11 @@ class Store:
         brief = self._titles.get(og)
         if not brief:
             return []
+        if brief.get("locator", {}).get("kind") == "t4":
+            eg = target.get("ep_guid") or self.episode_guid_at(
+                og, int(target.get("index") or 0))
+            return [dict(self._ep_resolve(eg, line), m3u8=False)
+                    for line in self.episode_lines(eg)]
         idx = int(target.get("index", 0) or 0)
         default = self.best_line(og)
         out, seen_url = [], set()
@@ -251,7 +328,7 @@ class Store:
                 titles = {k: self._titles[k] for k in keys}
                 orig = {k: v for k, v in self._orig.items() if k in keep}
             tmp.write_text(json.dumps(
-                {"titles": titles, "orig": orig}, ensure_ascii=False))
+                {"titles": titles, "orig": orig}, ensure_ascii=False), encoding="utf-8")
             tmp.replace(_STATE)
             self._dirty = False
         except Exception:
@@ -279,12 +356,28 @@ class Store:
         """保存跨源合并后的 brief（guid 已在 brief 内确定）。"""
         with self._lock:
             for b in briefs:
+                old = self._titles.get(b["guid"])
+                if b.get("locator", {}).get("kind") == "t4" and old and old.get("lines"):
+                    # A search card must not erase loaded detail or historical episode IDs.
+                    locator = dict(b["locator"], loaded_at=0)
+                    b = dict(b, lines=old["lines"], locator=locator)
                 self._titles[b["guid"]] = b
                 self._orig.setdefault(b["guid"], b.get("online_id", ""))
             self._dirty = True
             self._flush_locked(force=True)
             self._rebuild_index()
         return briefs
+
+    def replace_t4_detail(self, guid: str, title: providers.OnlineTitle) -> dict:
+        import inject
+        with self._lock:
+            brief = dict(inject.brief_of(title), guid=guid)
+            self._titles[guid] = brief
+            self._orig[guid] = title.online_id
+            self._dirty = True
+            self._flush_locked()
+            self._rebuild_index()
+            return brief
 
     def get_title_by_guid(self, guid: str) -> Optional[dict]:
         with self._lock:
@@ -321,7 +414,7 @@ class Store:
     # ---- 季 / 集（原生 TV 选集）----
     @staticmethod
     def _playable(eps: list[dict]) -> list[dict]:
-        return [e for e in eps if e.get("direct") or e.get("resolve")]
+        return [e for e in eps if e.get("direct") or e.get("resolve") or e.get("t4")]
 
     def best_line(self, guid: str) -> str | None:
         brief = self.get_title_by_guid(guid)
@@ -344,6 +437,8 @@ class Store:
         brief = self.get_title_by_guid(guid)
         if not brief:
             return 0
+        if brief.get("locator", {}).get("kind") == "t4" and not line:
+            return len(self._t4_episode_guids.get(guid, []))
         ln = line if line in brief.get("lines", {}) else self.best_line(guid)
         if not ln:
             return 0
@@ -387,6 +482,9 @@ class Store:
         brief = self.get_title_by_guid(guid)
         if not brief:
             return None
+        if brief.get("locator", {}).get("kind") == "t4":
+            eg = self.episode_guid_at(guid, int(ep_index or 0))
+            return self._ep_resolve(eg, line) if eg else None
         lines = brief.get("lines", {})
         # 选线路：指定 > 第一条可播（直链优先，其次可解析页）
         name = None
