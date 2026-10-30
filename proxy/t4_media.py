@@ -1,6 +1,8 @@
 """Bounded header-aware network delivery; no transcoding or video decoding."""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import secrets
 import time
@@ -19,10 +21,16 @@ MAX_MANIFEST = 2 * 1024 * 1024
 class T4Media:
     def __init__(self):
         self._resources = OrderedDict()
+        self._resource_key = secrets.token_bytes(32)
 
     def resource(self, url: str, playback: t4.Playback, *, manifest=False) -> str:
-        token = secrets.token_urlsafe(18)
+        # HLS implicit byte ranges require repeated URIs to stay identical.
+        identity = json.dumps([url, sorted(playback.headers.items()),
+                               playback.wrapper, manifest], separators=(",", ":"))
+        token = hashlib.blake2s(identity.encode(), key=self._resource_key,
+                               digest_size=18).hexdigest()
         now = time.monotonic()
+        self._resources.pop(token, None)
         while self._resources and (len(self._resources) >= 4096 or
                                   next(iter(self._resources.values()))[0] <= now):
             self._resources.popitem(last=False)
@@ -115,6 +123,14 @@ class T4Media:
             forwarded["Cache-Control"] = "no-store"
             if request.method == "HEAD":
                 await upstream.aclose()
+                if is_manifest:
+                    response = Response(status_code=upstream.status_code,
+                                        media_type="application/vnd.apple.mpegurl",
+                                        headers={"Cache-Control": "no-store"})
+                    # GET rewrites the manifest, so the origin length is not ours.
+                    if "content-length" in response.headers:
+                        del response.headers["content-length"]
+                    return response
                 return Response(status_code=upstream.status_code, headers=forwarded)
         except (httpx.HTTPError, UnicodeError, t4.T4Error):
             if upstream is not None:

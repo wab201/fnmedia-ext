@@ -293,6 +293,14 @@ pre.log{max-height:240px;overflow:auto;background:#0f1115;color:#d6dae0;border-r
         </div>
         <div class="hint">海量库在分类路由建立后自动出现；也可在「资源站」页把某个站单独生成一张媒体库卡片。</div>
       </div>
+      <div class="card">
+        <div class="card-title">T4 选片</div>
+        <div class="lib-grid" id="t4Libs"></div>
+        <label class="switch-row">
+          <input type="checkbox" id="t4Enabled" onchange="saveT4Cfg()"/>
+          <span>在飞牛影视媒体库显示 T4 选片</span>
+        </label>
+      </div>
     </section>
 
     <!-- ============ 片源质量 ============ -->
@@ -826,7 +834,7 @@ function catKeyOf(title){
 function libCardHtml(L,ic){
   return `<div class="lib" data-g="${L.guid}"><div class="ic">${ic}</div>
     <div style="flex:1;min-width:0"><div class="t">${esc(L.title)}</div>
-      <div class="c">${L.group==="hot"?(L.count+" 条"):(L.count?("路由 "+L.count):"建库中…")}</div></div>
+      <div class="c">${L.group==="t4"?(L.count+" 个插件"):L.group==="hot"?(L.count+" 条"):(L.count?("路由 "+L.count):"建库中…")}</div></div>
     <label class="pin" title="在飞牛影视媒体库列表中置顶">
       <input type="checkbox" ${L.pinned?"checked":""} onchange="togglePin('${L.guid}',this)"/>置顶</label>
   </div>`;
@@ -842,6 +850,8 @@ function renderLibrary(){
   if(!STATUS)return;
   $("hotEnabled").checked=CFG.hot_library_enabled!==false;
   if($("catEnabled"))$("catEnabled").checked=CFG.catalog_library_enabled!==false;
+  $("t4Enabled").checked=CFG.t4_library_enabled!==false;
+  $("t4Libs").innerHTML=LIBS.filter(x=>x.group==="t4").map(L=>libCardHtml(L,"")).join("");
   $("hotInterval").value=Math.round((CFG.hot_refresh_interval||21600)/3600);
   const c=STATUS.charts&&STATUS.charts.counts||{};
   const cats=(STATUS.catalog&&STATUS.catalog.categories)||{};
@@ -872,6 +882,12 @@ async function saveCatCfg(){
   const body={catalog_library_enabled:$("catEnabled").checked};
   const r=await jpost("/v/api/ext/config",body);
   if(r.code===0){Object.assign(CFG,body);toast("海量四库设置已保存");await loadLibs();renderLibrary();}
+  else toast(r.msg||"保存失败","fail");
+}
+async function saveT4Cfg(){
+  const body={t4_library_enabled:$("t4Enabled").checked};
+  const r=await jpost("/v/api/ext/config",body);
+  if(r.code===0){Object.assign(CFG,body);toast("T4 选片设置已保存");await loadLibs();renderLibrary();}
   else toast(r.msg||"保存失败","fail");
 }
 async function refreshHot(){
