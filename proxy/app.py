@@ -1803,6 +1803,11 @@ async def stream_list(guid: str, request: Request):
         else:
             target = store.resolve_media_guid(media_guid(guid))
     quals = _qualities(target) if target else []
+    if target and target.get("t4"):
+        # The player ID is opaque until playback. Do not advertise CMS metadata.
+        sl["files"][0].update(path="在线/T4", file_name="T4")
+        sl["video_streams"][0].update(
+            codec_name="", profile="", level="", width=0, height=0, wrapper="")
     if quals:
         sl["video_streams"][0]["resolution_type"] = quals[0]["resolution"]
         sl["video_streams"][0]["bps"] = quals[0]["bitrate"]
@@ -2202,6 +2207,41 @@ async def stream_post(request: Request):
         return _instant_stream_response(mg)
     if not target:
         return await forward_upstream(request)
+    if target.get("t4"):
+        try:
+            playback = await t4_service.resolve(ext_client(request), target)
+            await t4_media.identify(ext_client(request), playback)
+            if playback.wrapper == "DASH":
+                raise t4.T4Error("当前飞牛适配尚未验证 DASH/双轨播放")
+        except t4.T4Error as exc:
+            return JSONResponse({"code": -1, "msg": str(exc), "data": None},
+                                status_code=502)
+        if target.get("kind") == "episode":
+            sl = inj.episode_stream_list(target)
+        else:
+            sl = inj.stream_list(store.get_title_by_guid(target["online_guid"]))
+        f, v = sl["files"][0], sl["video_streams"][0]
+        suffix = {"HLS": "m3u8", "MP4": "mp4", "MKV": "mkv"}[playback.wrapper]
+        f.update(path=f"在线/T4.{suffix}", file_name=f"T4.{suffix}")
+        v.update(codec_name="", profile="", level="", width=0, height=0,
+                 wrapper=playback.wrapper)
+        qualities = _qualities(target)
+        data = {"file_stream": f, "video_stream": v, "audio_streams": [],
+                "subtitle_streams": [], "qualities": qualities, "cloud_storage_info": None}
+        if playback.wrapper != "HLS":
+            # trim.media 0.9.8 uses 9001 for remote raw-file/STRM delivery.
+            # This is a response contract only; no STRM file or DB row is created.
+            choices = _line_choices(target)
+            raw = [{
+                "resolution": choice["label"],
+                "bitrate": _line_bitrate(choice["line"], [c["line"] for c in choices]),
+                "is_m3u8": False,
+                "url": f"{ONLINE_PREFIX}/{mg}/t4?" +
+                       urllib.parse.urlencode({"line": choice["line"]}),
+            } for choice in choices]
+            data.update(cloud_storage_info={"cloud_storage_type": 9001},
+                        direct_link_qualities=raw)
+        return JSONResponse({"code": 0, "msg": "", "data": data})
     if target.get("kind") == "episode":
         sl = inj.episode_stream_list(target)
     else:

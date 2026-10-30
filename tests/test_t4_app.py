@@ -214,6 +214,37 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 502)
         self.assertIn("DASH", response.json()["msg"])
 
+    async def test_t4_stream_metadata_uses_native_raw_contract(self):
+        _, eg = await self.load_episode()
+        menu = (await self.client.get(f"/v/api/v1/stream/list/{eg}")).json()["data"]
+        self.assertEqual(menu["video_streams"][0]["wrapper"], "")
+        self.assertEqual(menu["video_streams"][0]["codec_name"], "")
+        self.assertFalse(any("play" in r.url.params for r in self.calls))
+        mg = storemod.ep_media_guid(eg)
+        for wrapper in ("mp4", "mkv"):
+            self.wrapper = wrapper
+            appmod.t4_service._playbacks.clear()
+            response = await self.client.post("/v/api/v1/stream", json={"media_guid": mg})
+            data = response.json()["data"]
+            self.assertEqual(data["video_stream"]["wrapper"], wrapper.upper())
+            self.assertEqual(data["video_stream"]["codec_name"], "")
+            self.assertEqual(data["cloud_storage_info"]["cloud_storage_type"], 9001)
+            self.assertEqual(len(data["direct_link_qualities"]), 2)
+            self.assertTrue(all(not q["is_m3u8"] for q in data["direct_link_qualities"]))
+            self.assertTrue(all(q["url"].startswith("/v/media/online/")
+                                for q in data["direct_link_qualities"]))
+            self.assertTrue(data["file_stream"]["file_name"].endswith("." + wrapper))
+
+    async def test_t4_hls_stream_stays_manifest_delivery(self):
+        self.wrapper = "m3u8"
+        _, eg = await self.load_episode()
+        response = await self.client.post("/v/api/v1/stream", json={
+            "media_guid": storemod.ep_media_guid(eg)})
+        data = response.json()["data"]
+        self.assertEqual(data["video_stream"]["wrapper"], "HLS")
+        self.assertIsNone(data["cloud_storage_info"])
+        self.assertNotIn("direct_link_qualities", data)
+
     async def test_import_legacy_entry_and_source_test(self):
         response = await self.client.post("/v/api/ext/source/import-tvbox", json={
             "text": json.dumps({"sites": [{"type": 4, "name": "Other T4",
