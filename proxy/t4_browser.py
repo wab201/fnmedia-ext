@@ -161,8 +161,23 @@ class T4Browser:
             if not entry[1]:
                 self._locks.pop(key, None)
 
+    def _category_type_name(self, parent):
+        seen = set()
+        while parent in self._nodes and parent not in seen:
+            seen.add(parent)
+            node = self._nodes[parent]
+            if node["kind"] in ("category", "filter"):
+                name = str(node.get("category_type_name") or
+                           node.get("category_title") or node["title"])
+                if any(word in name for word in
+                       inject._MOVIE_TYPE_WORDS + inject._TV_TYPE_WORDS):
+                    return name
+            parent = node["parent"]
+        return ""
+
     def _rows(self, rows, source, parent):
         cards, briefs = [], []
+        type_hint = self._category_type_name(parent)
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -172,7 +187,8 @@ class T4Browser:
             if str(row.get("vod_tag", "")).lower() == "folder":
                 if raw_id and row.get("vod_name"):
                     guid = self._put(source, "category", str(row["vod_name"]),
-                                     parent, tid=raw_id, filters={}, schema=[])
+                                     parent, tid=raw_id, filters={}, schema=[],
+                                     category_type_name=type_hint)
                     card = self.card(guid)
                     card["poster"] = inject._poster(str(row.get("vod_pic") or ""))
                     cards.append(card)
@@ -181,12 +197,16 @@ class T4Browser:
             if title is not None:
                 brief = inject.brief_of(title)
                 old = self.store.get_title_by_guid(brief["guid"])
+                if not brief["type_name"]:
+                    brief["type_name"] = (old or {}).get("type_name") or type_hint
                 if old is None or any(old.get(key) != brief.get(key) for key in (
-                    "title", "poster", "year", "remarks", "overview"
+                    "title", "type_name", "poster", "year", "remarks", "overview"
                 )) or any((old.get("locator") or {}).get(key) != brief["locator"].get(key)
                           for key in ("source_id", "vod_id", "content_key")):
                     briefs.append(brief)
-                card = inject.search_item(brief)
+                # 列表不抹掉已加载详情的类型和集数，也不提前请求详情/取链。
+                card = inject.search_item(dict(brief, lines=old["lines"])
+                                          if old and old.get("lines") else brief)
                 card.update(title=title.title, parent_guid=parent,
                             ancestor_guid=LIB_GUID, ancestor_name=LIB_TITLE,
                             ancestor_category="Mix")
@@ -261,7 +281,8 @@ class T4Browser:
                     guids.append(self._put(
                         source, "category", str(row.get("type_name") or tid),
                         guid, tid=tid, filters={},
-                        schema=schema if isinstance(schema, list) else []))
+                        schema=schema if isinstance(schema, list) else [],
+                        category_type_name=str(row.get("type_name") or "")))
                 prefix = [self.card(g) for g in guids]
                 count = len(result.get("list") or [])
                 total = len(prefix) + count
@@ -280,7 +301,8 @@ class T4Browser:
                     guids.append(self._put(
                         source, "category", base + " · " + label,
                         node["category_parent"], tid=node["tid"],
-                        filters=selected, schema=node["schema"]))
+                        filters=selected, schema=node["schema"],
+                        category_type_name=node.get("category_type_name", "")))
                 cards, total = [self.card(g) for g in guids[offset:offset + size]], len(guids)
             else:
                 guids = []
@@ -295,7 +317,8 @@ class T4Browser:
                         source, "filter", label, guid, tid=node["tid"],
                         filters=node["filters"], key=key, schema=node["schema"],
                         values=field.get("value") or [], category_title=node["title"],
-                        category_parent=node["parent"]))
+                        category_parent=node["parent"],
+                        category_type_name=self._category_type_name(guid)))
                 prefix = [self.card(g) for g in guids]
                 cards = prefix[offset:offset + size]
                 rows, total = await self._window(client, source, node,

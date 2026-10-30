@@ -135,11 +135,85 @@ class BrowseTests(unittest.IsolatedAsyncioTestCase):
         movies = [r for result in (first, second, third) for r in result["list"]
                   if r["type"] != "Directory"]
         self.assertEqual(len({r["guid"] for r in movies}), 11)
+        self.assertTrue(all(r["type"] == "TV" for r in movies))
         choices = await self.listing(first["list"][0]["guid"])
         selected = next(r["guid"] for r in choices["list"] if "2026" in r["title"])
-        await self.listing(selected)
+        filtered = await self.listing(selected)
         self.assertEqual(self.filters, {"year": "2026"})
+        self.assertTrue(all(r["type"] == "TV" for r in filtered["list"]
+                            if r["type"] != "Directory"))
         self.assertFalse(any("play" in r.url.params for r in self.calls))
+
+    async def test_category_type_reaches_detail_route_in_four_client_profiles(self):
+        parent = await self.category()
+        raw = {"vod_id": "movie-1", "vod_name": "测试剧"}
+        for ua in ("trimemedia-web", "com.trim.tv", "Dalvik/2.1.0 Android",
+                   "com.trim.media.ios"):
+            self.client.headers["User-Agent"] = ua
+            with patch.object(self.browser, "_window", return_value=([raw], 1)):
+                data = await self.listing(parent)
+            card = next(r for r in data["list"] if r["title"] == "测试剧")
+            self.assertEqual(card["type"], "TV")
+            detail = await self.client.get("/v/api/v1/item/" + card["guid"])
+            self.assertEqual(detail.status_code, 200)
+            self.assertEqual(detail.json()["data"]["type"], card["type"])
+            self.assertTrue(self.store.tv_episode_guids(card["guid"]))
+        self.assertFalse(any("play" in r.url.params for r in self.calls))
+
+    async def test_category_type_is_inherited_by_filtered_and_nested_directories(self):
+        category = await self.category()
+        first = await self.listing(category)
+        choices = await self.listing(first["list"][0]["guid"])
+        selected = next(r["guid"] for r in choices["list"] if "2026" in r["title"])
+        with patch.object(self.browser, "_window", return_value=([
+                {"vod_id": "pan", "vod_name": "资源目录", "vod_tag": "folder"}], 1)):
+            folders = await self.listing(selected)
+        child = next(r["guid"] for r in folders["list"] if r["title"] == "资源目录")
+        with patch.object(self.browser, "_window", return_value=([
+                {"vod_id": "unknown", "vod_name": "测试剧"}], 1)):
+            data = await self.listing(child)
+        self.assertEqual(data["list"][0]["type"], "TV")
+        restored = t4_browser.T4Browser(self.store, self.config)
+        self.assertIn("电视剧", restored._category_type_name(child))
+        self.assertFalse(any("ids" in r.url.params or "play" in r.url.params
+                             for r in self.calls))
+
+    async def test_explicit_type_wins_and_home_does_not_guess_from_title(self):
+        parent = await self.category()
+        cards = self.browser._rows([
+            {"vod_id": "film", "vod_name": "测试剧", "type_name": "动画电影"},
+            {"vod_id": "series", "vod_name": "测试片"},
+        ], self.source, parent)
+        self.assertEqual([r["type"] for r in cards], ["Movie", "TV"])
+        home = await self.plugin()
+        unknown = self.browser._rows([
+            {"vod_id": "unknown", "vod_name": "电视剧标题"}], self.source, home)[0]
+        self.assertEqual(self.store.get_title_by_guid(unknown["guid"])["type_name"], "")
+        self.assertEqual(unknown["type"], "Movie")
+
+    async def test_cached_list_keeps_loaded_type_and_episodes(self):
+        parent = await self.category()
+        row = {"vod_id": "movie-1", "vod_name": "测试剧"}
+        first = self.browser._rows([row], self.source, parent)[0]
+        detail = await self.client.get("/v/api/v1/item/" + first["guid"])
+        self.assertEqual(detail.json()["data"]["type"], "TV")
+        before = self.store.get_title_by_guid(first["guid"])
+        with patch.object(self.store, "remember_merged",
+                          wraps=self.store.remember_merged) as remember:
+            repeated = self.browser._rows([row], self.source, parent)[0]
+        remember.assert_not_called()
+        self.assertEqual(repeated["type"], "TV")
+        self.assertGreater(repeated["number_of_episodes"], 1)
+        self.assertEqual(self.store.get_title_by_guid(first["guid"]), before)
+
+    async def test_restored_category_without_hint_uses_its_label_not_source_name(self):
+        parent = await self.category()
+        self.browser.node(parent).pop("category_type_name", None)
+        self.browser.node(parent)["title"] = "豆瓣·热门电视剧 · 2024"
+        self.assertIn("电视剧", self.browser._category_type_name(parent))
+        home = await self.plugin()
+        self.browser.node(home)["title"] = "电视剧来源"
+        self.assertEqual(self.browser._category_type_name(home), "")
 
     async def test_metadata_free_pagination_finishes_on_short_last_page(self):
         self.no_metadata = True
