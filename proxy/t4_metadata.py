@@ -230,13 +230,16 @@ class MediaProbe:
                     reader, result = RangeReader(client, playback), {}
                     start = time.monotonic()
                     reason = "no_tracks"
+
+                    async def inspect():
+                        data = await reader.mp4() if playback.wrapper == "MP4" else \
+                            await reader.read(0, 1024 * 1024)
+                        return normalize(await inspect_bytes(data, binary), reader.total)
+
                     try:
-                        async with asyncio.timeout(TIME_BUDGET):
-                            data = await reader.mp4() if playback.wrapper == "MP4" else \
-                                await reader.read(0, 1024 * 1024)
-                            result = normalize(await inspect_bytes(data, binary), reader.total)
+                        result = await asyncio.wait_for(inspect(), timeout=TIME_BUDGET)
                     except (ProbeUnavailable, httpx.HTTPError, OSError, ValueError,
-                            TimeoutError) as exc:
+                            asyncio.TimeoutError) as exc:
                         reason = type(exc).__name__
                     self._cache[key] = time.monotonic() + (900 if result else 30), result
                     self._cache.move_to_end(key)

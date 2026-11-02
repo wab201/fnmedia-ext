@@ -179,6 +179,14 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await meta.MediaProbe().probe(self.client, self.playback), {})
         self.assertEqual(self.calls, [])
 
+    async def test_probe_does_not_require_python311_timeout_api(self):
+        with patch.object(meta.asyncio, "timeout", None, create=True), \
+                patch("t4_metadata.shutil.which", return_value="ffprobe"), \
+                patch("t4_metadata.inspect_bytes", new_callable=AsyncMock, return_value=INFO):
+            result = await meta.MediaProbe().probe(self.client, self.playback)
+        self.assertEqual(result["video"]["codec_name"], "hevc")
+        self.assertTrue(all(s.closed for s in self.streams))
+
     async def test_budget_and_deadline_do_not_block_original_delivery(self):
         reader = meta.RangeReader(self.client, self.playback)
         reader.used = meta.MAX_BYTES - 4
