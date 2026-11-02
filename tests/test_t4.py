@@ -233,6 +233,41 @@ class T4StateTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(next(s for s in imported if s.get("site_key") == "pan")["filterable"])
         self.assertFalse(next(s for s in imported if s.get("site_key") == "pan")["indexs"])
 
+    def test_full_subscription_import_preserves_existing_sources_and_switches(self):
+        for count in (172, 179):
+            with self.subTest(count=count):
+                self.config.save({"sources": [self.source]})
+                sources = [tvbox.classify_site({
+                    "type": 4, "key": f"plugin-{i}", "name": f"Plugin {i}",
+                    "api": f"http://t4.test/t4/fm/env-at/plugin-{i}/",
+                    "searchable": 0 if i % 7 == 0 else 1,
+                    "indexs": 0 if i % 11 == 0 else 1,
+                })[1] for i in range(count)]
+                first = self.config.import_t4_sources(sources[:8])
+                self.assertEqual(first["added"], 8)
+                old = self.config.all_sources()
+                existing = next(s for s in old if s.get("site_key") == "plugin-2")
+                existing["enabled"] = False
+                existing["name"] = "My existing name"
+                self.config.save({"sources": old})
+                report = self.config.import_t4_sources(sources)
+                self.assertEqual(report["added"], count - 8)
+                self.assertEqual(report["duplicate"], 8)
+                repeated = self.config.import_t4_sources(sources)
+                self.assertEqual((repeated["added"], repeated["duplicate"]), (0, count))
+                reloaded = configmod.Config()
+                rows = [s for s in reloaded.all_sources() if s.get("site_key")]
+                self.assertEqual(len(rows), count)
+                self.assertEqual(len({s["id"] for s in rows}), count)
+                self.assertEqual([s["site_key"] for s in rows],
+                                 [f"plugin-{i}" for i in range(count)])
+                self.assertFalse(rows[2]["enabled"])
+                self.assertEqual(rows[2]["name"], "My existing name")
+                self.assertFalse(rows[0]["searchable"])
+                self.assertFalse(rows[0]["indexs"])
+                self.assertTrue(any(s["id"] == self.source["id"]
+                                    for s in reloaded.all_sources()))
+
     async def test_lazy_singleflight_refresh_restart_and_episode_identity(self):
         guid = self.remember_card()
         calls = []
@@ -529,6 +564,105 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
         self.assertTrue(closed.is_set())
+
+    async def test_identify_uses_bounded_get_and_closes_media(self):
+        calls, streams = [], []
+
+        class PrefixStream(httpx.AsyncByteStream):
+            closed = False
+            requested_more = False
+
+            async def __aiter__(self):
+                yield b"\x00\x00\x00\x18ftypisom" + bytes(4096 - 12)
+                self.requested_more = True
+                raise AssertionError("format identification must not read the video")
+
+            async def aclose(self):
+                self.closed = True
+
+        def handler(request):
+            calls.append(request)
+            self.assertEqual(request.headers["Referer"], "needed")
+            if request.method == "HEAD":
+                return httpx.Response(405)
+            self.assertEqual(request.headers["Range"], "bytes=0-4095")
+            stream = PrefixStream()
+            streams.append(stream)
+            return httpx.Response(206, stream=stream,
+                                  headers={"Content-Type": "application/octet-stream"})
+
+        playback = t4.Playback("https://media.test/signed", {"Referer": "needed"}, "")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            self.assertIs(await t4_media.T4Media().identify(client, playback), playback)
+        self.assertEqual(playback.wrapper, "MP4")
+        self.assertEqual([r.method for r in calls], ["GET"])
+        self.assertTrue(streams[0].closed)
+        self.assertFalse(streams[0].requested_more)
+        self.assertEqual(playback.headers, {"Referer": "needed"})
+
+    async def test_identify_generic_head_checks_real_get_prefix_without_guessing(self):
+        for prefix, wrapper in (
+            (b"#EXTM3U\n#EXTINF:6,\nsegment.ts\n", "HLS"),
+            (b"\x1a\x45\xdf\xa3\x80matroska", "MKV"),
+            (b"<html>upstream error</html>", ""),
+            (b'{"error":"no media"}', ""),
+        ):
+            with self.subTest(wrapper=wrapper, prefix=prefix[:8]):
+                calls = []
+
+                def handler(request):
+                    calls.append(request)
+                    return httpx.Response(200, content=prefix if request.method == "GET" else b"",
+                                          headers={"Content-Type": "application/octet-stream"})
+
+                playback = t4.Playback("https://media.test/signed", {}, "")
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                    if wrapper:
+                        await t4_media.T4Media().identify(client, playback)
+                    else:
+                        with self.assertRaises(t4.T4Error):
+                            await t4_media.T4Media().identify(client, playback)
+                self.assertEqual(playback.wrapper, wrapper)
+                self.assertEqual([r.method for r in calls], ["GET"])
+
+    async def test_identify_get_still_rejects_real_http_failures(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(403)
+
+        playback = t4.Playback("https://media.test/signed", {}, "")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with self.assertRaises(t4.T4Error):
+                await t4_media.T4Media().identify(client, playback)
+        self.assertEqual(playback.wrapper, "")
+        self.assertEqual([r.method for r in calls], ["GET"])
+
+    async def test_identify_checks_actual_container_not_url_mime_or_declared_type(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(206, content=b"\x1a\x45\xdf\xa3\x80matroska",
+                                  headers={"Content-Type": "video/mp4"})
+
+        playback = t4.Playback("https://media.test/wrong.mp4", {}, "MP4")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            media = t4_media.T4Media()
+            await media.identify(client, playback)
+            await media.identify(client, playback)
+        self.assertEqual(playback.wrapper, "MKV")
+        self.assertEqual(len(calls), 1)
+
+    async def test_identify_rejects_html_even_with_mp4_filename_and_mime(self):
+        playback = t4.Playback("https://media.test/error.mp4", {}, "MP4")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _:
+                httpx.Response(200, content=b"<html>error</html>",
+                               headers={"Content-Type": "video/mp4"}))) as client:
+            with self.assertRaises(t4.T4Error):
+                await t4_media.T4Media().identify(client, playback)
+        self.assertFalse(playback.identified)
 
     async def test_hls_nested_and_key_network_only(self):
         media = t4_media.T4Media()

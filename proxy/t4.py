@@ -39,6 +39,15 @@ def is_folder(row: dict) -> bool:
         str(row.get("vod_id", "")).startswith(("action:", "push://"))
 
 
+def search_intent(row: dict) -> str:
+    action = row.get("t4_action")
+    if isinstance(action, dict) and action.get("type") == "search":
+        keyword = action.get("keyword")
+        if isinstance(keyword, str):
+            return keyword.strip()[:200]
+    return ""
+
+
 async def request(client: httpx.AsyncClient, source: dict,
                   params: dict, timeout: float = TIMEOUT) -> dict:
     query = dict(params)
@@ -86,6 +95,13 @@ def map_title(row: dict, source: dict, *, detail: bool = False,
                     vod_id=original.get("vod_id") or vod_id,
                     content_key=original.get("content_key") or
                     str(row.get("content_key") or vod_id))
+    if keyword := search_intent(row):
+        original["search_keyword"] = keyword
+        year = row["t4_action"].get("year")
+        if isinstance(year, str) and re.fullmatch(r"(?:19|20)\d{2}", year):
+            original["search_year"] = year
+    if isinstance(row.get("t4_source"), str):
+        original["source_label"] = row["t4_source"]
     sources = {}
     if detail:
         flags = str(row.get("vod_play_from") or "").split("$$$")
@@ -103,7 +119,7 @@ def map_title(row: dict, source: dict, *, detail: bool = False,
                     continue
                 episodes.append(providers.Episode(
                     title=title, url=play_id.strip(), direct=False, t4=True,
-                    play_from=flag, episode_key=episode_key(title)))
+                    play_from=flag, episode_key=episode_key(title, flag, play_id.strip())))
             if episodes:
                 sources[label] = episodes
     original["loaded_at"] = time.time() if detail else 0
@@ -118,16 +134,124 @@ def map_title(row: dict, source: dict, *, detail: bool = False,
         sources=sources, locator=original)
 
 
-def episode_key(title: str) -> str:
-    # Equal explicit episode labels may share progress; array positions may not.
+_ACTION_LABELS = {
+    "互动状态", "点赞", "投币", "收藏", "稍后再看", "媒体信息", "全局搜索",
+    "选集播放", "订阅信息", "检查更新", "立即巡检", "取消追剧", "操作",
+}
+_ACTION_IDS = (
+    "action:", "push://", "bilistat-", "bililike-", "bilicoin-", "bilifav-",
+    "biliwatch-", "msubstat-", "msubcheck-", "msubinspect-", "msubunsub-",
+    "msubadd-", "msubdel-", "msubinfo-", "watchadd-", "watchdel-",
+)
+
+
+def _season_from_flag(flag: str) -> int:
+    normalized = re.sub(r"\s+", "", flag).casefold()
+    match = re.search(r"(?<![a-z0-9])(?:season|s)0*(\d+)", normalized)
+    if not match:
+        match = re.search(r"第0*(\d+)季", normalized)
+    return int(match[1]) if match else 1
+
+
+def _episode_coordinates(title: str, default_season: int = 1) -> tuple[int, int] | None:
+    text = re.sub(r"\s+", "", title).casefold()
+    suffix = re.split(r"s\d+e\d+|第\d+(?:集|话|期)|(?:episode|ep)\d+",
+                      text, maxsplit=1)[-1]
+    if re.search(r"预告|花絮|彩蛋|特辑|幕后|片花|trailer|preview|sample", suffix) or \
+            re.search(r"^\d{1,3}[-~至]\d|e\d+(?:e|[-~至]e?)\d", text):
+        return None
+    patterns = (
+        r"s0*(\d+)e0*(\d+)",
+        r"season0*(\d+)episode0*(\d+)",
+        r"第0*(\d+)季第0*(\d+)(?:集|话|期)",
+    )
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            values = {(int(season), int(number)) for season, number in matches}
+            if len(values) == 1 and not re.search(r"(?:e\d+|集|话)[-~至]\d+", text):
+                season, number = next(iter(values))
+                labels = {int(n) for n in re.findall(r"第0*(\d+)(?:集|话|期)", text)}
+                return (season, number) if not labels or labels == {number} else None
+            return None
+
+    patterns = (
+        r"第0*(\d+)(?:集|话|期)",
+        r"^0*(\d+)(?:集|话|期)(?=$|[._(\-·])",
+        r"(?:episode|ep)0*(\d+)(?=$|[._(\-])",
+        r"^0*(\d{1,3})(?=$|[._(\-])",
+    )
+    for pattern in patterns:
+        numbers = {int(n) for n in re.findall(pattern, text)}
+        if numbers:
+            return (default_season, next(iter(numbers))) if len(numbers) == 1 else None
+    return None
+
+
+def episode_key(title: str, flag: str = "", play_id: str = "") -> str:
+    # Preserve opaque playlist rows, but do not expose control/action entries as episodes.
     normalized = re.sub(r"\s+", "", title).casefold()
-    match = re.fullmatch(r"(?:第)?0*(\d+)(?:集|话|期)?", normalized)
-    if match:
-        return "episode:" + str(int(match[1]))
-    match = re.fullmatch(r"s0*(\d+)e0*(\d+)", normalized)
-    if match:
-        return f"season:{int(match[1])}:episode:{int(match[2])}"
-    return "label:" + normalized
+    compact_label = re.sub(r"[^\w]", "", normalized)
+    if play_id.casefold().startswith(_ACTION_IDS) or compact_label in _ACTION_LABELS:
+        return ""
+    if re.fullmatch(r"追剧第\d+季", compact_label):
+        return ""
+    group = flag.rsplit(" · ", 1)[-1].strip().casefold()
+    if group == "操作":
+        return ""
+    if group in ("相关视频", "up主视频"):
+        line_id = hashlib.sha256(flag.encode()).hexdigest()[:16]
+        return f"season:0:related:{line_id}:{normalized}"
+
+    coordinates = _episode_coordinates(title, _season_from_flag(flag))
+    if coordinates:
+        season, number = coordinates
+        return (f"episode:{number}" if season == 1
+                else f"season:{season}:episode:{number}")
+    season = _season_from_flag(flag)
+    label = "label:" + normalized
+    return label if season == 1 else f"season:{season}:{label}"
+
+
+def episode_season(key: str) -> int:
+    match = re.match(r"season:(\d+):", key)
+    return int(match[1]) if match else 1
+
+
+def episode_number(key: str) -> int:
+    match = re.fullmatch(r"(?:season:\d+:)?episode:(\d+)", key)
+    return int(match[1]) if match else 0
+
+
+def episode_menu_title(title: str, key: str) -> str:
+    number = episode_number(key)
+    if number and not re.fullmatch(r"(?:第)?\s*\d+\s*(?:集|话|期)?", title.strip()):
+        # Strip release/size suffixes from common cloud-drive file names.
+        if _episode_coordinates(title) or re.match(r"^\s*\d{1,3}(?:[._(\-\s]|$)", title):
+            return f"第{number}集"
+    return title.strip()
+
+
+def playlist_entries(episodes: list[dict], flag: str):
+    """Yield unique coordinates; retain distinct versions without aligning them."""
+    rows = [(episode_key(e["title"], e.get("play_from") or flag, e.get("url", "")), e)
+            for e in episodes]
+    counts, labels = {}, {}
+    for key, ep in rows:
+        counts[key] = counts.get(key, 0) + 1
+        label = re.sub(r"\s+", "", ep["title"]).casefold()
+        labels[label] = labels.get(label, 0) + 1
+    for key, ep in rows:
+        if not key:
+            continue
+        if counts[key] > 1:
+            label = re.sub(r"\s+", "", ep["title"]).casefold()
+            if labels[label] > 1:
+                continue
+            # Two encodes of E01 are selectable, not two interchangeable E01 lines.
+            line_id = hashlib.sha256(flag.encode()).hexdigest()[:16]
+            key = f"season:{episode_season(key)}:variant:{line_id}:{label}"
+        yield key, dict(ep, episode_key=key)
 
 
 async def search(client: httpx.AsyncClient, source: dict, keyword: str):
@@ -138,6 +262,16 @@ async def search(client: httpx.AsyncClient, source: dict, keyword: str):
     if not isinstance(rows, list):
         raise T4Error("T4 搜索缺少 list 列表")
     return [title for row in rows if (title := map_title(row, source)) is not None]
+
+
+async def navigation_search(client: httpx.AsyncClient, source: dict, keyword: str,
+                            year: str = ""):
+    result = await request(client, source, {
+        "wd": keyword, "quick": "false", "pg": 1, "nav_search": "true", "year": year,
+    })
+    if not isinstance(result.get("list"), list):
+        raise T4Error("T4 导航搜索缺少 list 列表")
+    return result
 
 
 async def home(client: httpx.AsyncClient, source: dict) -> dict:
@@ -164,6 +298,8 @@ async def category(client: httpx.AsyncClient, source: dict, tid: str,
 
 async def detail(client: httpx.AsyncClient, source: dict, locator: dict,
                  fallback: dict | None = None):
+    import inject
+
     vod_id = locator["vod_id"]
     result = await request(client, source, {"ac": "detail", "ids": vod_id})
     rows = result.get("list")
@@ -171,9 +307,16 @@ async def detail(client: httpx.AsyncClient, source: dict, locator: dict,
         raise T4Error("T4 详情未返回唯一影片，请重新搜索")
     row = dict(rows[0])
     for field, brief_key in (("vod_name", "title"), ("vod_pic", "poster"),
-                             ("type_name", "type_name"), ("vod_year", "year")):
+                             ("type_name", "type_name"), ("vod_year", "year"),
+                             ("vod_content", "overview"), ("vod_actor", "actor"),
+                             ("vod_director", "director"), ("vod_area", "area"),
+                             ("vod_score", "score"), ("vod_remarks", "remarks")):
+        if field == "vod_content" and row.get("vod_blurb"):
+            continue
         if not row.get(field) and fallback:
             row[field] = fallback.get(brief_key, "")
+    row["type_name"] = inject.media_type_name(
+        str(row.get("type_name") or ""), (fallback or {}).get("type_name", ""))
     if is_folder(row):
         raise T4Error("该条目是目录，请从支持目录的入口展开")
     # Sidecar may rewrap the ID. Standard, stable IDs must still match exactly.
@@ -197,6 +340,7 @@ class Playback:
     parse: int = 0
     jx: int = 0
     subtitles: list = field(default_factory=list)
+    identified: bool = False
 
     @property
     def needs_proxy(self) -> bool:

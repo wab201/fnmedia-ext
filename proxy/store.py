@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 import providers
+import t4
 
 _GUID_PREFIX = "on"
 _TTL = 24 * 3600
@@ -93,26 +94,15 @@ class Store:
         lines = ([default] if default else []) + [
             ln for ln in brief.get("lines", {}) if ln != default]
         for line in lines:
-            eps = self._direct_eps(brief, line)
-            counts = {}
-            for ep in eps:
-                key = ep.get("episode_key", "")
-                counts[key] = counts.get(key, 0) + 1
-            for ep in eps:
-                key = ep.get("episode_key", "")
-                # Duplicate labels have no unambiguous identity; do not guess by index.
-                if not key or counts[key] != 1:
-                    continue
-                row = rows.setdefault(key, {"key": key, "title": ep["title"], "per": {}})
+            for key, ep in t4.playlist_entries(self._direct_eps(brief, line), line):
+                row = rows.setdefault(key, {
+                    "key": key, "title": t4.episode_menu_title(ep["title"], key), "per": {}})
                 row["per"][line] = ep
         def order(row):
             key = row["key"]
-            parts = key.split(":")
-            if key.startswith("episode:"):
-                return 0, 1, int(parts[1])
-            if key.startswith("season:"):
-                return 0, int(parts[1]), int(parts[3])
-            return 1, 0, 0
+            number = t4.episode_number(key)
+            season = t4.episode_season(key)
+            return (0 if number and season else 1, season, number, key)
         return sorted(rows.values(), key=order)
 
     def episode_guid_at(self, og: str, index: int) -> str:
@@ -131,14 +121,20 @@ class Store:
     def _index_t4(self, g: str, brief: dict):
         rows = self._t4_rows(brief)
         self._t4_episode_guids[g] = []
+        numbered = any(t4.episode_number(row["key"]) for row in rows)
+        positions = {}
         for index, row in enumerate(rows):
             eg = _h(f"t4ep:{g}:{row['key']}")
             self._t4_episode_guids[g].append(eg)
             per = row["per"]
             default = next(iter(per))
+            season = t4.episode_season(row["key"]) if (
+                t4.episode_number(row["key"]) or not numbered) else 0
+            positions[season] = positions.get(season, 0) + 1
             self._ep_index[eg] = {
-                "ep_guid": eg, "online_guid": g, "index": index, "season": 1,
-                "season_guid": season_guid(g), "title": brief["title"],
+                "ep_guid": eg, "online_guid": g, "index": index, "season": season,
+                "episode_number": t4.episode_number(row["key"]) or positions[season],
+                "season_guid": season_guid(g, season), "title": brief["title"],
                 "default_line": default, "lines": list(per), "_per": {
                     ln: dict(e, ep_title=e["title"]) for ln, e in per.items()},
                 "ep_title": row["title"], "line": default, "t4": True,
@@ -199,6 +195,17 @@ class Store:
                     "e:" + json.dumps({"ep": eg, "line": default})
                 self._media_index[ep_video_guid(eg, "")] = \
                     "e:" + json.dumps({"ep": eg, "line": default})
+        self._season_index = {}
+        self._t4_seasons = {}
+        for g, guids in self._t4_episode_guids.items():
+            for eg in guids:
+                ep = self._ep_index[eg]
+                sg = ep["season_guid"]
+                if sg not in self._season_index:
+                    self._t4_seasons.setdefault(g, []).append(sg)
+                self._season_index.setdefault(sg, {
+                    "online_guid": g, "season": ep["season"], "episode_guids": [],
+                })["episode_guids"].append(eg)
 
     def resolve_media_guid(self, mg: str) -> Optional[dict]:
         """media/video guid -> 可播放目标（含 url/line/index）。"""
@@ -241,7 +248,8 @@ class Store:
             "episode_key": one.get("episode_key", ""),
             "total": self.episode_count(ep["online_guid"]) if ep.get("t4") else
             len(self._direct_eps(self._titles[ep["online_guid"]], ep["default_line"])),
-            "season_guid": ep["season_guid"], "season": 1, "kind": "episode",
+            "season_guid": ep["season_guid"], "season": ep.get("season", 1),
+            "episode_number": ep.get("episode_number", ep["index"] + 1), "kind": "episode",
         }
 
     def get_episode(self, ep_g: str) -> Optional[dict]:
@@ -252,15 +260,36 @@ class Store:
         d.pop("_per", None)
         return d
 
-    def tv_episode_guids(self, og: str) -> list[str]:
+    def tv_episode_guids(self, og: str, *, regular_only: bool = False) -> list[str]:
         """某 TV（默认线路）按顺序的全部集 guid（与 episode/list 一致）。"""
         line = self.best_line(og)
         if not line:
             return []
         if self._titles[og].get("locator", {}).get("kind") == "t4":
-            return list(self._t4_episode_guids.get(og, []))
+            guids = list(self._t4_episode_guids.get(og, []))
+            regular = [eg for eg in guids if self._ep_index[eg]["season"] > 0]
+            return regular if regular_only and regular else guids
         n = len(self._direct_eps(self._titles[og], line))
         return [episode_guid(og, "", i) for i in range(n)]
+
+    def seasons(self, og: str) -> list[dict]:
+        brief = self.get_title_by_guid(og) or {}
+        if brief.get("locator", {}).get("kind") != "t4":
+            return [{"guid": season_guid(og), "season": 1,
+                     "episode_guids": self.tv_episode_guids(og)}]
+        rows = [dict(self._season_index[sg], guid=sg)
+                for sg in self._t4_seasons.get(og, [])]
+        return sorted(rows, key=lambda row: (row["season"] == 0, row["season"]))
+
+    def get_season(self, sg: str) -> Optional[dict]:
+        meta = self._season_index.get(sg)
+        if meta is not None:
+            return dict(meta)
+        for g, brief in self._titles.items():
+            if brief.get("locator", {}).get("kind") != "t4" and season_guid(g) == sg:
+                return {"online_guid": g, "season": 1,
+                        "episode_guids": self.tv_episode_guids(g)}
+        return None
 
     def episode_lines(self, ep_g: str) -> list[str]:
         ep = self._ep_index.get(ep_g)
@@ -446,6 +475,10 @@ class Store:
 
     def season_episode(self, season_g: str, index: int) -> Optional[dict]:
         """由伪造的 season guid 与集序号返回在线标题 guid / 线路 / 集。"""
+        meta = self.get_season(season_g)
+        if meta:
+            guids = meta["episode_guids"]
+            return self.get_episode_target(guids[index]) if 0 <= index < len(guids) else None
         for g in self._titles:
             if season_guid(g) == season_g:
                 ln = self.best_line(g)

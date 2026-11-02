@@ -14,6 +14,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "proxy"))
 
 import app as appmod
+import inject
 import t4
 import t4_browser
 import test_t4_app as fixtures
@@ -108,6 +109,26 @@ class BrowseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r["title"] for r in data["list"]], ["Test T4", "Test T4 (2)"])
         self.assertNotEqual(data["list"][0]["guid"], data["list"][1]["guid"])
 
+    async def test_full_plugin_library_pagination_never_starts_crawlers(self):
+        self.config.save({"sources": []})
+        self.config.import_t4_sources([dict(
+            self.source, name=f"Plugin {i}", site_key=f"plugin-{i}",
+            api=fixtures.API + f"&site=plugin-{i}",
+        ) for i in range(179)])
+        before = len(self.calls)
+        for ua in ("trimemedia-web", "com.trim.tv", "Dalvik/2.1.0 Android",
+                   "com.trim.media.ios"):
+            self.client.headers["User-Agent"] = ua
+            cards = []
+            for page in range(1, 10):
+                data = await self.listing(page=page, page_size=22)
+                self.assertEqual(data["total"], 179)
+                cards.extend(data["list"])
+            self.assertEqual([r["title"] for r in cards],
+                             [f"Plugin {i}" for i in range(179)])
+            self.assertEqual(len({r["guid"] for r in cards}), 179)
+        self.assertEqual(len(self.calls), before)
+
     async def test_nonsearchable_source_has_home_categories_and_folders(self):
         data = await self.listing(await self.plugin())
         self.assertEqual([r["title"] for r in data["list"]],
@@ -188,8 +209,82 @@ class BrowseTests(unittest.IsolatedAsyncioTestCase):
         home = await self.plugin()
         unknown = self.browser._rows([
             {"vod_id": "unknown", "vod_name": "电视剧标题"}], self.source, home)[0]
-        self.assertEqual(self.store.get_title_by_guid(unknown["guid"])["type_name"], "")
-        self.assertEqual(unknown["type"], "Movie")
+        node = self.browser.node(unknown["guid"])
+        self.assertEqual(self.store.get_title_by_guid(node["target_guid"])["type_name"], "")
+        self.assertEqual(unknown["type"], "Directory")
+        self.assertEqual(unknown["can_play"], 0)
+
+    async def test_untyped_title_resolves_lazily_to_the_real_native_type(self):
+        home = await self.plugin()
+        for media_type, playlist, expected in (
+                ("电视剧", "第1集$one#第2集$two", "TV"),
+                ("电影", "正片$film", "Movie")):
+            for ua in ("trimemedia-web", "com.trim.tv", "Dalvik/2.1.0 Android",
+                       "com.trim.media.ios"):
+                self.client.headers["User-Agent"] = ua
+                raw = {"vod_id": media_type + ua, "vod_name": "Untyped"}
+                before = len(self.calls)
+                card = self.browser._rows([raw], self.source, home)[0]
+                self.assertEqual(card["type"], "Directory")
+                self.assertEqual(len(self.calls), before)
+                node = self.browser.node(card["guid"])
+                title = t4.map_title(dict(raw, type_name=media_type,
+                    vod_play_from="A", vod_play_url=playlist), self.source, detail=True)
+                with patch.object(t4, "detail", return_value=title) as detail:
+                    data = await self.listing(card["guid"])
+                    self.assertEqual(data["total"], 1)
+                    resolved = data["list"][0]
+                    self.assertEqual(resolved["guid"], node["target_guid"])
+                    self.assertEqual(resolved["type"], expected)
+                    self.assertEqual(resolved["parent_guid"], card["guid"])
+                    await self.listing(card["guid"])
+                    self.assertEqual(detail.await_count, 1)
+                self.assertFalse(any("play" in r.url.params for r in self.calls[before:]))
+
+    async def test_untyped_search_directory_survives_restart_without_loading_details(self):
+        raw = {"vod_id": "unknown", "vod_name": "Untyped"}
+        brief = inject.brief_of(t4.map_title(raw, self.source))
+        self.store.remember_merged([brief])
+        card = self.browser.media_card(brief)
+        restored = t4_browser.T4Browser(self.store, self.config)
+        self.assertEqual(restored.card(card["guid"])["type"], "Directory")
+        self.assertEqual(restored.node(card["guid"])["target_guid"], brief["guid"])
+        self.assertFalse(any("ids" in r.url.params or "play" in r.url.params
+                             for r in self.calls))
+
+    async def test_hidden_library_keeps_untyped_search_usable_without_eager_requests(self):
+        self.config.save({"t4_library_enabled": False})
+        brief = inject.brief_of(t4.map_title(
+            {"vod_id": "unknown-search", "vod_name": "Untyped"}, self.source))
+        self.store.remember_merged([brief])
+        with patch.object(appmod, "_aggregate_briefs", return_value=[brief]), \
+                patch.object(appmod, "_search_cache", {}), \
+                patch.object(appmod, "_search_inflight", {}):
+            cards = await appmod.online_search("Untyped", self.network)
+        self.assertEqual(cards[0]["type"], "Directory")
+        self.assertEqual(self.browser.sources(), [])
+        title = t4.map_title({
+            "vod_id": "unknown-search", "vod_name": "Untyped", "type_name": "电视剧",
+            "vod_play_from": "A", "vod_play_url": "S01E01$a#S02E01$b",
+        }, self.source, detail=True)
+        with patch.object(t4, "detail", return_value=title):
+            data = await self.listing(cards[0]["guid"])
+        self.assertEqual(data["list"][0]["type"], "TV")
+        self.assertEqual(data["list"][0]["number_of_seasons"], 2)
+        self.assertFalse(any("play" in r.url.params for r in self.calls))
+
+    async def test_membership_label_does_not_override_category_media_type(self):
+        parent = await self.category()
+        raw = {"vod_id": "movie-1", "vod_name": "测试剧", "type_name": "大会员"}
+        card = self.browser._rows([raw], self.source, parent)[0]
+        self.assertEqual(card["type"], "TV")
+        brief = self.store.get_title_by_guid(card["guid"])
+        self.assertEqual(brief["type_name"], "电视剧")
+        detail_row = dict(raw, vod_play_from="A", vod_play_url="第1集$id-1")
+        with patch.object(t4, "request", return_value={"list": [detail_row]}):
+            title = await t4.detail(self.network, self.source, brief["locator"], brief)
+        self.assertEqual(title.type_name, "电视剧")
+        self.assertEqual(raw["type_name"], "大会员")
 
     async def test_cached_list_keeps_loaded_type_and_episodes(self):
         parent = await self.category()

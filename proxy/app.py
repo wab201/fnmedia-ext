@@ -35,6 +35,7 @@ import providers
 import t4
 from t4_service import T4Service
 from t4_media import T4Media
+import t4_metadata
 from t4_browser import T4Browser, LIB_GUID as T4_LIB_GUID, LIB_TITLE as T4_LIB_TITLE
 import client as clientmod
 import live as livemod
@@ -876,7 +877,9 @@ async def online_search(keyword: str, client: httpx.AsyncClient) -> list:
         async def work():
             try:
                 briefs = await _aggregate_briefs(keyword)
-                items = [inj.search_item(b) for b in briefs]
+                items = [t4_browser.media_card(b) if
+                         b.get("locator", {}).get("kind") == "t4" else inj.search_item(b)
+                         for b in briefs]
                 _search_cache[keyword] = (time.time(), items)
                 if not fut.done():
                     fut.set_result(items)
@@ -1409,6 +1412,10 @@ async def item_list(request: Request):
     parent = body.get("parent_guid") or aguid
     if aguid == T4_LIB_GUID or parent == T4_LIB_GUID or t4_browser.node(parent):
         try:
+            node = t4_browser.node(parent)
+            if node and node["kind"] == "title":
+                await asyncio.wait_for(t4_service.ensure_detail(
+                    ext_client(request), node["target_guid"]), timeout=35)
             data = await asyncio.wait_for(
                 t4_browser.listing(ext_client(request), parent or T4_LIB_GUID, body),
                 timeout=35)
@@ -1570,7 +1577,9 @@ async def _load_t4_detail(guid: str, request: Request):
     if ep:
         guid = ep["online_guid"]
     if not store.get_title_by_guid(guid):
-        guid = next((og for og in store._titles if season_guid(og) == guid), guid)
+        meta = store.get_season(guid)
+        if meta:
+            guid = meta["online_guid"]
     try:
         await t4_service.ensure_detail(ext_client(request), guid)
     except t4.T4Error as exc:
@@ -1761,30 +1770,15 @@ async def item_detail(guid: str, request: Request):
     # 伪造的 Season / Episode 节点
     if store.get_episode(guid):
         ep = store.get_episode(guid)
-        data = inj._base_item(
-            guid=guid, type="Episode", title=ep["ep_title"],
-            parent_guid=ep["season_guid"], parent_title="第 1 季",
-            tv_title=ep["title"], season_number=1, episode_number=ep["index"] + 1,
-            number_of_seasons=1, can_play=1,
-            media_guid=ep_media_guid(guid), video_guid=ep_video_guid(guid))
+        data = inj.episode_item(ep)
         _apply_marks(data)
         return JSONResponse({"code": 0, "msg": "",
                              "data": clientmod.normalize_detail(data, client)})
-    from store import season_guid as _sg
-    # 反查 season guid
-    tv = None
-    for g in store._titles:
-        if _sg(g) == guid:
-            tv = g
-            break
-    if tv:
+    season = store.get_season(guid)
+    if season:
+        tv = season["online_guid"]
         brief = store.get_title_by_guid(tv)
-        data = inj._base_item(
-            guid=guid, type="Season", title="第 1 季", parent_guid=tv,
-            parent_title=brief["title"], tv_title=brief["title"],
-            season_number=1, number_of_seasons=1,
-            number_of_episodes=store.episode_count(tv), can_play=None,
-            poster=inj._poster(brief.get("poster")))
+        data = inj.season_item(brief, dict(season, guid=guid))
         return JSONResponse({"code": 0, "msg": "",
                              "data": clientmod.normalize_detail(data, client)})
     brief = store.get_title_by_guid(guid)
@@ -1812,12 +1806,8 @@ async def season_list_route(guid: str, request: Request):
 @app.get("/v/api/v1/episode/list/{guid}")
 async def episode_list_route(guid: str, request: Request):
     # guid 可能是伪造的 season guid，也可能是 tv guid
-    tv = None
-    from store import season_guid as _sg
-    for g in store._titles:
-        if _sg(g) == guid:
-            tv = g
-            break
+    season = store.get_season(guid)
+    tv = season["online_guid"] if season else None
     if not tv:
         brief = store.get_title_by_guid(guid)
         if brief and inj.is_tv(brief):
@@ -1830,7 +1820,8 @@ async def episode_list_route(guid: str, request: Request):
     client = _client_of(request)
     return JSONResponse({"code": 0, "msg": "",
                          "data": clientmod.normalize_cards(
-                             inj.episode_list(store.get_title_by_guid(tv)), client)})
+                             inj.episode_list(store.get_title_by_guid(tv),
+                                              season["season"] if season else None), client)})
 
 
 @app.get("/v/api/v1/stream/list/{guid}")
@@ -1859,17 +1850,18 @@ async def stream_list(guid: str, request: Request):
         sl = inj.stream_list(brief)
         if inj.is_tv(brief):
             # 标题播放键实际播放智能续播集，线路菜单也以该集为准
-            egs = store.tv_episode_guids(guid)
+            egs = store.tv_episode_guids(guid, regular_only=True)
             if egs:
-                target = store.get_episode_target(egs[0])
+                resume_guid, _ = history.resume_episode(egs)
+                target = store.get_episode_target(resume_guid)
         else:
             target = store.resolve_media_guid(media_guid(guid))
     quals = _qualities(target) if target else []
     if target and target.get("t4"):
-        # The player ID is opaque until playback. Do not advertise CMS metadata.
-        sl["files"][0].update(path="在线/T4", file_name="T4")
-        sl["video_streams"][0].update(
-            codec_name="", profile="", level="", width=0, height=0, wrapper="")
+        # Menus never start a media probe. Reuse an exact episode/line result.
+        playback = t4_service.cached_playback(target)
+        metadata = t4_media.metadata.cached(playback) if playback else None
+        t4_metadata.apply(sl, playback.wrapper if playback else "", metadata)
     if quals:
         sl["video_streams"][0]["resolution_type"] = quals[0]["resolution"]
         sl["video_streams"][0]["bps"] = quals[0]["bitrate"]
@@ -2091,7 +2083,7 @@ def _online_play_info(guid: str, request: Request) -> dict | None:
         return None
     rec = history.get(guid)
     if inj.is_tv(brief):
-        ep_guids = store.tv_episode_guids(guid)
+        ep_guids = store.tv_episode_guids(guid, regular_only=True)
         if ep_guids:
             target_eg, resume_ts = history.resume_episode(ep_guids)
             if target_eg:
@@ -2331,16 +2323,16 @@ async def stream_post(request: Request):
             sl = inj.episode_stream_list(target)
         else:
             sl = inj.stream_list(store.get_title_by_guid(target["online_guid"]))
+        metadata = await t4_media.metadata.probe(ext_client(request), playback)
+        t4_metadata.apply(sl, playback.wrapper, metadata)
         f, v = sl["files"][0], sl["video_streams"][0]
-        suffix = {"HLS": "m3u8", "MP4": "mp4", "MKV": "mkv"}[playback.wrapper]
-        f.update(path=f"在线/T4.{suffix}", file_name=f"T4.{suffix}")
-        v.update(codec_name="", profile="", level="", width=0, height=0,
-                 wrapper=playback.wrapper)
         qualities = _qualities(menu_target)
         names = [choice["line"] for choice in choices]
-        v.update(resolution_type=target.get("label") or target["line"],
-                 bps=_line_bitrate(target["line"], names))
-        data = {"file_stream": f, "video_stream": v, "audio_streams": [],
+        if len(choices) > 1:
+            # These codes select sources in the official quality menu, not encoders.
+            v.update(resolution_type=target.get("label") or target["line"],
+                     bps=_line_bitrate(target["line"], names))
+        data = {"file_stream": f, "video_stream": v, "audio_streams": sl["audio_streams"],
                 "subtitle_streams": [], "qualities": qualities, "cloud_storage_info": None}
         if playback.wrapper != "HLS":
             # trim.media 0.9.8 uses 9001 for remote raw-file/STRM delivery.

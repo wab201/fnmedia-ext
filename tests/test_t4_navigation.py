@@ -1,0 +1,143 @@
+"""Explicit search cards use native directories, never guessed playback."""
+import asyncio
+import json
+import unittest
+from unittest.mock import patch
+
+import httpx
+
+import test_t4_browse as fixtures
+import inject
+import t4
+import t4_browser
+
+
+class NavigationTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = fixtures.BrowseTests.asyncSetUp
+    import_source = fixtures.BrowseTests.import_source
+    handle = fixtures.BrowseTests.handle
+    listing = fixtures.BrowseTests.listing
+    plugin = fixtures.BrowseTests.plugin
+
+    async def test_explicit_navigation_click_searches_without_detail_or_player(self):
+        home = await self.plugin()
+        raw = {"vod_id": "tmdb:1", "vod_name": "Film", "type_name": "电影",
+               "t4_action": {"type": "search", "keyword": "Film"}}
+        card = self.browser._rows([raw], self.source, home)[0]
+        self.assertEqual(card["type"], "Directory")
+        self.assertEqual(self.browser.node(card["guid"])["kind"], "search")
+        self.assertEqual(card["can_play"], 0)
+        results = {"list": [
+            {"vod_id": "film-a", "vod_name": "Film", "vod_year": "2026",
+             "type_name": "电视剧", "t4_source": "Source A"},
+            {"vod_id": "film-b", "vod_name": "Film", "vod_year": "2025",
+             "t4_source": "Source B"},
+            {"vod_id": "folder", "vod_name": "资源", "vod_tag": "folder"},
+        ], "t4_search": {"completed": 2, "failed": 0, "total": 2, "partial": False}}
+        for ua in ("trimemedia-web", "com.trim.tv", "Dalvik/2.1.0 Android",
+                   "com.trim.media.ios"):
+            self.client.headers["User-Agent"] = ua
+            with patch.object(t4, "navigation_search", return_value=results) as search:
+                self.browser._cache.clear()
+                self.browser._cache_bytes = 0
+                data = await self.listing(card["guid"])
+                self.assertEqual(data["total"], 3)
+                self.assertEqual([r["type"] for r in data["list"]],
+                                 ["TV", "Directory", "Directory"])
+                self.assertEqual([r["title"] for r in data["list"][:2]],
+                                 ["Film · Source A", "Film · Source B"])
+                self.assertEqual(len(data["jump_list"]), 3)
+                await self.listing(card["guid"], offset=1, page_size=1)
+                self.assertEqual(search.await_count, 1)
+        self.assertFalse(any("ids" in r.url.params or "play" in r.url.params for r in self.calls))
+        restored = t4_browser.T4Browser(self.store, self.config)
+        self.assertEqual(restored.node(card["guid"])["keyword"], "Film")
+
+    async def test_source_search_switch_does_not_disable_explicit_navigation(self):
+        self.assertFalse(self.config.all_sources()[0]["searchable"])
+
+        def respond(request):
+            self.assertEqual(request.url.params["nav_search"], "true")
+            self.assertEqual(request.url.params["wd"], "Film")
+            self.assertEqual(request.url.params["token"], "fixture")
+            return httpx.Response(200, json={"list": []})
+
+        async with type(self.network)(transport=httpx.MockTransport(respond)) as client:
+            self.assertEqual(await t4.navigation_search(client, self.source, "Film"), {"list": []})
+
+    async def test_labels_and_folder_names_do_not_implicitly_trigger_search(self):
+        home = await self.plugin()
+        for value in (None, "search", {"type": "play", "keyword": "Film"},
+                      {"type": "search", "keyword": 10}):
+            row = {"vod_id": "film-" + str(value), "vod_name": "片单导航",
+                   "type_name": "电影", "t4_action": value}
+            card = self.browser._rows([row], self.source, home)[0]
+            self.assertEqual(card["type"], "Movie")
+        folder = self.browser._rows([{
+            "vod_id": "folder", "vod_name": "Film", "vod_tag": "folder",
+        }], self.source, home)[0]
+        self.assertEqual(self.browser.node(folder["guid"])["kind"], "category")
+
+    async def test_search_cache_singleflight_partial_retry_and_failure(self):
+        self.browser._cache.clear()
+        self.browser._cache_bytes = 0
+        calls = 0
+
+        async def search(*args):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.01)
+            return {"list": []}
+
+        with patch.object(t4, "navigation_search", side_effect=search):
+            await asyncio.gather(*(self.browser._raw(
+                self.network, self.source, keyword="Film") for _ in range(8)))
+        self.assertEqual(calls, 1)
+        self.assertFalse(self.browser._locks)
+        self.browser._cache.clear()
+        self.browser._cache_bytes = 0
+        with patch.object(t4, "navigation_search", return_value={
+                "list": [], "t4_search": {"partial": True}}) as partial:
+            await self.browser._raw(self.network, self.source, keyword="Film")
+            await self.browser._raw(self.network, self.source, keyword="Film")
+            self.assertEqual(partial.await_count, 2)
+        with patch.object(t4, "navigation_search", side_effect=t4.T4Error("搜索超时")):
+            with self.assertRaises(t4.T4Error):
+                await self.browser._raw(self.network, self.source, keyword="Film")
+        self.assertFalse(self.browser._locks)
+
+    async def test_navigation_card_from_global_search_keeps_explicit_intent(self):
+        brief = inject.brief_of(t4.map_title({
+            "vod_id": "tmdb:2", "vod_name": "Film", "type_name": "电影",
+            "t4_action": {"type": "search", "keyword": "Film", "year": "2026"},
+        }, self.source))
+        self.store.remember_merged([brief])
+        card = self.browser.media_card(brief)
+        self.assertEqual(self.browser.node(card["guid"])["kind"], "search")
+        self.assertEqual(self.browser.node(card["guid"])["year"], "2026")
+        self.assertNotIn("token=", json.dumps(card))
+
+    async def test_explicit_search_does_not_change_playable_plugins_or_mix_same_ids(self):
+        home = await self.plugin()
+        rows = [
+            {"vod_id": "movie-1", "vod_name": "测试剧", "type_name": "电视剧",
+             "t4_source": "Source A"},
+            {"vod_id": "other", "vod_name": "测试剧", "type_name": "电视剧",
+             "t4_source": "Source B"},
+        ]
+        cards = self.browser._rows(rows, self.source, home)
+        self.assertNotEqual(cards[0]["guid"], cards[1]["guid"])
+        detail = await self.client.get("/v/api/v1/item/" + cards[0]["guid"])
+        self.assertEqual(detail.status_code, 200)
+        eps = self.store.tv_episode_guids(cards[0]["guid"])
+        self.assertEqual(len(eps), 2)
+        self.assertFalse(any("play" in r.url.params for r in self.calls))
+        info = (await self.client.post("/v/api/v1/play/info",
+                                      json={"item_guid": eps[1]})).json()["data"]
+        response = await self.client.post("/v/api/v1/play/play", json={
+            "media_guid": info["media_guid"], "line": "B"})
+        self.assertEqual(response.json()["data"]["play_link"], "https://media.test/b2.mp4")
+
+
+if __name__ == "__main__":
+    unittest.main()

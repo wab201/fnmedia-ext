@@ -22,6 +22,7 @@ import t4_service
 
 
 API = "http://t4.test/api/demo?token=fixture"
+MEDIA_BYTES = b"\x00\x00\x00\x18ftypisom" + (bytes(range(256)) * 4)[12:]
 
 
 class BytesStream(httpx.AsyncByteStream):
@@ -96,12 +97,14 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                     '#EXTINF:6,\n#EXT-X-BYTERANGE:16@16\nclip.mp4\n'
                     '#EXTINF:6,\n#EXT-X-BYTERANGE:16\nclip.mp4\n#EXT-X-ENDLIST\n'),
                     headers={"Content-Type": "application/octet-stream"})
-            data = bytes(range(256)) * 4
+            data = MEDIA_BYTES
+            if self.wrapper == "mkv":
+                data = b"\x1a\x45\xdf\xa3\x80matroska" + data[13:]
             start, end = 0, len(data) - 1
             status = 200
             if "range" in request.headers:
                 span = request.headers["range"].removeprefix("bytes=").split("-")
-                start, end = int(span[0]), int(span[1])
+                start, end = int(span[0]), min(int(span[1]), len(data) - 1)
                 status = 206
             return httpx.Response(status, stream=BytesStream(
                 b"" if request.method == "HEAD" else data[start:end + 1]),
@@ -117,6 +120,8 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                  "vod_pic": "https://img.test/poster.jpg"}]})
         if "ids" in params:
             self.assertEqual(params["ids"], "movie-1")
+            if hasattr(self, "detail_override"):
+                return httpx.Response(200, json={"list": [self.detail_override]})
             return httpx.Response(200, json={"list": [{
                 "vod_id": "movie-1", "vod_name": "测试剧", "type_name": "电视剧",
                 "vod_play_from": "A$$$B",
@@ -170,7 +175,9 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(data["play_link"], "https://media.test/b2.mp4")
         self.assertEqual(data["wrapper"], "MP4")
-        self.assertFalse(any(r.url.host == "media.test" for r in self.calls))
+        media_calls = [r for r in self.calls if r.url.host == "media.test"]
+        self.assertEqual(len(media_calls), 1)
+        self.assertEqual(media_calls[0].headers["Range"], "bytes=0-4095")
         local = await self.client.get("/v/api/v1/item/official-guid")
         self.assertEqual(local.json(), {"code": 0, "data": []})
 
@@ -252,6 +259,70 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(data["cloud_storage_info"])
         self.assertNotIn("direct_link_qualities", data)
 
+    async def test_multiseason_first_middle_last_switch_next_and_resume_profiles(self):
+        self.detail_override = {
+            "vod_id": "movie-1", "vod_name": "测试剧", "type_name": "电视剧",
+            "vod_play_from": "A$$$B",
+            "vod_play_url": (
+                "S01E03(3 GB)$a3#S01E01(1 GB)$a1#S01E02(2 GB)$a2#"
+                "S02E01(1 GB)$a21#S02E02(2 GB)$a22$$$"
+                "第1集$b1#第3集$b3#S02E01$b21#S02E02$b22"),
+        }
+        guid = await self.search()
+        for ua in ("trimemedia-web", "com.trim.tv", "Dalvik/2.1.0 Android",
+                   "com.trim.media.ios"):
+            with self.subTest(ua=ua):
+                self.client.headers["User-Agent"] = ua
+                seasons = (await self.client.get(f"/v/api/v1/season/list/{guid}")).json()["data"]
+                self.assertEqual([s["season_number"] for s in seasons], [1, 2])
+                self.assertEqual([s["number_of_episodes"] for s in seasons], [3, 2])
+                for season in seasons:
+                    detail = (await self.client.get(f"/v/api/v1/item/{season['guid']}")).json()["data"]
+                    self.assertEqual(detail["season_number"], season["season_number"])
+                    episodes = (await self.client.get(
+                        f"/v/api/v1/episode/list/{season['guid']}")).json()["data"]
+                    for i, ep in enumerate(episodes):
+                        self.assertEqual(ep["episode_number"], i + 1)
+                        info = (await self.client.post("/v/api/v1/play/info", json={
+                            "item_guid": ep["guid"]})).json()["data"]
+                        self.assertEqual(info["item"]["season_number"], season["season_number"])
+                        mg = info["media_guid"]
+                        stream = (await self.client.get(
+                            f"/v/api/v1/stream/list/{ep['guid']}")).json()["data"]
+                        choices = stream.get("qualities") or [{"resolution": "A", "bitrate": 90000000}]
+                        self.assertEqual(len(choices), 1 if (
+                            season["season_number"] == 1 and i == 1) else 2)
+                        for quality in choices:
+                            body = {"media_guid": mg, "bitrate": quality["bitrate"]}
+                            played = (await self.client.post("/v/api/v1/play/play", json=body)).json()
+                            prefix = "a" if quality["resolution"] == "A" else "b"
+                            number = str(i + 1) if season["season_number"] == 1 else f"2{i + 1}"
+                            self.assertEqual(played["data"]["play_link"],
+                                             f"https://media.test/{prefix}{number}.mp4")
+                # Completing an episode selects its actual successor, across a season boundary.
+                s1 = (await self.client.get(
+                    f"/v/api/v1/episode/list/{seasons[0]['guid']}")).json()["data"]
+                s2 = (await self.client.get(
+                    f"/v/api/v1/episode/list/{seasons[1]['guid']}")).json()["data"]
+                self.history._rec.clear()
+                await self.client.post("/v/api/v1/play/record", json={
+                    "item_guid": s1[-1]["guid"], "ts": 990, "duration": 1000})
+                info = (await self.client.post("/v/api/v1/play/info",
+                                               json={"item_guid": guid})).json()["data"]
+                self.assertEqual(info["guid"], s2[0]["guid"])
+                self.assertEqual(info["ts"], 0)
+
+    async def test_resume_latest_rewatched_episode_not_highest_episode_number(self):
+        guid, second = await self.load_episode()
+        first = self.store.tv_episode_guids(guid)[0]
+        for ep, ts, updated in ((second, 300, 100), (first, 120, 200)):
+            with patch("history.time.time", return_value=updated):
+                await self.client.post("/v/api/v1/play/record", json={
+                    "item_guid": ep, "ts": ts, "duration": 3600})
+        data = (await self.client.post("/v/api/v1/play/info",
+                                       json={"item_guid": guid})).json()["data"]
+        self.assertEqual((data["guid"], data["ts"]), (first, 120))
+
     async def test_import_legacy_entry_and_source_test(self):
         response = await self.client.post("/v/api/ext/source/import-tvbox", json={
             "text": json.dumps({"sites": [{"type": 4, "name": "Other T4",
@@ -268,6 +339,55 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/v/online-admin")
         self.assertEqual(response.status_code, 200)
         self.assertIn("TVBox / T4", response.text)
+
+    async def test_season_episode_and_play_info_retain_title_metadata_all_clients(self):
+        self.detail_override = {
+            "vod_id": "movie-1", "vod_name": "测试剧", "type_name": "电视剧",
+            "vod_year": "2024", "vod_content": "原有简介", "vod_actor": "原有主演",
+            "vod_director": "原有导演", "vod_area": "中国大陆", "vod_score": "8.5",
+            "vod_play_from": "A", "vod_play_url": "第01集$a1#第02集$a2"}
+        guid, eg = await self.load_episode()
+        season = self.store.get_episode(eg)["season_guid"]
+        for ua in ("trimemedia-web", "com.trim.tv", "Dalvik/2.1.0 Android",
+                   "com.trim.media.ios"):
+            self.client.headers["User-Agent"] = ua
+            for item in (eg, season):
+                data = (await self.client.get(f"/v/api/v1/item/{item}")).json()["data"]
+                self.assertIn("原有简介", data["overview"])
+                self.assertIn("原有主演", data["overview"])
+                self.assertTrue(data["posters"].startswith("/online/"))
+                self.assertEqual(data["vote_average"], "8.5")
+                self.assertTrue(data["release_date"].startswith("2024"))
+            info = (await self.client.post("/v/api/v1/play/info",
+                                           json={"item_guid": eg})).json()["data"]
+            self.assertIn("原有导演", info["item"]["overview"])
+            self.assertEqual(info["item"]["tv_title"], "测试剧")
+        # A sparse subsequent detail must not erase good metadata from the same ID.
+        self.detail_override = {
+            "vod_id": "movie-1", "vod_name": "测试剧", "vod_play_from": "A",
+            "vod_play_url": "第01集$a1#第02集$a2"}
+        await appmod.t4_service.ensure_detail(self.network, guid, force=True)
+        self.assertEqual(self.store.get_title_by_guid(guid)["actor"], "原有主演")
+
+    async def test_stream_exposes_exact_metadata_without_fabricating_defaults(self):
+        _, eg = await self.load_episode()
+        mg = storemod.ep_media_guid(eg)
+        before = (await self.client.get(f"/v/api/v1/stream/list/{eg}")).json()["data"]
+        self.assertEqual(before["video_streams"][0]["bit_depth"], 0)
+        self.assertEqual(before["video_streams"][0]["color_range_type"], "")
+        metadata = {"size": 12345678, "video": {"codec_name": "hevc", "profile": "Main",
+                    "width": 3840, "height": 2024, "duration": 2860.698, "bps": 4588470},
+                    "audio": [{"index": 1, "codec_name": "aac", "channels": 2}]}
+        with patch.object(appmod.t4_media.metadata, "probe", return_value=metadata):
+            data = (await self.client.post("/v/api/v1/stream",
+                                           json={"media_guid": mg})).json()["data"]
+        self.assertEqual(data["file_stream"]["size"], metadata["size"])
+        self.assertEqual(data["video_stream"]["codec_name"], "hevc")
+        self.assertEqual(data["video_stream"]["width"], 3840)
+        self.assertEqual(data["audio_streams"][0]["codec_name"], "aac")
+        # Inspection remains network/container-only; no transcoded delivery.
+        self.assertEqual(data["cloud_storage_info"]["cloud_storage_type"], 9001)
+        self.assertNotIn("ffmpeg", str(data))
 
     async def test_cms_search_and_play_regression(self):
         self.config.save({"sources": [{
@@ -331,7 +451,7 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                         follow_redirects=True)
                     self.assertEqual(response.status_code, 206)
                     self.assertEqual(response.history, [])
-                    self.assertEqual(response.content, (bytes(range(256)) * 4)[32:48])
+                    self.assertEqual(response.content, MEDIA_BYTES[32:48])
                     played = [r for r in self.calls if "play" in r.url.params][-1]
                     self.assertEqual(played.url.params["play"], "b2")
                     self.assertEqual(played.url.params["flag"], "B")
@@ -379,6 +499,8 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
             "media_guid": mg, "bitrate": 90010001})
         link = response.json()["data"]["play_link"]
         self.assertEqual(link, "https://media.test/b2.mp4")
+        self.assertEqual(len([r for r in self.calls if r.url.host == "media.test"]), 1)
+        self.calls.clear()
         response = await self.client.get(f"/v/api/v1/media/range/{mg}",
                                          params={"playlink": link})
         self.assertEqual(response.status_code, 302)
@@ -439,6 +561,8 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         _, eg = await self.load_episode()
         response = await self.client.post("/v/api/v1/play/play", json={
             "media_guid": storemod.ep_media_guid(eg)})
+        self.assertEqual(len([r for r in self.calls if r.url.host == "media.test"]), 1)
+        self.calls.clear()
         response = await self.client.get(response.json()["data"]["play_link"])
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response.headers["location"], "https://media.test/a2.m3u8")
@@ -522,7 +646,7 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                     part = await self.client.get(uris[0], headers={
                         "Range": f"bytes={start}-{end}"})
                     self.assertEqual(part.status_code, 206)
-                    self.assertEqual(part.content, (bytes(range(256)) * 4)[start:end+1])
+                    self.assertEqual(part.content, MEDIA_BYTES[start:end+1])
                 await self.client.post("/v/api/v1/play/record", json={
                     "item_guid": eg, "media_guid": mg, "ts": 123, "duration": 3600})
                 history = (await self.client.get("/v/api/v1/play/list")).json()["data"]

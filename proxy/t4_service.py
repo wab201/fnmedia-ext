@@ -95,6 +95,12 @@ class T4Service:
                str(target.get("index", 0)), target.get("line", ""))
         self._playbacks.pop(key, None)
 
+    def cached_playback(self, target: dict):
+        key = (target["online_guid"], target.get("episode_key") or
+               str(target.get("index", 0)), target.get("line", ""))
+        hit = self._playbacks.get(key)
+        return hit[1] if hit else None
+
     def cached_line_for_url(self, target: dict, url: str) -> str | None:
         episode = target.get("episode_key") or str(target.get("index", 0))
         lines = {key[2] for key, (_, result) in self._playbacks.items()

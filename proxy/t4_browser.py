@@ -49,7 +49,8 @@ class T4Browser:
         return [s for s in self.config.enabled_sources() if s.get("kind") == "t4"]
 
     def source(self, sid):
-        source = next((s for s in self.sources() if s["id"] == sid), None)
+        source = next((s for s in self.config.enabled_sources()
+                       if s.get("kind") == "t4" and s["id"] == sid), None)
         if source is None:
             raise t4.T4Error("T4 来源已移除或停用")
         return source
@@ -114,9 +115,38 @@ class T4Browser:
                        skip_filesize=0, prefer_local_nfo=0)
         return row
 
-    async def _raw(self, client, source, tid=None, page=1, filters=None):
+    def media_card(self, brief, parent=LIB_GUID):
+        if brief.get("locator", {}).get("search_keyword"):
+            source = self.source(brief["locator"]["source_id"])
+            guid = self._put(source, "search", brief["title"], parent,
+                             key=brief["guid"],
+                             keyword=brief["locator"]["search_keyword"],
+                             year=brief["locator"].get("search_year", ""))
+            card = self.card(guid)
+            card["poster"] = inject._poster(brief.get("poster") or "")
+            self._save()
+            return card
+        old = self.store.get_title_by_guid(brief["guid"])
+        display = dict(brief, lines=old["lines"], type_name=inject.media_type_name(
+            brief.get("type_name", ""), old.get("type_name", ""))) \
+            if old and old.get("lines") else brief
+        if (brief.get("locator", {}).get("kind") == "t4" and not display.get("lines")
+                and not any(word in (brief.get("type_name") or "")
+                            for word in inject._MOVIE_TYPE_WORDS + inject._TV_TYPE_WORDS)):
+            source = self.source(brief["locator"]["source_id"])
+            guid = self._put(source, "title", brief["title"], parent,
+                             key=brief["guid"], target_guid=brief["guid"])
+            card = self.card(guid)
+            card["poster"] = inject._poster(brief.get("poster") or "")
+            self._save()
+            return card
+        return inject.search_item(display)
+
+    async def _raw(self, client, source, tid=None, page=1, filters=None, *,
+                   keyword=None, year=""):
         key = hashlib.sha256(json.dumps(
-            [source, tid, page, filters], sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+            [source, tid, page, filters, keyword, year],
+            sort_keys=True, ensure_ascii=True).encode()).hexdigest()
 
         def cached():
             now = time.monotonic()
@@ -142,17 +172,24 @@ class T4Browser:
                     return hit
                 start = time.monotonic()
                 async with self._slots:
-                    result = (await t4.home(client, source) if tid is None else
+                    result = (await t4.navigation_search(client, source, keyword, year)
+                              if keyword is not None else
+                              await t4.home(client, source) if tid is None else
                               await t4.category(client, source, tid, page, filters))
                 self.source(source["id"])
                 size = len(json.dumps(result, ensure_ascii=True).encode())
-                if size <= 1024 * 1024:
+                status = result.get("t4_search") or {}
+                # Retry partial/failing search sources on the next visit.
+                cacheable = not isinstance(status, dict) or not (
+                    status.get("partial") or status.get("failed"))
+                if size <= 1024 * 1024 and cacheable:
                     self._cache[key] = time.monotonic(), result, size
                     self._cache_bytes += size
                     while len(self._cache) > 32 or self._cache_bytes > 4 * 1024 * 1024:
                         self._cache_bytes -= self._cache.popitem(last=False)[1][2]
                 _log.info("source=%s operation=%s page=%d rows=%d elapsed_ms=%d",
-                          source["id"], "home" if tid is None else "category",
+                          source["id"], "search" if keyword is not None else
+                          "home" if tid is None else "category",
                           page, len(result.get("list") or []),
                           int((time.monotonic() - start) * 1000))
                 return result
@@ -166,6 +203,8 @@ class T4Browser:
         while parent in self._nodes and parent not in seen:
             seen.add(parent)
             node = self._nodes[parent]
+            if node["kind"] == "search":
+                return ""
             if node["kind"] in ("category", "filter"):
                 name = str(node.get("category_type_name") or
                            node.get("category_title") or node["title"])
@@ -197,19 +236,22 @@ class T4Browser:
             if title is not None:
                 brief = inject.brief_of(title)
                 old = self.store.get_title_by_guid(brief["guid"])
-                if not brief["type_name"]:
-                    brief["type_name"] = (old or {}).get("type_name") or type_hint
+                brief["type_name"] = inject.media_type_name(
+                    brief["type_name"],
+                    inject.media_type_name((old or {}).get("type_name", ""), type_hint))
                 if old is None or any(old.get(key) != brief.get(key) for key in (
                     "title", "type_name", "poster", "year", "remarks", "overview"
                 )) or any((old.get("locator") or {}).get(key) != brief["locator"].get(key)
-                          for key in ("source_id", "vod_id", "content_key")):
+                          for key in ("source_id", "vod_id", "content_key",
+                                      "search_keyword", "search_year", "source_label")):
                     briefs.append(brief)
                 # 列表不抹掉已加载详情的类型和集数，也不提前请求详情/取链。
-                card = inject.search_item(dict(brief, lines=old["lines"])
-                                          if old and old.get("lines") else brief)
+                card = self.media_card(brief, parent)
                 card.update(title=title.title, parent_guid=parent,
                             ancestor_guid=LIB_GUID, ancestor_name=LIB_TITLE,
                             ancestor_category="Mix")
+                if label := brief.get("locator", {}).get("source_label"):
+                    card["title"] = title.title + " · " + label
                 cards.append(card)
         if briefs:
             self.store.remember_merged(briefs)
@@ -290,6 +332,20 @@ class T4Browser:
                 start = max(0, offset - len(prefix))
                 cards += self._rows((result.get("list") or [])[start:start + size - len(cards)],
                                     source, guid)
+            elif node["kind"] == "title":
+                brief = self.store.get_title_by_guid(node["target_guid"])
+                if not brief or not brief.get("lines"):
+                    raise t4.T4Error("资源详情未加载，请重新打开资源目录")
+                card = inject.search_item(brief)
+                card.update(parent_guid=guid, ancestor_guid=LIB_GUID,
+                            ancestor_name=LIB_TITLE, ancestor_category="Mix")
+                cards, total = [card][offset:offset + size], 1
+            elif node["kind"] == "search":
+                result = await self._raw(client, source, keyword=node["keyword"],
+                                         year=node.get("year", ""))
+                rows = result["list"]
+                cards = self._rows(rows[offset:offset + size], source, guid)
+                total = len(rows)
             elif node["kind"] == "filter":
                 guids = []
                 for value in node.get("values") or []:
@@ -328,6 +384,10 @@ class T4Browser:
                 total += len(prefix)
             self.source(node["source_id"])
         self._save()
-        return {"mdb_name": LIB_TITLE, "mdb_category": "Mix", "top_dir": "",
+        data = {"mdb_name": LIB_TITLE, "mdb_category": "Mix", "top_dir": "",
                 "dir": "/".join(row["base_name"] for row in self._trail(guid)),
                 "jump_list": self._trail(guid), "total": total, "list": cards}
+        if guid != LIB_GUID and node["kind"] == "search" and isinstance(
+                result.get("t4_search"), dict):
+            data["t4_search"] = result["t4_search"]
+        return data

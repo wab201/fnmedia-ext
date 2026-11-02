@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import secrets
 import time
@@ -13,15 +14,18 @@ import httpx
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 
 import t4
+from t4_metadata import MediaProbe
 
 PREFIX = "/v/media/t4-resource"
 MAX_MANIFEST = 2 * 1024 * 1024
+_log = logging.getLogger("fnmedia.t4.media")
 
 
 class T4Media:
     def __init__(self):
         self._resources = OrderedDict()
         self._resource_key = secrets.token_bytes(32)
+        self.metadata = MediaProbe()
 
     def resource(self, url: str, playback: t4.Playback, *, manifest=False) -> str:
         # HLS implicit byte ranges require repeated URIs to stay identical.
@@ -46,21 +50,36 @@ class T4Media:
         return await self.deliver(client, url, playback, request, manifest=manifest)
 
     async def identify(self, client, playback: t4.Playback) -> t4.Playback:
-        if playback.wrapper:
+        if playback.identified or playback.wrapper == "DASH":
             return playback
+        # Cloud links can be named .mp4 and even advertise MP4 while serving MKV.
+        # Inspect at most 4 KiB once per short-lived playback, never decode video.
+        headers = httpx.Headers(playback.headers)
+        if playback.wrapper != "HLS":
+            headers["Range"] = "bytes=0-4095"
         try:
-            response = await client.head(playback.url, headers=playback.headers,
-                                         timeout=10, follow_redirects=True)
-            response.raise_for_status()
-            detected = t4.playback({"url": str(response.url),
-                                    "type": response.headers.get("content-type", ""),
-                                    "header": playback.headers}, playback.url)
-        except httpx.HTTPError:
-            raise t4.T4Error("无法识别 T4 媒体格式，服务端需返回 type") from None
-        if not detected.wrapper:
-            raise t4.T4Error("T4 媒体格式未知，不会将其伪装成 HLS")
-        playback.wrapper = detected.wrapper
-        return playback
+            async with client.stream("GET", playback.url, headers=headers,
+                                     timeout=10, follow_redirects=True) as response:
+                response.raise_for_status()
+                prefix = await anext(response.aiter_bytes(chunk_size=4096), b"")
+                wrapper = ""
+                if prefix.lstrip(b"\xef\xbb\xbf \r\n\t").startswith(b"#EXTM3U"):
+                    wrapper = "HLS"
+                elif len(prefix) >= 12 and prefix[4:8] == b"ftyp":
+                    wrapper = "MP4"
+                elif prefix.startswith(b"\x1a\x45\xdf\xa3") and b"matroska" in prefix:
+                    wrapper = "MKV"
+                if wrapper:
+                    _log.info("T4 media identified method=GET declared=%s wrapper=%s",
+                              playback.wrapper or "unknown", wrapper)
+                    playback.wrapper = wrapper
+                    playback.identified = True
+                    return playback
+        except httpx.HTTPError as exc:
+            status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else 0
+            _log.info("T4 media identify method=GET http=%s error=%s",
+                      status, type(exc).__name__)
+        raise t4.T4Error("无法识别 T4 媒体格式，请检查媒体 GET 响应或服务端 type")
 
     async def deliver(self, client, url: str, playback: t4.Playback, request,
                       *, manifest: bool | None = None):
@@ -78,6 +97,8 @@ class T4Media:
             upstream = await client.send(req, stream=True, follow_redirects=True)
             if upstream.status_code >= 400:
                 status = upstream.status_code
+                _log.warning("T4 media delivery method=%s http=%s wrapper=%s",
+                             request.method, status, playback.wrapper)
                 extra = {"Content-Range": upstream.headers["content-range"]} \
                     if status == 416 and "content-range" in upstream.headers else {}
                 await upstream.aclose()
@@ -120,6 +141,11 @@ class T4Media:
             forwarded = {k: v for k, v in upstream.headers.items() if k.lower() in (
                 "content-type", "content-length", "content-range", "accept-ranges",
                 "content-encoding", "etag", "last-modified")}
+            if url == playback.url and ctype.split(";", 1)[0] in (
+                    "", "application/octet-stream", "binary/octet-stream"):
+                mime = {"MP4": "video/mp4", "MKV": "video/x-matroska"}.get(playback.wrapper)
+                if mime:
+                    forwarded["content-type"] = mime
             forwarded["Cache-Control"] = "no-store"
             if request.method == "HEAD":
                 await upstream.aclose()
@@ -132,7 +158,9 @@ class T4Media:
                         del response.headers["content-length"]
                     return response
                 return Response(status_code=upstream.status_code, headers=forwarded)
-        except (httpx.HTTPError, UnicodeError, t4.T4Error):
+        except (httpx.HTTPError, UnicodeError, t4.T4Error) as exc:
+            _log.warning("T4 media delivery method=%s error=%s wrapper=%s",
+                         request.method, type(exc).__name__, playback.wrapper)
             if upstream is not None:
                 await upstream.aclose()
             return Response("T4 媒体网络请求失败", status_code=502)
