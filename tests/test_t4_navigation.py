@@ -106,6 +106,93 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
                 await self.browser._raw(self.network, self.source, keyword="Film")
         self.assertFalse(self.browser._locks)
 
+    async def test_partial_search_pages_share_snapshot_in_four_client_profiles(self):
+        home = await self.plugin()
+        card = self.browser._rows([{
+            "vod_id": "tmdb:1", "vod_name": "Film", "type_name": "电影",
+            "t4_action": {"type": "search", "keyword": "Film"},
+        }], self.source, home)[0]
+        results = {"list": [
+            {"vod_id": f"film-{i}", "vod_name": f"Film {i}",
+             "type_name": "电视剧", "t4_source": "Source A"}
+            for i in range(66)
+        ], "t4_search": {"completed": 16, "failed": 2, "total": 174,
+                        "partial": True, "truncated": 125}}
+
+        async def search(*args):
+            await asyncio.sleep(0.01)
+            return results
+
+        for ua in ("trimemedia-web", "com.trim.tv", "Dalvik/2.1.0 Android",
+                   "com.trim.media.ios"):
+            with self.subTest(ua=ua):
+                self.browser._cache.clear()
+                self.browser._cache_bytes = 0
+                self.client.headers["User-Agent"] = ua
+                with patch.object(t4, "navigation_search", side_effect=search) as lookup:
+                    pages = await asyncio.gather(*(self.listing(
+                        card["guid"], offset=offset, page_size=22)
+                        for offset in (0, 22, 44)))
+                    again = await self.listing(card["guid"], page_size=22)
+                self.assertEqual(lookup.await_count, 1)
+                self.assertTrue(all(page["total"] == 66 for page in pages))
+                self.assertTrue(all(page["t4_search"] == results["t4_search"]
+                                    for page in pages))
+                self.assertEqual([row["guid"] for row in again["list"]],
+                                 [row["guid"] for row in pages[0]["list"]])
+                self.assertEqual(len({row["guid"] for page in pages
+                                      for row in page["list"]}), 66)
+                self.assertFalse(self.browser._locks)
+        self.assertFalse(any("ids" in r.url.params or "play" in r.url.params
+                             for r in self.calls))
+
+    async def test_incomplete_snapshot_expires_and_does_not_cache_empty_results(self):
+        for status in ({"partial": True}, {"partial": False, "failed": 1}):
+            with self.subTest(status=status):
+                self.browser._cache.clear()
+                self.browser._cache_bytes = 0
+                result = {"list": [{"vod_id": "film", "vod_name": "Film"}],
+                          "t4_search": status}
+                with patch.object(t4, "navigation_search", return_value=result) as lookup:
+                    await self.browser._raw(self.network, self.source, keyword="Film")
+                    await self.browser._raw(self.network, self.source, keyword="Film")
+                    self.assertEqual(lookup.await_count, 1)
+                    for key, (stamp, data, size) in list(self.browser._cache.items()):
+                        self.browser._cache[key] = stamp - 61, data, size
+                    await self.browser._raw(self.network, self.source, keyword="Film")
+                    self.assertEqual(lookup.await_count, 2)
+                    self.assertEqual(len(self.browser._cache), 1)
+                    self.assertEqual(self.browser._cache_bytes,
+                                     next(iter(self.browser._cache.values()))[2])
+                self.browser._cache.clear()
+                self.browser._cache_bytes = 0
+                with patch.object(t4, "navigation_search", return_value={
+                        "list": [], "t4_search": status}) as lookup:
+                    await self.browser._raw(self.network, self.source, keyword="Film")
+                    await self.browser._raw(self.network, self.source, keyword="Film")
+                    self.assertEqual(lookup.await_count, 2)
+                    self.assertFalse(self.browser._cache)
+
+    async def test_browse_timeout_records_source_and_node_without_credentials(self):
+        home = await self.plugin()
+        card = self.browser._rows([{
+            "vod_id": "tmdb:1", "vod_name": "Film",
+            "t4_action": {"type": "search", "keyword": "Film"},
+        }], self.source, home)[0]
+        with patch.object(self.browser, "listing", side_effect=asyncio.TimeoutError), \
+                self.assertLogs("fnmedia", level="WARNING") as logs:
+            response = await self.client.post("/v/api/v1/item/list", json={
+                "ancestor_guid": t4_browser.LIB_GUID,
+                "parent_guid": card["guid"], "page": 2})
+        self.assertEqual(response.status_code, 504)
+        self.assertIn("浏览超时", response.json()["msg"])
+        log = "\n".join(logs.output)
+        for value in (self.source["id"], card["guid"], "kind=search", "page=2",
+                      "elapsed_ms="):
+            self.assertIn(value, log)
+        self.assertNotIn("token=", log)
+        self.assertNotIn("http://", log)
+
     async def test_navigation_card_from_global_search_keeps_explicit_intent(self):
         brief = inject.brief_of(t4.map_title({
             "vod_id": "tmdb:2", "vod_name": "Film", "type_name": "电影",

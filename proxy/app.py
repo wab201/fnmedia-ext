@@ -1411,8 +1411,9 @@ async def item_list(request: Request):
 
     parent = body.get("parent_guid") or aguid
     if aguid == T4_LIB_GUID or parent == T4_LIB_GUID or t4_browser.node(parent):
+        started = time.monotonic()
+        node = t4_browser.node(parent)
         try:
-            node = t4_browser.node(parent)
             if node and node["kind"] == "title":
                 await asyncio.wait_for(t4_service.ensure_detail(
                     ext_client(request), node["target_guid"]), timeout=35)
@@ -1420,6 +1421,11 @@ async def item_list(request: Request):
                 t4_browser.listing(ext_client(request), parent or T4_LIB_GUID, body),
                 timeout=35)
         except asyncio.TimeoutError:
+            _log.warning(
+                "T4 browse timeout source=%s node=%s kind=%s page=%s elapsed_ms=%d",
+                (node or {}).get("source_id", ""), parent,
+                (node or {}).get("kind", "root"), body.get("page", 1),
+                int((time.monotonic() - started) * 1000))
             return JSONResponse({"code": -1, "msg": "T4 浏览超时，请稍后重新进入",
                                  "data": None}, status_code=504)
         except t4.T4Error as exc:

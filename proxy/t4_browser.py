@@ -179,8 +179,9 @@ class T4Browser:
                 self.source(source["id"])
                 size = len(json.dumps(result, ensure_ascii=True).encode())
                 status = result.get("t4_search") or {}
-                # Retry partial/failing search sources on the next visit.
-                cacheable = not isinstance(status, dict) or not (
+                # Paging must reuse one snapshot even when some plugins are slow.
+                # Empty incomplete results remain immediately retryable.
+                cacheable = bool(result.get("list")) or not isinstance(status, dict) or not (
                     status.get("partial") or status.get("failed"))
                 if size <= 1024 * 1024 and cacheable:
                     self._cache[key] = time.monotonic(), result, size
