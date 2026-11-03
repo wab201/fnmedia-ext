@@ -86,6 +86,76 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["size"], len(self.data))
         self.assertEqual(results[0]["video"]["bps"], 4588470)
 
+    async def test_handoff_deadline_keeps_bounded_probe_and_reuses_completed_metadata(self):
+        probe = meta.MediaProbe()
+        self.addAsyncCleanup(probe.close)
+        entered, unblock = asyncio.Event(), asyncio.Event()
+
+        async def inspect(*_):
+            entered.set()
+            await unblock.wait()
+            return INFO
+
+        with patch("t4_metadata.shutil.which", return_value="ffprobe"), \
+                patch("t4_metadata.inspect_bytes", side_effect=inspect) as mock:
+            self.assertEqual(await probe.for_playback(
+                self.client, self.playback, wait=0.01), {})
+            await entered.wait()
+            self.assertEqual(await probe.for_playback(
+                self.client, self.playback, wait=0), {})
+            self.assertEqual(len(probe._pending), 1)
+            mock.assert_awaited_once()
+            unblock.set()
+            await asyncio.gather(*probe._pending.values())
+            result = await probe.for_playback(self.client, self.playback, wait=0)
+            self.assertEqual(result["video"]["codec_name"], "hevc")
+            self.assertFalse(probe._pending)
+            mock.assert_awaited_once()
+
+    async def test_background_probe_limit_request_cancel_and_shutdown_cleanup(self):
+        probe = meta.MediaProbe()
+        self.addAsyncCleanup(probe.close)
+        entered = asyncio.Event()
+        active = 0
+
+        async def inspect(*_):
+            nonlocal active
+            active += 1
+            if active == 2:
+                entered.set()
+            await asyncio.Event().wait()
+
+        with patch("t4_metadata.shutil.which", return_value="ffprobe"), \
+                patch("t4_metadata.inspect_bytes", side_effect=inspect):
+            for i in range(20):
+                await probe.for_playback(self.client, t4.Playback(
+                    f"http://media.test/{i}.mp4", self.playback.headers, "MP4"), wait=0)
+            self.assertEqual(len(probe._pending), 2)
+            await asyncio.wait_for(entered.wait(), 1)
+            waiting = asyncio.create_task(probe.for_playback(self.client, t4.Playback(
+                "http://media.test/0.mp4", self.playback.headers, "MP4"), wait=20))
+            await asyncio.sleep(0)
+            waiting.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiting
+            self.assertEqual(len(probe._pending), 2)
+            await probe.close()
+        self.assertFalse(probe._pending)
+        self.assertFalse(probe._locks)
+        self.assertEqual(probe._slots._value, 2)
+        self.assertTrue(all(s.closed for s in self.streams))
+
+    async def test_optional_probe_failure_does_not_fail_handoff_or_log_secrets(self):
+        probe = meta.MediaProbe()
+        self.addAsyncCleanup(probe.close)
+        with patch.object(probe, "probe", side_effect=RuntimeError("fixture-secret")):
+            with self.assertLogs("fnmedia.t4.metadata", level="WARNING") as logs:
+                self.assertEqual(await probe.for_playback(
+                    self.client, self.playback, wait=1), {})
+        self.assertIn("RuntimeError", str(logs.output))
+        self.assertNotIn("fixture-secret", str(logs.output))
+        self.assertFalse(probe._pending)
+
     async def test_no_wrong_offsets_when_origin_ignores_range(self):
         self.ignore_range = True
         probe = meta.MediaProbe()
@@ -217,6 +287,22 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.headers["content-type"], "video/mp4")
             self.assertEqual(b"".join([part async for part in response.body_iterator]), b"unchanged")
             self.assertEqual(response.headers["content-range"], "bytes 0-8/100")
+
+    async def test_identification_preserves_total_size_not_partial_content_length(self):
+        data = box(b"ftyp", b"isom")
+        for status, headers, expected in (
+                (206, {"Content-Range": "bytes 0-11/987654321",
+                       "Content-Length": "12"}, 987654321),
+                (206, {"Content-Length": "12"}, 0),
+                (200, {"Content-Length": "987654321"}, 987654321)):
+            with self.subTest(status=status, headers=headers):
+                async def handler(request):
+                    return httpx.Response(status, content=data, headers=headers)
+
+                playback = t4.Playback(self.playback.url, self.playback.headers, "MP4")
+                async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                    await t4_media.T4Media().identify(client, playback)
+                self.assertEqual(playback.size, expected)
 
     def test_unknown_fields_are_not_fabricated_and_audio_has_stable_identity(self):
         sl = inject.stream_list({"guid": "fixture", "title": "Fixture"})

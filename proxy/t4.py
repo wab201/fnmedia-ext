@@ -347,6 +347,7 @@ class Playback:
     jx: int = 0
     subtitles: list = field(default_factory=list)
     identified: bool = False
+    size: int = 0
 
     @property
     def needs_proxy(self) -> bool:

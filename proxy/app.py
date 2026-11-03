@@ -65,6 +65,7 @@ ONLINE_PREFIX = "/v/media/online"
 _search_cache: dict[str, tuple[float, list]] = {}
 _search_inflight: dict[str, asyncio.Future] = {}
 CACHE_TTL = 120
+T4_STREAM_READY_BUDGET = 8.0
 # 在线热门按内容拆成 4 个虚拟媒体库。guid 由固定串 md5 派生，保持稳定。
 HOT_CATEGORIES = [
     ("movie",   "🌐在线电影", "Movie"),
@@ -432,6 +433,7 @@ async def lifespan(app: FastAPI):
             await app.state.update_task
         except (asyncio.CancelledError, Exception):
             pass
+        await t4_media.metadata.close()
         await app.state.up.aclose()
         await app.state.ext.aclose()
 
@@ -486,13 +488,15 @@ def _diagnostic_query(request: Request) -> str:
 
 @app.middleware("http")
 async def _access(request: Request, call_next):
+    started = time.monotonic()
     resp = await call_next(request)
     p = request.url.path
     if "/api/" in p or p.startswith(ONLINE_PREFIX) or p.startswith("/v/media"):
         query = _diagnostic_query(request)
-        _log.info("%s %s -> %s client=%s", request.method,
+        _log.info("%s %s -> %s client=%s elapsed_ms=%d", request.method,
                   (p + ("?" + query if query else ""))[:120],
-                  resp.status_code, _client_of(request).label)
+                  resp.status_code, _client_of(request).label,
+                  int((time.monotonic() - started) * 1000))
     _live_record(request, resp.status_code, p)
     return resp
 
@@ -2326,11 +2330,16 @@ async def stream_post(request: Request):
     if not target:
         return await forward_upstream(request)
     if target.get("t4"):
+        started = time.monotonic()
+        _log.info("T4 stream start media=%s client=%s",
+                  mg, _client_of(request).label)
         menu_target = target
         choices = _line_choices(target)
         try:
             target = _t4_selected_target(mg, target, body, request)
         except t4.T4Error as exc:
+            _log.warning("T4 stream failed media=%s client=%s stage=selection",
+                         mg, _client_of(request).label)
             return JSONResponse({"code": -1, "msg": str(exc), "data": None},
                                 status_code=400)
         try:
@@ -2339,37 +2348,53 @@ async def stream_post(request: Request):
             if playback.wrapper == "DASH":
                 raise t4.T4Error("当前飞牛适配尚未验证 DASH/双轨播放")
         except t4.T4Error as exc:
+            _log.warning("T4 stream failed media=%s client=%s stage=resolve elapsed_ms=%d",
+                         mg, _client_of(request).label,
+                         int((time.monotonic() - started) * 1000))
             return JSONResponse({"code": -1, "msg": str(exc), "data": None},
                                 status_code=502)
         if target.get("kind") == "episode":
             sl = inj.episode_stream_list(target)
         else:
             sl = inj.stream_list(store.get_title_by_guid(target["online_guid"]))
-        metadata = await t4_media.metadata.probe(ext_client(request), playback)
+        metadata = await t4_media.metadata.for_playback(
+            ext_client(request), playback,
+            wait=max(0.0, T4_STREAM_READY_BUDGET - (time.monotonic() - started)))
         t4_metadata.apply(sl, playback.wrapper, metadata)
         f, v = sl["files"][0], sl["video_streams"][0]
+        if not f["size"]:
+            f["size"] = playback.size
         qualities = _qualities(menu_target)
         names = [choice["line"] for choice in choices]
         if len(choices) > 1:
             # These codes select sources in the official quality menu, not encoders.
             v.update(resolution_type=target.get("label") or target["line"],
                      bps=_line_bitrate(target["line"], names))
+        else:
+            # Native players also require a ready original-quality entry for one source.
+            qualities = [{
+                "resolution": v["resolution_type"] or "原画",
+                "bitrate": v["bps"],
+                "progressive": True,
+                "is_m3u8": False,
+            }]
         data = {"file_stream": f, "video_stream": v, "audio_streams": sl["audio_streams"],
                 "subtitle_streams": [], "qualities": qualities, "cloud_storage_info": None}
         if playback.wrapper != "HLS":
             # trim.media 0.9.8 uses 9001 for remote raw-file/STRM delivery.
             # This is a response contract only; no STRM file or DB row is created.
             raw = [{
-                "resolution": choice["label"],
-                "bitrate": _line_bitrate(choice["line"], names),
-                "is_m3u8": False,
+                **quality,
                 "url": _t4_media_url(request, mg, line=choice["line"]),
-            } for choice in choices]
+            } for choice, quality in zip(choices, qualities)]
             data.update(cloud_storage_info={"cloud_storage_type": 9001},
                         direct_link_qualities=raw)
-        _log.info("T4 stream media=%s client=%s wrapper=%s delivery=%s lines=%d",
+        _log.info("T4 stream media=%s client=%s wrapper=%s delivery=%s lines=%d "
+                  "qualities=%d audio=%d elapsed_ms=%d",
                   mg, _client_of(request).label, playback.wrapper,
-                  "server" if playback.needs_proxy else "direct", len(choices))
+                  "server" if playback.needs_proxy else "direct", len(choices),
+                  len(qualities), len(sl["audio_streams"]),
+                  int((time.monotonic() - started) * 1000))
         return JSONResponse({"code": 0, "msg": "", "data": data})
     if target.get("kind") == "episode":
         sl = inj.episode_stream_list(target)

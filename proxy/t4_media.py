@@ -70,6 +70,17 @@ class T4Media:
                 elif prefix.startswith(b"\x1a\x45\xdf\xa3") and b"matroska" in prefix:
                     wrapper = "MKV"
                 if wrapper:
+                    if wrapper in ("MP4", "MKV"):
+                        span = re.fullmatch(
+                            r"bytes \d+-\d+/(\d+)",
+                            response.headers.get("content-range", ""))
+                        size = ""
+                        if span and response.status_code == 206:
+                            size = span[1]
+                        elif response.status_code == 200:
+                            size = response.headers.get("content-length", "")
+                        if size.isdigit():
+                            playback.size = int(size)
                     _log.info("T4 media identified method=GET declared=%s wrapper=%s",
                               playback.wrapper or "unknown", wrapper)
                     playback.wrapper = wrapper

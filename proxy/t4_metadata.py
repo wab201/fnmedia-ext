@@ -189,6 +189,7 @@ class MediaProbe:
         self._cache = OrderedDict()
         self._locks = {}
         self._slots = asyncio.Semaphore(2)
+        self._pending = {}
 
     @staticmethod
     def _key(playback):
@@ -204,6 +205,46 @@ class MediaProbe:
             return hit[1]
         self._cache.pop(key, None)
         return None
+
+    async def for_playback(self, client, playback, *, wait: float) -> dict:
+        """Optional inspection must not extend a native player's response deadline."""
+        if playback.wrapper not in ("MP4", "MKV"):
+            return {}
+        hit = self.cached(playback)
+        if hit is not None:
+            return hit
+        key = self._key(playback)
+        task = self._pending.get(key)
+        if task is None:
+            if len(self._pending) >= 2:
+                return {}
+            task = asyncio.create_task(self.probe(client, playback))
+            self._pending[key] = task
+
+            def finished(done):
+                self._pending.pop(key, None)
+                if not done.cancelled() and done.exception() is not None:
+                    _log.warning("T4 metadata background failed error=%s",
+                                 type(done.exception()).__name__)
+
+            task.add_done_callback(finished)
+        if wait <= 0:
+            return {}
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=wait)
+        except asyncio.TimeoutError:
+            _log.info("T4 metadata deferred wrapper=%s", playback.wrapper)
+            return {}
+        except Exception:
+            # The client can inspect original bytes; optional metadata cannot fail handoff.
+            return {}
+
+    async def close(self):
+        tasks = list(self._pending.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._pending.clear()
 
     async def probe(self, client, playback) -> dict:
         if playback.wrapper not in ("MP4", "MKV"):

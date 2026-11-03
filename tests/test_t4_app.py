@@ -1,12 +1,13 @@
 """Exercise real FastAPI routes with in-process T4/official/media fixtures."""
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -68,6 +69,7 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.network.aclose)
         appmod.app.state.ext = self.network
         appmod.app.state.up = self.network
+        self.addAsyncCleanup(appmod.t4_media.metadata.close)
         # Do not run lifespan: it starts production workers and config polling.
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=appmod.app),
                                         base_url="http://fnmedia.test")
@@ -295,6 +297,74 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["video_stream"]["wrapper"], "HLS")
         self.assertIsNone(data["cloud_storage_info"])
         self.assertNotIn("direct_link_qualities", data)
+
+    async def test_single_line_stream_is_ready_for_every_client_and_container(self):
+        self.protected = True
+        self.detail_override = {
+            "vod_id": "movie-1", "vod_name": "测试剧", "type_name": "电视剧",
+            "vod_play_from": "A", "vod_play_url": "第01集$a1#第02集$a2"}
+        _, eg = await self.load_episode()
+        mg = storemod.ep_media_guid(eg)
+        metadata = {"size": 12345, "video": {
+            "codec_name": "hevc", "resolution_type": "4K", "bps": 9208081},
+            "audio": []}
+        for wrapper in ("mp4", "mkv", "m3u8"):
+            self.wrapper = wrapper
+            appmod.t4_service._playbacks.clear()
+            for ua in ("com.trim.media.ios", "com.trim.tv",
+                       "Dalvik/2.1.0 Android", "trimemedia-web"):
+                with self.subTest(wrapper=wrapper, ua=ua), patch.object(
+                        appmod.t4_media.metadata, "probe", return_value=metadata):
+                    response = await self.client.post("/v/api/v1/stream",
+                        json={"media_guid": mg}, headers={"User-Agent": ua})
+                    self.assertEqual(response.status_code, 200)
+                    data = response.json()["data"]
+                    self.assertEqual(len(data["qualities"]), 1)
+                    quality = data["qualities"][0]
+                    self.assertEqual(quality["resolution"],
+                                     "原画" if wrapper == "m3u8" else "4K")
+                    self.assertEqual(quality["bitrate"], data["video_stream"]["bps"])
+                    self.assertTrue(quality["progressive"])
+                    if wrapper != "m3u8":
+                        direct = data["direct_link_qualities"][0]
+                        self.assertEqual({k: direct[k] for k in quality}, quality)
+                        response = await self.client.get(direct["url"],
+                            headers={"Range": "bytes=0-15"}, follow_redirects=True)
+                        self.assertEqual(response.status_code, 206)
+
+    async def test_slow_optional_metadata_cannot_hold_native_stream_response(self):
+        self.protected = True
+        self.detail_override = {
+            "vod_id": "movie-1", "vod_name": "测试剧", "type_name": "电视剧",
+            "vod_play_from": "A", "vod_play_url": "第01集$a1#第02集$a2"}
+        _, eg = await self.load_episode()
+        mg = storemod.ep_media_guid(eg)
+        unblock = asyncio.Event()
+
+        async def slow(*_):
+            await unblock.wait()
+            return {}
+
+        with patch.object(appmod, "T4_STREAM_READY_BUDGET", 0.02), \
+                patch.object(appmod.t4_media.metadata, "probe",
+                             new=AsyncMock(side_effect=slow)) as probe:
+            with self.assertLogs("fnmedia", level="INFO") as logs:
+                response = await asyncio.wait_for(self.client.post("/v/api/v1/stream",
+                    json={"media_guid": mg}, headers={"User-Agent": "com.trim.media.ios"}),
+                    timeout=0.5)
+            data = response.json()["data"]
+            self.assertEqual(data["video_stream"]["codec_name"], "")
+            self.assertEqual(data["file_stream"]["size"], len(MEDIA_BYTES))
+            self.assertEqual(len(data["qualities"]), 1)
+            self.assertEqual(len(appmod.t4_media.metadata._pending), 1)
+            self.assertTrue(any("elapsed_ms=" in row for row in logs.output))
+            await self.client.post("/v/api/v1/stream", json={"media_guid": mg})
+            probe.assert_awaited_once()
+            response = await self.client.get(data["direct_link_qualities"][0]["url"],
+                headers={"Range": "bytes=0-15"}, follow_redirects=True)
+            self.assertEqual(response.status_code, 206)
+            unblock.set()
+            await appmod.t4_media.metadata.close()
 
     async def test_multiseason_first_middle_last_switch_next_and_resume_profiles(self):
         self.detail_override = {
