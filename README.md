@@ -294,6 +294,22 @@ Lucky 的该类子规则会替换匹配的路径前缀，所以后端也必须�
 不能变为 `/api/v1/mediadb/list` 或 `/v/v/api/v1/mediadb/list`。
 其他反代软件同样以这个最终路径为准。
 
+仅能打开页面不代表原生播放器收到的完整地址正确。飞牛内置入口可能去掉 Host 的
+端口，因此外层代理应明确传递外部协议和完整 Host，不要修改飞牛系统 nginx：
+
+- 在 Lucky 现有 `/v` 子规则中启用「追加客户端协议头到指定 Header」，
+  Header Key 填 `X-Forwarded-Proto`。
+- 在同一子规则的自定义参数中设置完整公网域名与端口。例如公网入口为
+  `https://media.example.com:15666/v/` 时：
+
+```nginx
+proxy_set_header X-Forwarded-Host media.example.com:15666;
+```
+
+这是 Lucky 的子规则参数，不是飞牛系统配置文件；域名和端口按自己的入口替换，
+使用标准 HTTPS 端口时可省略 `:443`。保留其他子规则、鉴权和后端地址。
+如果播放地址变成 `http` 或丢失公网端口，先检查这两项，再重新打开详情取链。
+
 使用 Nginx 时，可在现有影视域名的 `server` 内增加下面两个 `location`，
 保留原有 TLS、根路径和其他代理规则：
 
