@@ -1,7 +1,7 @@
 appname               = fnmedia-ext
 version               = @VERSION@
 display_name          = 飞牛影视在线扩展
-desc                  = 飞牛影视在线扩展 T4 预发布版：可逆代理官方影视入口，支持远程 T4 订阅、原生搜索、懒加载详情、多线路选集、按需取链、Range/HEAD 流式交付，不做视频转码。保留原有 CMS、榜单、分类及管理页；部分 T4 能力仍待适配。
+desc                  = 飞牛影视在线扩展：支持远程 T4 订阅、原生选片与搜索、多季多线路选集、按需取链及 Range/HEAD 流式交付，保留 CMS、榜单、分类和管理页。不解码、不转码；实际播放取决于来源可用性与客户端编码支持。
 platform              = all
 source                = thirdparty
 maintainer            = wab201
