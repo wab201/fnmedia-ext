@@ -225,6 +225,84 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
             "media_guid": info["media_guid"], "line": "B"})
         self.assertEqual(response.json()["data"]["play_link"], "https://media.test/b2.mp4")
 
+    async def test_incremental_scroll_continues_same_session_in_four_profiles(self):
+        home = await self.plugin()
+        card = self.browser._rows([{
+            "vod_id": "tmdb:1", "vod_name": "Film",
+            "t4_action": {"type": "search", "keyword": "Film"},
+        }], self.source, home)[0]
+        rows = [{"vod_id": f"film-{i}", "vod_name": f"Film {i}",
+                 "type_name": "电视剧", "t4_source": "Source A"} for i in range(45)]
+
+        async def search(client, source, keyword, year, options):
+            self.assertEqual(options["nav_incremental"], "true")
+            offset, limit = options["nav_offset"], options["nav_limit"]
+            self.assertEqual(options.get("nav_session", "test-session"), "test-session")
+            return {"list": rows[offset:offset + limit], "total": 45,
+                    "t4_search": {"incremental": True, "session": "test-session",
+                                  "pending": False, "partial": False}}
+
+        for ua in ("trimemedia-web", "com.trim.tv", "Dalvik/2.1.0 Android",
+                   "com.trim.media.ios"):
+            with self.subTest(ua=ua):
+                self.browser._cache.clear()
+                self.browser._cache_bytes = 0
+                self.browser._search_sessions.clear()
+                self.client.headers["User-Agent"] = ua
+                with patch.object(t4, "navigation_search", side_effect=search) as lookup:
+                    pages = await asyncio.gather(*(self.listing(card["guid"],
+                        offset=offset, page_size=22) for offset in (0, 22, 44)))
+                    replay = await self.listing(card["guid"], page_size=22)
+                self.assertEqual(lookup.await_count, 3)
+                self.assertEqual([len(page["list"]) for page in pages], [22, 22, 1])
+                self.assertTrue(all(page["total"] == 45 for page in pages))
+                self.assertEqual(pages[0]["list"], replay["list"])
+                self.assertEqual(len({r["guid"] for page in pages for r in page["list"]}), 45)
+
+    async def test_sparse_incremental_page_exposes_native_continue_directory(self):
+        home = await self.plugin()
+        card = self.browser._rows([{
+            "vod_id": "tmdb:1", "vod_name": "Film",
+            "t4_action": {"type": "search", "keyword": "Film"},
+        }], self.source, home)[0]
+        rows = [{"vod_id": "first", "vod_name": "Film", "type_name": "电视剧"}]
+
+        async def search(client, source, keyword, year, options):
+            if options["nav_offset"] == 0:
+                return {"list": rows, "total": 2, "t4_search": {
+                    "incremental": True, "session": "sparse", "pending": True,
+                    "partial": True, "completed": 1, "total": 2}}
+            self.assertEqual(options["nav_offset"], 1)
+            self.assertEqual(options["nav_session"], "sparse")
+            return {"list": [{"vod_id": "late", "vod_name": "Film",
+                              "type_name": "电视剧"}],
+                    "total": 2, "t4_search": {"incremental": True, "session": "sparse",
+                                            "pending": False, "partial": False}}
+
+        with patch.object(t4, "navigation_search", side_effect=search) as lookup:
+            first = await self.listing(card["guid"])
+            self.assertEqual(len(first["list"]), 2)
+            more = first["list"][-1]
+            self.assertEqual(more["type"], "Directory")
+            self.assertEqual(more["title"], "继续搜索剩余来源")
+            self.assertEqual(self.browser.node(more["guid"])["search_offset"], 1)
+            second = await self.listing(more["guid"])
+            self.assertEqual(second["total"], 1)
+            self.assertEqual(len(second["list"]), 1)
+            self.assertNotEqual(first["list"][0]["guid"], second["list"][0]["guid"])
+            self.assertEqual(lookup.await_count, 2)
+
+    async def test_expired_session_prompts_reentry_without_starting_another_search(self):
+        def respond(request):
+            return httpx.Response(400, json={"detail": {
+                "code": "t4_request_invalid", "message": "session expired"}})
+
+        async with type(self.network)(transport=httpx.MockTransport(respond)) as client:
+            with self.assertRaisesRegex(t4.T4Error, "返回片单重新选片"):
+                await t4.navigation_search(client, self.source, "Film", "", {
+                    "nav_incremental": "true", "nav_session": "expired",
+                    "nav_offset": 22, "nav_limit": 22})
+
 
 if __name__ == "__main__":
     unittest.main()

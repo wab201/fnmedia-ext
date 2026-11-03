@@ -245,9 +245,46 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data["cloud_storage_info"]["cloud_storage_type"], 9001)
             self.assertEqual(len(data["direct_link_qualities"]), 2)
             self.assertTrue(all(not q["is_m3u8"] for q in data["direct_link_qualities"]))
-            self.assertTrue(all(q["url"].startswith("/v/media/online/")
+            self.assertTrue(all(q["url"].startswith("http://fnmedia.test/v/media/online/")
                                 for q in data["direct_link_qualities"]))
             self.assertTrue(data["file_stream"]["file_name"].endswith("." + wrapper))
+
+    async def test_native_strm_urls_are_absolute_and_preserve_proxy_origin_and_headers(self):
+        self.protected = True
+        _, eg = await self.load_episode()
+        mg = storemod.ep_media_guid(eg)
+        profiles = ("trimemedia-web", "com.trim.tv", "Dalvik/2.1.0 Android",
+                    "com.trim.media.ios")
+        origins = (
+            ({}, "http://fnmedia.test"),
+            ({"X-Forwarded-Proto": "https", "X-Forwarded-Host": "public.test:15666"},
+             "https://public.test:15666"),
+            ({"X-Forwarded-Proto": "https", "Host": "public.test:15666"},
+             "https://public.test:15666"),
+            ({"X-Forwarded-Proto": "https, http",
+              "X-Forwarded-Host": "[2001:db8::1]:15666, upstream.test"},
+             "https://[2001:db8::1]:15666"),
+        )
+        for ua in profiles:
+            for headers, origin in origins:
+                with self.subTest(ua=ua, origin=origin):
+                    headers = dict(headers, **{"User-Agent": ua})
+                    response = await self.client.post("/v/api/v1/stream",
+                        json={"media_guid": mg}, headers=headers)
+                    links = response.json()["data"]["direct_link_qualities"]
+                    self.assertEqual(len(links), 2)
+                    for quality in links:
+                        self.assertTrue(quality["url"].startswith(
+                            f"{origin}/v/media/online/{mg}/t4?"))
+                        self.assertNotIn("fixture-secret", quality["url"])
+                        response = await self.client.get(quality["url"],
+                            headers={"Range": "bytes=504-519"}, follow_redirects=True)
+                        self.assertEqual(response.status_code, 206)
+                        self.assertEqual(response.content, MEDIA_BYTES[504:520])
+                    played = await self.client.post("/v/api/v1/play/play",
+                        json={"media_guid": mg}, headers=headers)
+                    self.assertTrue(played.json()["data"]["play_link"].startswith(
+                        f"{origin}/v/media/online/"))
 
     async def test_t4_hls_stream_stays_manifest_delivery(self):
         self.wrapper = "m3u8"

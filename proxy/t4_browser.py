@@ -31,6 +31,7 @@ class T4Browser:
         self._nodes = OrderedDict()
         self._cache = OrderedDict()
         self._cache_bytes = 0
+        self._search_sessions = OrderedDict()
         self._locks = {}
         self._slots = asyncio.Semaphore(4)
         self._dirty = False
@@ -143,10 +144,24 @@ class T4Browser:
         return inject.search_item(display)
 
     async def _raw(self, client, source, tid=None, page=1, filters=None, *,
-                   keyword=None, year=""):
+                   keyword=None, year="", navigation=None):
         key = hashlib.sha256(json.dumps(
             [source, tid, page, filters, keyword, year],
             sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+
+        def search_session():
+            stored = self._search_sessions.get(key)
+            if stored and time.monotonic() - stored[1] < 90:
+                return stored[0]
+            self._search_sessions.pop(key, None)
+            return None
+
+        def cache_key():
+            session = (navigation or {}).get("nav_session") or search_session()
+            if navigation is not None and session:
+                return (key, session, navigation.get("nav_offset", 0),
+                        navigation.get("nav_limit", 22))
+            return key
 
         def cached():
             now = time.monotonic()
@@ -154,9 +169,10 @@ class T4Browser:
             for old in list(self._cache):
                 if now - self._cache[old][0] >= 60:
                     self._cache_bytes -= self._cache.pop(old)[2]
-            hit = self._cache.get(key)
+            # Legacy T4 servers ignore incremental options and return one snapshot.
+            hit = self._cache.get(key) or self._cache.get(cache_key())
             if hit:
-                self._cache.move_to_end(key)
+                self._cache.move_to_end(key if key in self._cache else cache_key())
                 return hit[1]
             return None
 
@@ -172,19 +188,37 @@ class T4Browser:
                     return hit
                 start = time.monotonic()
                 async with self._slots:
-                    result = (await t4.navigation_search(client, source, keyword, year)
-                              if keyword is not None else
-                              await t4.home(client, source) if tid is None else
-                              await t4.category(client, source, tid, page, filters))
+                    if keyword is not None:
+                        options = dict(navigation or {})
+                        if session := search_session():
+                            options.setdefault("nav_session", session)
+                        result = await t4.navigation_search(
+                            client, source, keyword, year, options) if options else \
+                            await t4.navigation_search(client, source, keyword, year)
+                    else:
+                        result = await t4.home(client, source) if tid is None else \
+                            await t4.category(client, source, tid, page, filters)
                 self.source(source["id"])
                 size = len(json.dumps(result, ensure_ascii=True).encode())
-                status = result.get("t4_search") or {}
+                status = result.get("t4_search")
+                status = status if isinstance(status, dict) else {}
                 # Paging must reuse one snapshot even when some plugins are slow.
                 # Empty incomplete results remain immediately retryable.
-                cacheable = bool(result.get("list")) or not isinstance(status, dict) or not (
+                cacheable = bool(result.get("list")) or not (
                     status.get("partial") or status.get("failed"))
+                if navigation is not None and status.get("incremental"):
+                    self._search_sessions[key] = status["session"], time.monotonic()
+                    self._search_sessions.move_to_end(key)
+                    while len(self._search_sessions) > 32:
+                        self._search_sessions.popitem(last=False)
+                    cacheable = not status.get("pending") or len(result["list"]) >= \
+                        navigation.get("nav_limit", 22)
                 if size <= 1024 * 1024 and cacheable:
-                    self._cache[key] = time.monotonic(), result, size
+                    stored_key = cache_key() if status.get("incremental") else key
+                    previous = self._cache.pop(stored_key, None)
+                    if previous:
+                        self._cache_bytes -= previous[2]
+                    self._cache[stored_key] = time.monotonic(), result, size
                     self._cache_bytes += size
                     while len(self._cache) > 32 or self._cache_bytes > 4 * 1024 * 1024:
                         self._cache_bytes -= self._cache.popitem(last=False)[1][2]
@@ -342,11 +376,31 @@ class T4Browser:
                             ancestor_name=LIB_TITLE, ancestor_category="Mix")
                 cards, total = [card][offset:offset + size], 1
             elif node["kind"] == "search":
+                base = _number(node.get("search_offset"))
+                options = {"nav_incremental": "true", "nav_offset": base + offset,
+                           "nav_limit": size}
+                if node.get("search_session"):
+                    options["nav_session"] = node["search_session"]
                 result = await self._raw(client, source, keyword=node["keyword"],
-                                         year=node.get("year", ""))
+                                         year=node.get("year", ""), navigation=options)
                 rows = result["list"]
-                cards = self._rows(rows[offset:offset + size], source, guid)
-                total = len(rows)
+                status = result.get("t4_search") or {}
+                if status.get("incremental"):
+                    cards = self._rows(rows, source, guid)
+                    total = max(0, _number(result.get("total")) - base)
+                    if status.get("pending") and len(cards) < size:
+                        resume = base + offset + len(rows)
+                        more = self._put(
+                            source, "search", "继续搜索剩余来源", guid,
+                            key=f"next:{status['session']}:{resume}",
+                            keyword=node["keyword"], year=node.get("year", ""),
+                            search_offset=resume, search_session=status["session"])
+                        cards.append(self.card(more))
+                    elif status.get("pending"):
+                        total = max(total, offset + size + 1)
+                else:
+                    cards = self._rows(rows[offset:offset + size], source, guid)
+                    total = len(rows)
             elif node["kind"] == "filter":
                 guids = []
                 for value in node.get("values") or []:

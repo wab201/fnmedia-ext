@@ -265,10 +265,16 @@ async def search(client: httpx.AsyncClient, source: dict, keyword: str):
 
 
 async def navigation_search(client: httpx.AsyncClient, source: dict, keyword: str,
-                            year: str = ""):
-    result = await request(client, source, {
-        "wd": keyword, "quick": "false", "pg": 1, "nav_search": "true", "year": year,
-    })
+                            year: str = "", options: dict | None = None):
+    try:
+        result = await request(client, source, {
+            "wd": keyword, "quick": "false", "pg": 1, "nav_search": "true", "year": year,
+            **(options or {}),
+        })
+    except T4Error as exc:
+        if (options or {}).get("nav_session") and exc.refresh_detail:
+            raise T4Error("片单搜索会话已失效，请返回片单重新选片") from None
+        raise
     if not isinstance(result.get("list"), list):
         raise T4Error("T4 导航搜索缺少 list 列表")
     return result

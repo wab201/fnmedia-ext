@@ -1595,6 +1595,18 @@ async def _load_t4_detail(guid: str, request: Request):
     return None
 
 
+def _t4_media_url(request: Request, mg: str, **params) -> str:
+    # Native STRM players consume this URL without the browser's origin resolution.
+    scheme = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    if scheme not in ("http", "https"):
+        scheme = request.url.scheme
+    host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    host = host or request.url.netloc
+    return urllib.parse.urlunsplit((
+        scheme, host, f"{ONLINE_PREFIX}/{mg}/t4",
+        urllib.parse.urlencode(params), ""))
+
+
 async def _t4_play_response(mg: str, target: dict, body: dict, request: Request):
     try:
         result = await t4_service.resolve(ext_client(request), target)
@@ -1608,10 +1620,14 @@ async def _t4_play_response(mg: str, target: dict, body: dict, request: Request)
     # Headers stay server-side; unsigned public results need no extra media hop.
     if result.wrapper == "HLS":
         session = t4_service.create_session(mg, target)
-        link = f"{ONLINE_PREFIX}/{mg}/t4?" + urllib.parse.urlencode({"session": session})
+        link = _t4_media_url(request, mg, session=session)
     else:
-        link = f"{ONLINE_PREFIX}/{mg}/t4?" + urllib.parse.urlencode(
-            {"line": target["line"]}) if result.needs_proxy else result.url
+        link = _t4_media_url(request, mg, line=target["line"]) \
+            if result.needs_proxy else result.url
+    _log.info("T4 handoff media=%s client=%s wrapper=%s delivery=%s absolute=%s",
+              mg, _client_of(request).label, result.wrapper,
+              "server" if result.needs_proxy else "direct",
+              bool(urllib.parse.urlsplit(link).netloc))
     return JSONResponse({"code": 0, "msg": "", "data": {
         "audio_guid": "", "audio_index": -1, "hls_time": 6,
         "is_subtitle_external": 0, "media_guid": mg, "play_link": link,
@@ -2347,11 +2363,13 @@ async def stream_post(request: Request):
                 "resolution": choice["label"],
                 "bitrate": _line_bitrate(choice["line"], names),
                 "is_m3u8": False,
-                "url": f"{ONLINE_PREFIX}/{mg}/t4?" +
-                       urllib.parse.urlencode({"line": choice["line"]}),
+                "url": _t4_media_url(request, mg, line=choice["line"]),
             } for choice in choices]
             data.update(cloud_storage_info={"cloud_storage_type": 9001},
                         direct_link_qualities=raw)
+        _log.info("T4 stream media=%s client=%s wrapper=%s delivery=%s lines=%d",
+                  mg, _client_of(request).label, playback.wrapper,
+                  "server" if playback.needs_proxy else "direct", len(choices))
         return JSONResponse({"code": 0, "msg": "", "data": data})
     if target.get("kind") == "episode":
         sl = inj.episode_stream_list(target)
@@ -2680,8 +2698,12 @@ async def media_p(request: Request):
     except Exception:
         body = {}
     link = body.get("playLink", "")
-    if isinstance(link, str) and link.startswith(ONLINE_PREFIX):
-        parsed = urllib.parse.urlsplit(link)
+    try:
+        parsed = urllib.parse.urlsplit(link) if isinstance(link, str) else None
+    except ValueError:
+        parsed = None
+    online = bool(parsed and parsed.path.startswith(ONLINE_PREFIX + "/"))
+    if online:
         parts = parsed.path.removeprefix(ONLINE_PREFIX + "/").split("/")
         session = urllib.parse.parse_qs(parsed.query).get("session", [""])[0]
         if len(parts) == 2 and parts[1] == "t4" and session:
@@ -2709,7 +2731,7 @@ async def media_p(request: Request):
             elif body.get("req") == "media.quit":
                 t4_service.close_session(mg, session)
     if isinstance(link, str) and link and (
-            link.startswith(ONLINE_PREFIX) or t4_service.owns_playback_url(link)):
+            online or t4_service.owns_playback_url(link)):
         return JSONResponse({"code": 0, "msg": "",
                              "data": {"reqid": body.get("reqid", ""), "result": "succ"}})
     return await forward_upstream(request)
